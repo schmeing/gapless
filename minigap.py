@@ -64,7 +64,7 @@ def MiniGapSplit(fa_file,o_file=False,min_n=False):
                             if len(seq): # Ignore potentially empty sequences, when scaffold starts or ends with N
                                 fout.write(">{0}_chunk{1}-{2}{3}\n".format(seqid[0],start_pos+1,start_pos+len(seq), seqid[1]))
                                 fout.write(seq)
-                                fout.write('\n');
+                                fout.write('\n')
                             # Insert new sequence
                             start_pos += len(seq) + num_n
                             seq = contig
@@ -77,7 +77,7 @@ def MiniGapSplit(fa_file,o_file=False,min_n=False):
                     else:
                         fout.write(">{0}_chunk{1}-{2}{3}\n".format(seqid[0],start_pos+1,start_pos+len(seq), seqid[1]))
                     fout.write(seq)
-                    fout.write('\n');
+                    fout.write('\n')
 
 def ReadContigs(assembly_file):
     # Create contig table of assembly
@@ -319,7 +319,7 @@ def MaskRepeatEnds(contigs, repeat_file, contig_ids, max_repeat_extension, min_l
     repeat_table = repeat_table[['q_id','q_len','q_start','q_end']].copy()
     repeat_table.sort_values(['q_id','q_start','q_end'], inplace=True)
     repeat_table['group'] = (repeat_table['q_id'] != repeat_table['q_id'].shift(1, fill_value=-1)) | (repeat_table['q_start'] > repeat_table['q_end'].shift(1, fill_value=-1) + max_repeat_extension)
-    while sum(repeat_table['group']) < len(repeat_table):
+    while np.sum(repeat_table['group']) < len(repeat_table):
         repeat_table['group'] = repeat_table['group'].cumsum()
         repeat_table = repeat_table.groupby('group').agg(['min','max']).reset_index()[[('q_id','min'),('q_len','min'),('q_start','min'),('q_end','max')]].copy()
         repeat_table.columns = repeat_table.columns.droplevel(-1)
@@ -372,16 +372,16 @@ def RemoveUnmappedContigs(contigs, mappings, remove_zero_hit_contigs):
     org_contig_info = {}
     org_contig_info['num'] = {}
     org_contig_info['num']['total'] = len(contigs)
-    org_contig_info['num']['removed_total'] = sum(contigs['remove'])
-    org_contig_info['num']['removed_no_mapping'] = sum(0==mapped_reads)
+    org_contig_info['num']['removed_total'] = np.sum(contigs['remove'])
+    org_contig_info['num']['removed_no_mapping'] = np.sum(0==mapped_reads)
     org_contig_info['num']['removed_duplicates'] = org_contig_info['num']['removed_total'] - org_contig_info['num']['removed_no_mapping']
-    org_contig_info['num']['masked'] = sum(np.logical_not(contigs['remove']) & (contigs['repeat_mask_right'] == 0))
+    org_contig_info['num']['masked'] = np.sum(np.logical_not(contigs['remove']) & (contigs['repeat_mask_right'] == 0))
     org_contig_info['len'] = {}
-    org_contig_info['len']['total'] = sum(contigs['length'])
-    org_contig_info['len']['removed_total'] = sum(contigs.loc[contigs['remove'], 'length'])
-    org_contig_info['len']['removed_no_mapping'] = sum(contigs.loc[0==mapped_reads, 'length'])
+    org_contig_info['len']['total'] = np.sum(contigs['length'])
+    org_contig_info['len']['removed_total'] = np.sum(contigs.loc[contigs['remove'], 'length'])
+    org_contig_info['len']['removed_no_mapping'] = np.sum(contigs.loc[0==mapped_reads, 'length'])
     org_contig_info['len']['removed_duplicates'] = org_contig_info['len']['removed_total'] - org_contig_info['len']['removed_no_mapping']
-    org_contig_info['len']['masked'] = sum(contigs.loc[np.logical_not(contigs['remove']) & (contigs['repeat_mask_right'] == 0), 'length'])
+    org_contig_info['len']['masked'] = np.sum(contigs.loc[np.logical_not(contigs['remove']) & (contigs['repeat_mask_right'] == 0), 'length'])
     org_contig_info['max'] = {}
     org_contig_info['max']['total'] = max(contigs['length'])
     org_contig_info['max']['removed_total'] = max(contigs.loc[contigs['remove'], 'length'])
@@ -785,28 +785,30 @@ def UpdateMappingsToContigParts(mappings, contigs, contig_parts, break_groups, m
     mappings.loc[0 < mappings['num_part'], 'left_con_side'] = 'r'
     mappings.loc[mappings['parts'] - mappings['num_part'] > 1, 'right_con'] = mappings.loc[mappings['parts'] - mappings['num_part'] > 1, 'conpart'] + 1
     mappings.loc[mappings['parts'] - mappings['num_part'] > 1, 'right_con_side'] = 'l'
-    mappings['con_from'] = mappings['t_start']
-    mappings['con_to'] = mappings['t_end']
-    mappings.loc[0 < mappings['num_part'], 'con_from'] = contig_parts.iloc[mappings.loc[0 < mappings['num_part'], 'conpart'], contig_parts.columns.get_loc('start')].values
-    mappings.loc[mappings['parts'] - mappings['num_part'] > 1, 'con_to'] = contig_parts.iloc[mappings.loc[mappings['parts'] - mappings['num_part'] > 1, 'conpart'], contig_parts.columns.get_loc('end')].values
+    mappings['con_from'] = np.maximum(mappings['t_start'], contig_parts.iloc[mappings['conpart'], contig_parts.columns.get_loc('start')])  # We cannot work with 0 < mappings['num_part'], because of reads that start before mappings['con_start'] but do not cross the break region and therefore don't have a mapping before
+    mappings['con_to'] = np.minimum(mappings['t_end'], contig_parts.iloc[mappings['conpart'], contig_parts.columns.get_loc('end')])
     mappings['read_from'] = mappings['q_start']
     mappings['read_to'] = mappings['q_end']
     
     # Rough estimate of the split for the reads, better not use the new information, but not always avoidable (it's important that read_to and read_from of the next entry match, so that using this mappings avoids the rough estimate by not adding or removing any sequences)
     # Forward strand
-    multi_maps = mappings[(0 < mappings['num_part']) & (mappings['strand'] == '+')]
-    mappings.loc[(0 < mappings['num_part']) & (mappings['strand'] == '+'), 'read_from'] = np.round(multi_maps['q_end'] - (multi_maps['q_end']-multi_maps['q_start'])/(multi_maps['t_end']-multi_maps['t_start'])*(multi_maps['t_end']-multi_maps['con_from'])).astype(int)
+    multi_maps = mappings[(mappings['con_from'] > mappings['t_start']) & (mappings['strand'] == '+')]
+    mappings.loc[(mappings['con_from'] > mappings['t_start']) & (mappings['strand'] == '+'), 'read_from'] = np.round(multi_maps['q_end'] - (multi_maps['q_end']-multi_maps['q_start'])/(multi_maps['t_end']-multi_maps['t_start'])*(multi_maps['t_end']-multi_maps['con_from'])).astype(int)
     mappings['read_to'] = np.where((mappings['parts'] - mappings['num_part'] > 1) & (mappings['strand'] == '+'), mappings['read_from'].shift(-1, fill_value = 0), mappings['read_to'])
+    multi_maps = mappings[(mappings['con_to'] < mappings['t_end']) & (mappings['strand'] == '+') & (mappings['parts'] - mappings['num_part'] == 1)]
+    mappings.loc[(mappings['con_to'] < mappings['t_end']) & (mappings['strand'] == '+') & (mappings['parts'] - mappings['num_part'] == 1), 'read_to'] = np.round(multi_maps['q_start'] + (multi_maps['q_end']-multi_maps['q_start'])/(multi_maps['t_end']-multi_maps['t_start'])*(multi_maps['con_to']-multi_maps['t_start'])).astype(int)
     # Reverse strand
-    multi_maps = mappings[(0 < mappings['num_part']) & (mappings['strand'] == '-')]
-    mappings.loc[(0 < mappings['num_part']) & (mappings['strand'] == '-'), 'read_to'] = np.round(multi_maps['q_start'] + (multi_maps['q_end']-multi_maps['q_start'])/(multi_maps['t_end']-multi_maps['t_start'])*(multi_maps['t_end']-multi_maps['con_from'])).astype(int)
+    multi_maps = mappings[(mappings['con_from'] > mappings['t_start']) & (mappings['strand'] == '-')]
+    mappings.loc[(mappings['con_from'] > mappings['t_start']) & (mappings['strand'] == '-'), 'read_to'] = np.round(multi_maps['q_start'] + (multi_maps['q_end']-multi_maps['q_start'])/(multi_maps['t_end']-multi_maps['t_start'])*(multi_maps['t_end']-multi_maps['con_from'])).astype(int)
     mappings['read_from'] = np.where((mappings['parts'] - mappings['num_part'] > 1) & (mappings['strand'] == '-'), mappings['read_to'].shift(1, fill_value = 0), mappings['read_from'])
+    multi_maps = mappings[(mappings['con_to'] < mappings['t_end']) & (mappings['strand'] == '-') & (mappings['parts'] - mappings['num_part'] == 1)]
+    mappings.loc[(mappings['con_to'] < mappings['t_end']) & (mappings['strand'] == '-') & (mappings['parts'] - mappings['num_part'] == 1), 'read_from'] = np.round(multi_maps['q_end'] - (multi_maps['q_end']-multi_maps['q_start'])/(multi_maps['t_end']-multi_maps['t_start'])*(multi_maps['con_to']-multi_maps['t_start'])).astype(int)
 
     mappings.reset_index(inplace=True)
     mappings['matches'] = np.round(mappings['matches']/(mappings['t_end']-mappings['t_start'])*(mappings['con_to']-mappings['con_from'])).astype(int) # Rough estimate use with care!
     mappings.rename(columns={'q_name':'read_name'}, inplace=True)
     mappings = mappings[['read_name', 'read_start', 'read_end', 'read_from', 'read_to', 'strand', 'conpart', 'con_from', 'con_to', 'left_con', 'left_con_side', 'right_con', 'right_con_side', 'mapq', 'matches']].copy()
-
+    
     # Count how many mappings each read has
     mappings['num_mappings'] = 1
     num_mappings = mappings.groupby(['read_name','read_start'], sort=False)['num_mappings'].size().values
@@ -1279,11 +1281,11 @@ def HandleUniqueBridges(contig_parts, bridges, mappings, lowq_bridges):
 
 def MergeCircularityGroups(circular):
     mergeable = [True]
-    while sum(mergeable):
+    while np.sum(mergeable):
         circular = [ list(np.unique(x)) for x in circular ]
         circular.sort()
         mergeable = [False] + [ x[0] == y[0] for x,y in zip(circular[1:],circular[:-1]) ]
-        n_groups = len(mergeable)-sum(mergeable)
+        n_groups = len(mergeable)-np.sum(mergeable)
         group_ids = np.cumsum(np.logical_not(mergeable))-1
         new_circular = [ [] for i in range(n_groups) ]
         for i, gr in enumerate(group_ids):
@@ -1322,7 +1324,7 @@ def CombineContigsOnLeftConnections(scaffold_result, contig_parts):
     scaffold_result['left_end_con_side'] = ''
     scaffold_result.loc[scaffold_result['left_end_con']>=0,'left_end_con_side'] = scaffold_result.iloc[scaffold_result.loc[scaffold_result['left_end_con']>=0,'left_end_con'].values, scaffold_result.columns.get_loc('left_con_side')].values
 
-    while sum(scaffold_result['left_end_con_side'] == 'r'):
+    while np.sum(scaffold_result['left_end_con_side'] == 'r'):
         # Make next step
         scaffold_result.loc[scaffold_result['left_end_con_side']=='r','left_end_con'] = scaffold_result.iloc[scaffold_result.loc[scaffold_result['left_end_con_side']=='r','left_end_con'].values, scaffold_result.columns.get_loc('left_con')].values # Do not use left_con_end column (would make it faster, but potentially miss circularity and end up in inifinit loop)
         scaffold_result.loc[scaffold_result['left_end_con_side']=='r','left_end_dist'] += 1
@@ -1469,7 +1471,7 @@ def HandleLeftRightScaffoldConnections(scaffold_result, contig_parts, scaffolds)
     scaffolds['left_end_con_side'] = ''
     scaffolds.loc[scaffolds['left_end_scaf']>=0,'left_end_con_side'] = scaffolds.iloc[scaffolds.loc[scaffolds['left_end_scaf']>=0,'left_end_scaf'].values, scaffolds.columns.get_loc('left_con_side')].values
 
-    while sum(scaffolds['left_end_con_side'] == 'r'):
+    while np.sum(scaffolds['left_end_con_side'] == 'r'):
         # Make next step
         scaffolds.loc[scaffolds['left_end_con_side']=='r','left_end_scaf'] = scaffolds.iloc[scaffolds.loc[scaffolds['left_end_con_side']=='r','left_end_scaf'].values, scaffolds.columns.get_loc('left_con')].values # Do not use left_con_end column (would make it faster, but potentially miss circularity and end up in inifinit loop)
         scaffolds.loc[scaffolds['left_end_con_side']=='r','left_end_dist'] += scaffolds.iloc[scaffolds.loc[scaffolds['left_end_con_side']=='r','left_end_scaf'].values, scaffolds.columns.get_loc('scaf_size')].values
@@ -1567,7 +1569,7 @@ def OrderByUnbrokenOriginalScaffolds(scaffold_result, contig_parts):
     
     # Merge by min-max connections (min-min is already a single group)
     ungrouped = np.isin(scaffold_order['min_scaf'], scaffold_order['max_scaf'])
-    while sum(ungrouped):
+    while np.sum(ungrouped):
         lowest_scaf = {h:l for h,l in zip(scaffold_order['max_scaf'], scaffold_order['min_scaf'])}
         scaffold_order.loc[ungrouped, 'min_scaf'] = itemgetter(*scaffold_order.loc[ungrouped, 'min_scaf'])(lowest_scaf)
         ungrouped = np.isin(scaffold_order['min_scaf'], scaffold_order['max_scaf'])
@@ -1749,9 +1751,10 @@ def GetScaffoldExtendingMappings(mappings, contig_parts, scaffold_info, max_dist
     mappings = mappings[ np.isin(mappings['conpart'], scaffold_info.loc[(scaffold_info['pos'] == 0) | (scaffold_info['pos'] == scaffold_info['scaf_size']-1), 'part_id'].values) ].copy()
     
     # Reads need to extend the contig in the right direction
-    mappings['con_len'] = contig_parts.iloc[mappings['conpart'].values, contig_parts.columns.get_loc('end')].values
-    mappings['left_ext'] = np.where('+' == mappings['strand'], mappings['read_from']-mappings['read_start']-mappings['con_from'], (mappings['read_end']-mappings['read_to'])-mappings['con_from'])
-    mappings['right_ext'] = np.where('-' == mappings['strand'], mappings['read_from']-mappings['read_start']-(mappings['con_len']-mappings['con_to']), (mappings['read_end']-mappings['read_to'])-(mappings['con_len']-mappings['con_to']))
+    mappings['con_start'] = contig_parts.iloc[mappings['conpart'].values, contig_parts.columns.get_loc('start')].values
+    mappings['con_end'] = contig_parts.iloc[mappings['conpart'].values, contig_parts.columns.get_loc('end')].values
+    mappings['left_ext'] = np.where('+' == mappings['strand'], mappings['read_from']-mappings['read_start']-(mappings['con_from']-mappings['con_start']), (mappings['read_end']-mappings['read_to'])-(mappings['con_from']-mappings['con_start']))
+    mappings['right_ext'] = np.where('-' == mappings['strand'], mappings['read_from']-mappings['read_start']-(mappings['con_end']-mappings['con_to']), (mappings['read_end']-mappings['read_to'])-(mappings['con_end']-mappings['con_to']))
     
     # Set extensions to zero that are in the wrong direction
     tmp_info = scaffold_info.iloc[mappings['conpart'].values]
@@ -1764,13 +1767,13 @@ def GetScaffoldExtendingMappings(mappings, contig_parts, scaffold_info, max_dist
     mappings.loc[ (tmp_info2['right_con'] == -2).values, 'right_ext'] = 0
     
     # Set extensions to zero that are too far away from the contig_end
-    mappings.loc[mappings['con_from'] > max_dist_contig_end, 'left_ext'] = 0
-    mappings.loc[mappings['con_len']-mappings['con_to'] > max_dist_contig_end, 'right_ext'] = 0
-
+    mappings.loc[mappings['con_from']-mappings['con_start'] > max_dist_contig_end, 'left_ext'] = 0
+    mappings.loc[mappings['con_end']-mappings['con_to'] > max_dist_contig_end, 'right_ext'] = 0
+    
     mappings = mappings[(mappings['left_ext'] > 0) | (mappings['right_ext'] > 0)].copy()
     mappings['left_ext'] = np.maximum(0, mappings['left_ext'])
     mappings['right_ext'] = np.maximum(0, mappings['right_ext'])
-
+    
     # Lift mappings from contigs to scaffolds
     mappings['scaffold'] = scaffold_info.iloc[mappings['conpart'].values, scaffold_info.columns.get_loc('scaffold')].values
     is_reversed = scaffold_info.iloc[mappings['conpart'].values]['reverse'].values
@@ -1778,11 +1781,11 @@ def GetScaffoldExtendingMappings(mappings, contig_parts, scaffold_info, max_dist
     tmp_ext = mappings['left_ext'].copy().values
     mappings['left_ext'] = np.where(is_reversed, mappings['right_ext'], mappings['left_ext'])
     mappings['right_ext'] = np.where(is_reversed, tmp_ext, mappings['right_ext'])
-
-    mappings['left_dist_start'] = np.where(is_reversed, mappings['con_len']-mappings['con_to'], mappings['con_from'])
-    mappings['left_dist_end'] = np.where(is_reversed, mappings['con_len']-mappings['con_from'], mappings['con_to'])
-    mappings['right_dist_start'] = np.where(is_reversed, mappings['con_from'], mappings['con_len']-mappings['con_to'])
-    mappings['right_dist_end'] = np.where(is_reversed, mappings['con_to'], mappings['con_len']-mappings['con_from'])
+    
+    mappings['left_dist_start'] = np.where(is_reversed, mappings['con_end']-mappings['con_to'], mappings['con_from']-mappings['con_start'])
+    mappings['left_dist_end'] = np.where(is_reversed, mappings['con_end']-mappings['con_from'], mappings['con_to']-mappings['con_start'])
+    mappings['right_dist_start'] = np.where(is_reversed, mappings['con_from']-mappings['con_start'], mappings['con_end']-mappings['con_to'])
+    mappings['right_dist_end'] = np.where(is_reversed, mappings['con_to']-mappings['con_start'], mappings['con_end']-mappings['con_from'])
     
     mappings.loc[mappings['left_ext']==0, 'left_dist_start'] = -1
     mappings.loc[mappings['left_ext']==0, 'left_dist_end'] = -1
@@ -1799,7 +1802,7 @@ def GetScaffoldExtendingMappings(mappings, contig_parts, scaffold_info, max_dist
         del extension_lengths
     
     mappings = mappings[(min_extension<=mappings['left_ext']) | (min_extension<=mappings['right_ext'])].copy()
-
+    
     # Only keep extension, when there are enough of them
     num_left_extensions = mappings[mappings['left_ext']>0].groupby(['scaffold','conpart']).size().reset_index(name='counts')
     num_right_extensions = mappings[mappings['right_ext']>0].groupby(['scaffold','conpart']).size().reset_index(name='counts')
@@ -1814,7 +1817,7 @@ def GetScaffoldExtendingMappings(mappings, contig_parts, scaffold_info, max_dist
     contig_parts.iloc[num_right_extensions.loc[np.logical_not(num_right_extensions['reverse']), 'conpart'].values, contig_parts.columns.get_loc('right_ext')] = num_right_extensions.loc[np.logical_not(num_right_extensions['reverse']), 'counts'].values
     contig_parts.iloc[num_left_extensions.loc[num_left_extensions['reverse'], 'conpart'].values, contig_parts.columns.get_loc('right_ext')] = num_left_extensions.loc[num_left_extensions['reverse'], 'counts'].values
     mappings.drop(columns=['conpart'], inplace=True)
-
+    
     mappings = mappings[((mappings['left_ext']>0) & np.isin(mappings['scaffold'], num_left_extensions.loc[num_left_extensions['counts']>=min_num_reads, 'scaffold'].values)) |
                         ((mappings['right_ext']>0) & np.isin(mappings['scaffold'], num_right_extensions.loc[num_right_extensions['counts']>=min_num_reads, 'scaffold'].values))]
 
@@ -1941,7 +1944,7 @@ def PrintStats(contig_parts, org_contig_info, min_num_reads):
     print("    No long reads mapping: {} ({} bases, largest: {} bases)".format(org_contig_info['num']['removed_no_mapping'], org_contig_info['len']['removed_no_mapping'], org_contig_info['max']['removed_no_mapping']))
     print("    Complete duplications: {} ({} bases, largest: {} bases)".format(org_contig_info['num']['removed_duplicates'], org_contig_info['len']['removed_duplicates'], org_contig_info['max']['removed_duplicates']))
     print("  Masked: {} ({} bases, largest: {} bases)".format(org_contig_info['num']['masked'], org_contig_info['len']['masked'], org_contig_info['max']['masked']))
-    print("  Broken: {} into {} contigs".format(sum(break_info>1), sum(break_info[break_info>1])))
+    print("  Broken: {} into {} contigs".format(np.sum(break_info>1), np.sum(break_info[break_info>1])))
     
     gaps, breaks, scaffolds = GetPrintCategories(contig_parts, min_num_reads)
     
@@ -2049,10 +2052,6 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, prefix=False, stat
     print( str(timedelta(seconds=clock())), "Search for possible bridges")
     bridges, lowq_bridges = GetBridges(mappings, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, pdf)
     
-    #contig_parts, invalid_anchors = HandleSimpleLoops(contig_parts, bridges, loop_contigs, mappings, max_length_diff_loop_extension, min_factor_alternatives, min_num_reads, pdf)
-    #bridges = bridges[np.logical_not(np.isin(bridges['from'],invalid_anchors) | np.isin(bridges['to'],invalid_anchors))].copy()
-    #del invalid_anchors
-    
     contig_parts, anchored_contig_parts = HandleAlternativeConnections(contig_parts, bridges, mappings)
     bridges = bridges[(bridges['from_alt'] == 1) & (bridges['to_alt'] == 1)].copy()
     bridges = bridges[np.isin(bridges['from'], anchored_contig_parts) == False].copy()
@@ -2078,7 +2077,337 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, prefix=False, stat
     
     print( str(timedelta(seconds=clock())), "Finished")
     PrintStats(contig_parts, org_contig_info, min_num_reads)
+
+def LoadExtensions(prefix, min_extension):
+    # Load extending mappings
+    mappings = pd.read_csv(prefix+"_extensions.csv")
+
+    # Split mappings by side
+    mappings = mappings.iloc[np.repeat(mappings.index, 2)].reset_index(drop=True).copy()
+    mappings['side'] = np.tile(['l','r'], int(len(mappings)/2))
+    mappings['dist_start'] = np.where('l' == mappings['side'], mappings['left_dist_start'], mappings['right_dist_start'])
+    mappings['dist_end'] = np.where('l' == mappings['side'], mappings['left_dist_end'], mappings['right_dist_end'])
+    mappings['extension'] = np.where('l' == mappings['side'], mappings['left_ext'], mappings['right_ext'])
+    mappings.drop(columns = ['left_dist_start', 'right_dist_start', 'left_dist_end', 'right_dist_end', 'left_ext', 'right_ext'], inplace=True)
     
+    # Drop sides that do not fullfil min_extension
+    mappings = mappings[min_extension <= mappings['extension']].reset_index(drop=True).copy()
+    
+    return mappings
+
+def RemoveDuplicatedReadMappings(reads):
+    # Minimap2 has sometimes two overlapping mappings: Remove the shorter mapping
+    reads.sort_values(['q_scaffold','q_side','t_scaffold','t_side','q_index','t_index'], inplace=True)
+    reads['min_len'] = np.minimum(reads['q_end']-reads['q_start'], reads['t_end']-reads['t_start'])
+    duplicates = reads.groupby(['q_scaffold','q_side','t_scaffold','t_side','q_index','t_index'])['min_len'].agg(['max','size'])
+    reads['max_len'] = np.repeat(duplicates['max'].values,duplicates['size'].values)
+    reads = reads[reads['min_len'] == reads['max_len']].copy()
+
+    # Remove the more unequal one
+    reads['max_len'] = np.maximum(reads['q_end']-reads['q_start'], reads['t_end']-reads['t_start'])
+    duplicates = reads.groupby(['q_scaffold','q_side','t_scaffold','t_side','q_index','t_index'])['max_len'].agg(['min','size'])
+    reads['min_len'] = np.repeat(duplicates['min'].values,duplicates['size'].values)
+    reads = reads[reads['min_len'] == reads['max_len']].copy()
+    reads.drop(columns=['min_len','max_len'], inplace=True)
+
+    # Otherwise remove the second one (with the higher original id)
+    duplicates = reads.groupby(['q_scaffold','q_side','t_scaffold','t_side','q_index','t_index'])['org_id'].agg(['min','size'])
+    reads['min_id'] = np.repeat(duplicates['min'].values,duplicates['size'].values)
+    reads = reads[reads['org_id'] == reads['min_id']].copy()
+    reads.drop(columns=['min_id','org_id'], inplace=True)
+
+    return reads
+
+def LoadReads(all_vs_all_mapping_file, mappings, min_length_contig_break):
+    # Load all vs. all mappings for extending reads
+    reads = ReadPaf(all_vs_all_mapping_file)
+    reads.drop(columns=['matches','alignment_length','mapq'], inplace=True) # We don't need those columns
+
+    # Add scaffold and side to which the query reads belong to
+    reads = reads.merge(mappings[['read_name','read_start','read_from','read_to','scaffold','side','strand']].reset_index().rename(columns={'index':'q_index', 'read_name':'q_name', 'read_start':'q_read_start', 'read_from':'q_read_from', 'read_to':'q_read_to', 'scaffold':'q_scaffold', 'side':'q_side', 'strand':'q_strand'}), on=['q_name'], how='inner')
+
+    # Remove reads where the all vs. all mapping is not in the gap for the scaffold belonging to the query
+    reads = reads[np.where(np.logical_xor('+' == reads['q_strand'], 'l' == reads['q_side']), reads['q_end'] > reads['q_read_to'], reads['q_start'] < reads['q_read_from'])].copy()
+
+    # Repeat the last two steps for the target reads
+    reads = reads.merge(mappings[['read_name','read_start','read_from','read_to','scaffold','side','strand']].reset_index().rename(columns={'index':'t_index','read_name':'t_name', 'read_start':'t_read_start', 'read_from':'t_read_from', 'read_to':'t_read_to', 'scaffold':'t_scaffold', 'side':'t_side', 'strand':'t_strand'}), on=['t_name'], how='inner')
+    reads = reads[np.where(np.logical_xor('+' == reads['t_strand'], 'l' == reads['t_side']), reads['t_end'] > reads['t_read_to'], reads['t_start'] < reads['t_read_from'])].copy()
+
+    # Remove reads that map to itself, drop superfluous columns and reorder remaining columns
+    reads = reads.loc[(reads['q_name'] != reads['t_name']) | (reads['q_read_start'] != reads['t_read_start']), ['q_scaffold','q_side','q_index','q_read_from','q_read_to','q_start','q_end','q_len','q_strand','t_scaffold','t_side','t_index','t_read_from','t_read_to','t_start','t_end','t_len','t_strand','strand'] ]
+
+    # Add query-target reverted copy to reads, so that all relevant read mappings show up if we search for example for q_scaffold
+    reads['org_id'] = reads.index # We need this one to properly remove duplicated mappings later
+    reads = pd.concat([reads, reads.rename(columns={'q_scaffold':'t_scaffold', 't_scaffold':'q_scaffold', 'q_side':'t_side', 't_side':'q_side', 'q_index':'t_index', 't_index':'q_index',
+                                                    'q_read_from':'t_read_from', 't_read_from':'q_read_from', 'q_read_to':'t_read_to', 't_read_to':'q_read_to', 
+                                                    'q_start':'t_start', 't_start':'q_start', 'q_end':'t_end', 't_end':'q_end', 'q_len':'t_len', 't_len':'q_len',
+                                                    'q_strand':'t_strand', 't_strand':'q_strand'})], ignore_index=True, sort=False)
+
+    # Minimap2 has sometimes two overlapping mappings
+    reads = RemoveDuplicatedReadMappings(reads)
+
+    # Split into extending read mappings(share the same scaffold) and connecting read mappings(do not share the same scaffold)
+    extensions = reads[(reads['q_scaffold'] == reads['t_scaffold']) & (reads['q_side'] == reads['t_side'])].drop(columns=['t_scaffold','t_side']).rename(columns={'q_scaffold':'scaffold','q_side':'side'}).copy()
+    connections = reads[(reads['q_scaffold'] != reads['t_scaffold']) | (reads['q_side'] != reads['t_side'])].copy()
+
+    # Filter extensions where the all vs. all mapping does not touch the the contig mapping of query and target or the reads diverge more than min_length_contig_break or their mapping length within the contig mapping
+    extensions['q_max_divergence'] = np.minimum(min_length_contig_break, np.where(np.logical_xor('+' == extensions['q_strand'], 'l' == extensions['side']), extensions['q_read_to']-extensions['q_start'], extensions['q_end']-extensions['q_read_from']))
+    extensions['t_max_divergence'] = np.minimum(min_length_contig_break, np.where(np.logical_xor('+' == extensions['t_strand'], 'l' == extensions['side']), extensions['t_read_to']-extensions['t_start'], extensions['t_end']-extensions['t_read_from']))
+    extensions = extensions[(0 < extensions['q_max_divergence']) & (0 < extensions['t_max_divergence'])].copy() # all vs. all mappings do not touch contig mapping
+    extensions['read_divergence'] = np.minimum(np.where(np.logical_xor('+' == extensions['q_strand'], 'l' == extensions['side']), extensions['q_start'], extensions['q_len']-extensions['q_end']), np.where(np.logical_xor('+' == extensions['t_strand'], 'l' == extensions['side']), extensions['t_start'], extensions['t_len']-extensions['t_end']))
+    extensions = extensions[( (0 < np.where(np.logical_xor('+' == extensions['q_strand'], 'l' == extensions['side']), extensions['q_read_from']-extensions['q_start'], extensions['q_end']-extensions['q_read_to']) + extensions['q_max_divergence']) |
+                              (extensions['read_divergence'] < extensions['q_max_divergence']) ) &
+                            ( (0 < np.where(np.logical_xor('+' == extensions['t_strand'], 'l' == extensions['side']), extensions['t_read_from']-extensions['t_start'], extensions['t_end']-extensions['t_read_to']) + extensions['t_max_divergence']) |
+                              (extensions['read_divergence'] < extensions['t_max_divergence']) ) ].copy()
+    extensions.drop(columns=['q_max_divergence','t_max_divergence','read_divergence'], inplace=True)
+
+    # Extensions: Remove reads that somehow do not fullfil strand rules and remove superfluous strand column
+    extensions = extensions[ np.where(extensions['q_strand'] == extensions['t_strand'], '+', '-') == extensions['strand'] ].copy()
+    extensions.drop(columns=['strand'], inplace=True)
+
+    return extensions, connections
+
+def ClusterExtension(extensions, min_num_reads):
+    # Remove indexes that cannot fulfill min_num_reads (have less than min_num_reads-1 mappings to other reads)
+    extensions.sort_values(['scaffold','side','q_index'], inplace=True)
+    org_len = len(extensions)+1
+    while len(extensions) < org_len:
+        num_mappings = extensions.groupby(['scaffold','side','q_index'], sort=False).size().values
+        extensions['q_mappings'] = np.repeat(num_mappings, num_mappings)
+        extensions.sort_values(['scaffold','side','t_index'], inplace=True)
+        
+        num_mappings = extensions.groupby(['scaffold','side','t_index'], sort=False).size().values
+        extensions['t_mappings'] = np.repeat(num_mappings, num_mappings)
+        
+        org_len = len(extensions)
+        extensions = extensions[ np.minimum(extensions['q_mappings'], extensions['t_mappings']) >= min_num_reads-1 ].copy()
+        if len(extensions) < org_len:
+            num_mappings = extensions.groupby(['scaffold','side','t_index'], sort=False).size().values
+            extensions['t_mappings'] = np.repeat(num_mappings, num_mappings)
+            
+            extensions.sort_values(['scaffold','side','q_index'], inplace=True)
+            num_mappings = extensions.groupby(['scaffold','side','q_index'], sort=False).size().values
+            extensions['q_mappings'] = np.repeat(num_mappings, num_mappings)
+            
+            org_len = len(extensions)
+            extensions = extensions[ np.minimum(extensions['q_mappings'], extensions['t_mappings']) >= min_num_reads-1 ].copy()
+            
+    extensions.drop(columns=['q_mappings','t_mappings'], inplace=True)
+    
+    # Cluster reads that share a mapping (A read in a cluster maps at least to one other read in this cluster)
+    extensions.sort_values(['scaffold','side','q_index'], inplace=True)
+    clusters = extensions.groupby(['scaffold','side','q_index'], sort=False).size().reset_index(name='size')
+    clusters['cluster'] = np.arange(len(clusters))
+    extensions['q_cluster_id'] = np.repeat(clusters.index.values, clusters['size'].values)
+    extensions = extensions.merge(clusters[['scaffold','side','q_index']].reset_index().rename(columns={'q_index':'t_index','index':'t_cluster_id'}), on=['scaffold','side','t_index'], how='left')
+    
+    cluster_col = clusters.columns.get_loc('cluster')
+    extensions['cluster'] = np.minimum(clusters.iloc[extensions['q_cluster_id'].values, cluster_col].values, clusters.iloc[extensions['t_cluster_id'].values, cluster_col].values)
+    clusters['new_cluster'] = np.minimum( extensions.groupby('q_cluster_id')['cluster'].min().values, extensions.groupby('t_cluster_id')['cluster'].min().values )
+    while np.sum(clusters['new_cluster'] != clusters['cluster']):
+        clusters['cluster'] = clusters['new_cluster']
+        extensions['cluster'] = np.minimum(clusters.iloc[extensions['q_cluster_id'].values, cluster_col].values, clusters.iloc[extensions['t_cluster_id'].values, cluster_col].values)
+        clusters['new_cluster'] = np.minimum( extensions.groupby('q_cluster_id')['cluster'].min().values, extensions.groupby('t_cluster_id')['cluster'].min().values )
+    
+    extensions['cluster'] = clusters.iloc[extensions['q_cluster_id'].values, cluster_col].values
+    clusters.drop(columns=['new_cluster'], inplace=True)
+    
+    # Remove sides with two alternative clusters
+    clusters.sort_values(['cluster','size','q_index'], ascending=[True,False,True], inplace=True)
+    alternatives = clusters[['scaffold','side','cluster']].drop_duplicates().groupby(['scaffold','side']).size().reset_index(name='alternatives')
+    clusters['cluster_id'] = clusters.index # We have to save it, because 'q_cluster_id' and 't_cluster_id' use them and merging removes the index
+    clusters = clusters.merge(alternatives, on=['scaffold','side'], how='left')
+    clusters.index = clusters['cluster_id'].values
+    extensions['alternatives'] = clusters.loc[ extensions['q_cluster_id'].values, 'alternatives' ].values
+    clusters = clusters[ clusters['alternatives'] == 1 ].copy()
+    extensions = extensions[ extensions['alternatives'] == 1 ].copy()
+    clusters.drop(columns=['alternatives'], inplace=True)
+    extensions.drop(columns=['alternatives'], inplace=True)
+    
+    # Add how long the query agrees with the target in the gap
+    extensions['q_agree'] = np.where( np.logical_xor('+' == extensions['q_strand'], 'l' == extensions['side']), extensions['q_end']-extensions['q_read_to'], extensions['q_read_from']-extensions['q_start'] )
+    
+    extensions.drop(columns=['cluster','q_cluster_id','t_cluster_id'], inplace=True)
+    return extensions
+
+def ExtendScaffolds(scaffold_table, extensions, mappings, min_num_reads, max_mapping_uncertainty):
+    # Create table on how long mappings agree in the gap with at least min_num_reads-1 (-1 because they always agree with themselves)
+    len_agree = extensions[['scaffold','side','q_index','q_agree']].sort_values(['scaffold','side','q_index','q_agree'], ascending=[True,True,True,False])
+    len_agree['n_longest'] = 1
+    len_agree['n_longest'] = len_agree[['scaffold','side','q_index','n_longest']].groupby(['scaffold','side','q_index'], sort=False).cumsum()
+    len_agree = len_agree[len_agree['n_longest'] == max(1,min_num_reads-1)]
+    len_agree.drop(columns=['n_longest'], inplace=True)
+    len_mappings = mappings.iloc[len_agree['q_index'].values]
+    len_agree['q_ext_len'] = np.where( np.logical_xor('+' == len_mappings['strand'], 'l' == len_mappings['side']), len_mappings['read_end']-len_mappings['read_to'], len_mappings['read_from'] )
+    
+    # Take the read that has the longest agreement with at least min_num_reads-1 and see if and at what position another bundle of min_num_reads diverge from it (extend until that position or as long as min_num_reads-1 agree)
+    len_agree.sort_values(['scaffold','side','q_agree'], ascending=[True,True,False], inplace=True)
+    extending_reads = len_agree.groupby(['scaffold','side'], sort=False).first().reset_index()
+    len_agree = len_agree.merge(extending_reads[['scaffold','side','q_index']].rename(columns={'q_index':'t_index'}), on=['scaffold','side'], how='inner')
+    len_agree = len_agree[len_agree['q_index'] != len_agree['t_index']].copy()
+    len_agree = len_agree.merge(extensions[['scaffold','side','q_index','t_index','q_agree']].rename(columns={'q_agree':'qt_agree'}), on=['scaffold','side','q_index','t_index'], how='left')
+    len_agree['qt_agree'].fillna(0, inplace=True)
+    len_agree = len_agree[ len_agree['q_agree'] > len_agree['qt_agree']+max_mapping_uncertainty].copy()
+    len_agree = len_agree.merge(extensions[['scaffold','side','q_index','t_index','q_agree']].rename(columns={'q_index':'t_index','t_index':'q_index','q_agree':'tq_agree'}), on=['scaffold','side','q_index','t_index'], how='left')
+    len_agree['tq_agree'].fillna(0, inplace=True)
+    
+    len_agree.sort_values(['scaffold','side','tq_agree'], inplace=True)
+    len_agree['n_disagree'] = 1
+    len_agree['n_disagree'] = len_agree[['scaffold','side','n_disagree']].groupby(['scaffold','side'], sort=False).cumsum()
+    len_agree = len_agree[ len_agree['n_disagree'] == min_num_reads ].copy()
+    extending_reads = extending_reads.merge(len_agree[['scaffold','side','tq_agree']].rename(columns={'tq_agree':'valid_ext'}), on=['scaffold','side'], how='left')
+    extending_reads.loc[np.isnan(extending_reads['valid_ext']),'valid_ext'] = extending_reads.loc[np.isnan(extending_reads['valid_ext']),'q_agree'].values
+    extending_reads = extending_reads[extending_reads['valid_ext'] > 0.0].copy()
+    
+    # Change structure of extending_reads to the same as scaffold_table
+    # Start by adding read information
+    ext_mappings = mappings.iloc[extending_reads['q_index'].values]
+    extending_reads['name'] = ext_mappings['read_name'].values
+    extending_reads['start'] = np.where( np.logical_xor('+' == ext_mappings['strand'], 'l' == ext_mappings['side']), ext_mappings['read_to'].values, ext_mappings['read_from'].values-extending_reads['valid_ext'].values.astype(int) )
+    extending_reads['end'] = np.where( np.logical_xor('+' == ext_mappings['strand'], 'l' == ext_mappings['side']), ext_mappings['read_to'].values+extending_reads['valid_ext'].values.astype(int), ext_mappings['read_from'].values )
+    extending_reads['reverse'] = ('-' == ext_mappings['strand'].values)
+    
+    # Cut contigs where it is required by the extensions
+    scaffold_table['side'] = np.where(0 == scaffold_table['pos'], 'l', '')
+    scaffold_table = scaffold_table.merge(ext_mappings[['scaffold','side','dist_start']].rename(columns={'dist_start':'left_start'}), on=['scaffold','side'], how='left')
+    scaffold_table['side'] = np.where(scaffold_table['scaf_size'] == scaffold_table['pos']+1, 'r', '')
+    scaffold_table = scaffold_table.merge(ext_mappings[['scaffold','side','dist_start']].rename(columns={'dist_start':'right_start'}), on=['scaffold','side'], how='left')
+    scaffold_table.loc[(False == scaffold_table['reverse']) & (False == np.isnan(scaffold_table['left_start'])), 'start'] += scaffold_table.loc[(False == scaffold_table['reverse']) & (False == np.isnan(scaffold_table['left_start'])), 'left_start']
+    scaffold_table.loc[scaffold_table['reverse'] & (False == np.isnan(scaffold_table['left_start'])), 'end'] -= scaffold_table.loc[scaffold_table['reverse'] & (False == np.isnan(scaffold_table['left_start'])), 'left_start']
+    scaffold_table.loc[(False == scaffold_table['reverse']) & (False == np.isnan(scaffold_table['right_start'])), 'end'] -= scaffold_table.loc[(False == scaffold_table['reverse']) & (False == np.isnan(scaffold_table['right_start'])), 'right_start']
+    scaffold_table.loc[scaffold_table['reverse'] & (False == np.isnan(scaffold_table['right_start'])), 'start'] += scaffold_table.loc[scaffold_table['reverse'] & (False == np.isnan(scaffold_table['right_start'])), 'right_start']
+    scaffold_table['start'] = scaffold_table['start'].astype(int)
+    scaffold_table['end'] = scaffold_table['end'].astype(int)
+    
+    # Update scaffold information in scaffold_table and add it to extending_reads
+    ext_count = scaffold_table.groupby(['scaffold'], sort=False).agg({'left_start':['size','count'], 'right_start':['count']})
+    scaffold_table['scaf_size'] += np.repeat(ext_count['left_start','count'].values + ext_count['right_start','count'].values, ext_count['left_start','size'])
+    scaffold_table['pos'] += np.repeat(ext_count['left_start','count'].values, ext_count['left_start','size'])
+    
+    extending_reads = extending_reads.merge(scaffold_table[['scaffold','scaf_size']].groupby(['scaffold'], sort=False).first(), on=['scaffold'], how='left')
+    extending_reads['pos'] = np.where(extending_reads['side'] == 'l', 0, extending_reads['scaf_size']-1)
+    
+    extending_reads = extending_reads.merge(scaffold_table[['scaffold','side','org_dist_right']], on=['scaffold','side'], how='left')
+    extending_reads['org_dist_right'] = extending_reads['org_dist_right'].fillna(-1).astype(int)
+    scaffold_table['side'] = np.where(1 == scaffold_table['pos'], 'l', '') # Position of left contig with extension is now 1, because we already shifted (For non-extended scaffold that is not the left-most part, but we don't care, because those scaffolds are not in extending_reads)
+    extending_reads = extending_reads.merge(scaffold_table[['scaffold','side','org_dist_left']], on=['scaffold','side'], how='left')
+    extending_reads['org_dist_left'] = extending_reads['org_dist_left'].fillna(-1).astype(int)
+    
+    scaffold_table.loc[False == np.isnan(scaffold_table['left_start']), 'org_dist_left'] = -1
+    scaffold_table.loc[False == np.isnan(scaffold_table['right_start']), 'org_dist_right'] = -1
+    scaffold_table.drop(columns=['side','left_start','right_start'], inplace=True)
+    
+    # Add extending_reads to scaffold_table and sort again
+    extending_reads['type'] = 'read'
+    scaffold_table = scaffold_table.append( extending_reads[['scaffold','pos','scaf_size','type','name','start','end','reverse','org_dist_left','org_dist_right']] )
+    scaffold_table.sort_values(['scaffold','pos'], inplace=True)
+    
+    extension_info = {}
+    extension_info['count'] = len(extending_reads)
+    extension_info['left'] = len(extending_reads[extending_reads['side'] == 'l'])
+    extension_info['right'] = len(extending_reads[extending_reads['side'] == 'r'])
+    extension_info['mean'] = int(round(np.mean(extending_reads['valid_ext'])))
+    extension_info['min'] = int(np.min(extending_reads['valid_ext']))
+    extension_info['max'] = int(np.max(extending_reads['valid_ext']))
+    
+    return scaffold_table, extension_info
+
+def MiniGapExtend(all_vs_all_mapping_file, prefix):
+    # Define parameters
+    min_extension = 500    
+    min_num_reads = 3
+    min_length_contig_break = 1000
+    max_mapping_uncertainty = 200
+    
+    print( str(timedelta(seconds=clock())), "Preparing data from files")
+    scaffold_table = pd.read_csv(prefix+"_scaffold_table.csv")
+    mappings = LoadExtensions(prefix, min_extension)
+    extensions, connections = LoadReads(all_vs_all_mapping_file, mappings, min_length_contig_break)
+    
+    print( str(timedelta(seconds=clock())), "Searching for extensions")
+    extensions = ClusterExtension(extensions, min_num_reads)
+    scaffold_table, extension_info = ExtendScaffolds(scaffold_table, extensions, mappings, min_num_reads, max_mapping_uncertainty)
+
+    print( str(timedelta(seconds=clock())), "Writing output")
+    scaffold_table.to_csv(prefix+"_extended_scaffold_table.csv", index=False)
+    np.savetxt(prefix+'_used_reads.lst', np.unique(scaffold_table.loc['read' == scaffold_table['type'], 'name']), fmt='%s')
+    
+    print( str(timedelta(seconds=clock())), "Finished")
+    print( "Extended {} scaffolds (left: {}, right:{}).".format(extension_info['count'], extension_info['left'], extension_info['right']) )
+    print( "The extensions ranged from {} to {} bases and had a mean length of {}.".format(extension_info['min'], extension_info['max'], extension_info['mean']) )
+
+def MiniGapFinish(assembly_file, read_file, read_format, scaffold_file, output_file):
+    if False == output_file:
+        if ".gz" == assembly_file[-3:len(assembly_file)]:
+            output_file = assembly_file.rsplit('.',2)[0]+"_minigap.fa"
+        else:
+            output_file = assembly_file.rsplit('.',1)[0]+"_minigap.fa"
+        pass
+    
+    print( str(timedelta(seconds=clock())), "Loading assembly from: {}".format(assembly_file))
+    contigs = {}
+    with gzip.open(assembly_file, 'rb') if 'gz' == assembly_file.rsplit('.',1)[-1] else open(assembly_file, 'rU') as fin:
+        for record in SeqIO.parse(fin, "fasta"):
+            contigs[ record.description.split(' ', 1)[0] ] = record.seq
+    
+    print( str(timedelta(seconds=clock())), "Loading reads from: {}".format(read_file))
+    reads = {}
+    with gzip.open(read_file, 'rb') if 'gz' == read_file.rsplit('.',1)[-1] else open(read_file, 'rU') as fin:
+        for record in SeqIO.parse(fin, read_format):
+            reads[ record.description.split(' ', 1)[0] ] = record.seq
+            
+    print( str(timedelta(seconds=clock())), "Loading scaffold info from: {}".format(scaffold_file))
+    scaffold_table = pd.read_csv(scaffold_file)
+    
+    print( str(timedelta(seconds=clock())), "Writing modified assembly to: {}".format(output_file))
+    with gzip.open(output_file, 'wb') if 'gz' == output_file.rsplit('.',1)[-1] else open(output_file, 'w') as fout:
+        cur_scaffold = 0
+        name = []
+        seq = []
+        for row in scaffold_table.itertuples(index=False):
+            # Check if scaffold changed
+            if cur_scaffold != row.scaffold:
+                if cur_scaffold < row.scaffold:
+                    # Write scaffold to disc
+                    fout.write('_'.join(name))
+                    fout.write('\n')
+                    fout.write(''.join(seq))
+                    fout.write('\n')
+
+                    # Start new scaffold
+                    cur_scaffold = row.scaffold
+                    name = []
+                    seq = []
+                else:
+                    print("Encountered scaffold {} while handling scaffold {}. The loaded scaffold table is invalid." )
+            
+            # Add sequences to scaffold
+            if 'contig' == row.type:
+                name.append(row.name)
+                
+                if row.reverse:
+                    seq.append(str(contigs[row.name][row.start:row.end].reverse_complement()))
+                else:
+                    seq.append(str(contigs[row.name][row.start:row.end]))
+            else:
+                if row.reverse:
+                    seq.append(str(reads[row.name][row.start:row.end].reverse_complement()))
+                else:
+                    seq.append(str(reads[row.name][row.start:row.end]))
+                
+            # Add N's to keep original scaffolds
+            if 0 <= row.org_dist_right:
+                seq.append( 'N' * row.org_dist_right )
+                cur_scaffold += 1 # Combine this scaffold with the next
+            
+            # Write out last scaffold
+            fout.write('_'.join(name))
+            fout.write('\n')
+            fout.write(''.join(seq))
+            fout.write('\n')
+        
+        print( str(timedelta(seconds=clock())), "Finished" )
+
 def MiniGapTest():
     # contigs, contig_ids = ReadContigs(assembly_file)
     # contigs, center_repeats = MaskRepeatEnds(contigs, repeat_file, contig_ids, max_repeat_extension, min_len_repeat_connection, repeat_len_factor_unique, remove_duplicated_contigs, pdf)
@@ -2095,21 +2424,34 @@ def Usage(module=""):
         print("Modules:")
         print("split         Splits scaffolds into contigs")
         print("scaffold      Scaffolds contigs and assigns reads to gaps")
-        print("finish        Fills gaps")
+        print("extend        Extend scaffold ends")
+        print("finish        Create new fasta assembly file")
         print("test          Short test")
     elif "split" == module:
         print("Usage: minigap.py split [OPTIONS] {assembly}.fa")
         print("Splits scaffolds into contigs.")
-        print("  -h, --help            Display this help and exit")
-        print("  -n, --minN [int]      Minimum number of N's to split at that position (1)")
-        print("  -o, --output FILE     File to which the split sequences should be written to ({assembly}_split.fa)")
+        print("  -h, --help                Display this help and exit")
+        print("  -n, --minN [int]          Minimum number of N's to split at that position (1)")
+        print("  -o, --output FILE.fa      File to which the split sequences should be written to ({assembly}_split.fa)")
     elif "scaffold" == module:
         print("Usage: minigap.py scaffold [OPTIONS] {assembly}.fa {mapping}.paf {repeat}.paf")
         print("Scaffolds contigs and assigns reads to gaps.")
-        print("  -h, --help            Display this help and exit")
-        print("  -p, --prefix FILE     Prefix for output files ({assembly})")
-        print("  -s, --stats FILE.pdf  Output file for plots with statistics regarding input parameters (deactivated)")
-
+        print("  -h, --help                Display this help and exit")
+        print("  -p, --prefix FILE         Prefix for output files ({assembly})")
+        print("  -s, --stats FILE.pdf      Output file for plots with statistics regarding input parameters (deactivated)")
+    elif "extend" == module:
+        print("Usage: minigap.py extend -p {prefix} {all_vs_all}.paf")
+        print("Extend scaffold ends with reads reaching over the ends.")
+        print("  -h, --help                Display this help and exit")
+        print("  -p, --prefix FILE         Prefix for output files of scaffolding step (mandatory)")
+    elif "finish" == module:
+        print("Usage: minigap.py finish [OPTIONS] -s {scaffolds}.csv {assembly}.fa {reads}.fq")
+        print("Creates previously defined scaffolds. Only providing necessary reads increases speed and substantially reduces memory requirements.")
+        print("  -h, --help                Display this help and exit")
+        print("  -f, --format FORMAT       Format of {reads}.fq (fasta/fastq) (Default: fastq)")
+        print("  -o, --output FILE.fa      Output file for modified assembly ({assembly}_minigap.fa)")
+        print("  -s, --scaffolds FILE.csv  Csv file from previous steps describing the scaffolding (mandatory)")
+        
 def main(argv):
     if 0 == len(argv):
         Usage()
@@ -2167,7 +2509,7 @@ def main(argv):
                 prefix = par
             elif opt in ("-s", "--stats"):
                 stats = par
-                if(stats[-4:] != ".pdf"):
+                if stats[-4:] != ".pdf":
                     print("stats argument needs to end on .pdf")
                     Usage(module)
                     sys.exit(1)
@@ -2178,9 +2520,74 @@ def main(argv):
             sys.exit(2)
 
         MiniGapScaffold(args[0], args[1], args[2], prefix, stats)
+    elif "extend" == module:
+        try:
+            optlist, args = getopt.getopt(argv, 'hp:', ['help','prefix='])
+        except getopt.GetoptError:
+            print("Unknown option\n")
+            Usage(module)
+            sys.exit(1)
+            
+        prefix = False
+        for opt, par in optlist:
+            if opt in ("-h", "--help"):
+                Usage(module)
+                sys.exit()
+            elif opt in ("-p", "--prefix"):
+                prefix = par
+                    
+        if 1 != len(args):
+            print("Wrong number of files. Exactly one file is required.\n")
+            Usage(module)
+            sys.exit(2)
+            
+        if False == prefix:
+            print("prefix argument is mandatory")
+            Usage(module)
+            sys.exit(1)
+
+        MiniGapExtend(args[0], prefix)
     elif "finish" == module:
-        print("Finish is not implemented yet")
-        sys.exit(1)
+        try:
+            optlist, args = getopt.getopt(argv, 'hf:o:s:', ['help','format=','output=','scaffolds='])
+        except getopt.GetoptError:
+            print("Unknown option\n")
+            Usage(module)
+            sys.exit(1)
+            
+        read_format = 'fastq'
+        output = False
+        scaffolds = False
+        for opt, par in optlist:
+            if opt in ("-h", "--help"):
+                Usage(module)
+                sys.exit()
+            elif opt in ("-f", "--format"):
+                if 'fasta' == par.lower() or 'fa' == par.lower():
+                    read_format = 'fasta'
+                elif 'fastq' == par.lower() or 'fq' == par.lower():
+                    pass # default
+                else:
+                    print("Unsupported read format: {}.".format(par))
+                    Usage(module)
+                    sys.exit(1)
+            elif opt in ("-o", "--output"):
+                output = par
+            elif opt in ("-s", "--scaffolds"):
+                scaffolds = par
+        
+        if 2 != len(args):
+            print("Wrong number of files. Exactly two files are required.\n")
+            Usage(module)
+            sys.exit(2)
+            
+        if False == scaffolds:
+            print("scaffolds argument is mandatory")
+            Usage(module)
+            sys.exit(1)
+
+
+        MiniGapFinish(args[0], args[1], read_format, scaffolds, output)
     elif "test" == module:
         MiniGapTest()
     else:
