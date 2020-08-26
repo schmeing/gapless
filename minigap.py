@@ -180,8 +180,8 @@ def PlotHist(pdf, xtitle, ytitle, values, category=[], catname='category', thres
         else:
             plt.axvline(threshold)
 
-    if logy:            
-        ax.set_yscale('log', nonposy='clip')
+    if logy:
+        ax.set_yscale('log', nonpositive='clip')
     else:
         # Set at what range of exponents they are not plotted in exponential format for example (-3,4): [0.001-1000[
         ax.get_yaxis().get_major_formatter().set_powerlimits((-3,4))
@@ -229,10 +229,11 @@ def MaskRepeatEnds(contigs, repeat_file, contig_ids, max_repeat_extension, min_l
     
     repeat_table = repeat_table[(repeat_table['q_name'] != repeat_table['t_name']) | (repeat_table['q_start'] != repeat_table['t_start'])].copy()  # Ignore repeats on same contig and same position
      
-    if pdf:
+    if pdf and len(repeat_table):
         tmp_dist = np.minimum(repeat_table['q_start'], repeat_table['q_len']-repeat_table['q_end']) # Repeat distance to contig end
         PlotHist(pdf, "Repeat distance to contig end", "# Repeat mappings", tmp_dist, logx=True, threshold=max_repeat_extension)
-        PlotHist(pdf, "Repeat distance to contig end", "# Repeat mappings", np.extract(tmp_dist < 10*max_repeat_extension, tmp_dist), threshold=max_repeat_extension)
+        if np.sum(tmp_dist < 10*max_repeat_extension):
+            PlotHist(pdf, "Repeat distance to contig end", "# Repeat mappings", np.extract(tmp_dist < 10*max_repeat_extension, tmp_dist), threshold=max_repeat_extension)
 
     # We can do everything on query as all mappings are also reversed in the table
     # Check if the repeat belongs to a contig end
@@ -292,27 +293,30 @@ def MaskRepeatEnds(contigs, repeat_file, contig_ids, max_repeat_extension, min_l
     con_search = con_search[(con_search['left_repeat'] != con_search['con_left']) & (con_search['strand'] == '+') | (con_search['left_repeat'] == con_search['con_left']) & (con_search['strand'] == '-')].copy() # Strand must match a connection
     
     # Apply filter
-    con_search = con_search.merge(second_longest, on=['q_id','left_repeat','right_repeat'], how='left').fillna(0)
-    con_search['accepted'] = (con_search['rep_len'] >= min_len_repeat_connection) & (con_search['len_second']*repeat_len_factor_unique < con_search['rep_len'])
-    if pdf:
-        PlotHist(pdf, "Connection length", "# Potential repeat connections", con_search['rep_len'], logx=True, threshold=min_len_repeat_connection)
-        PlotHist(pdf, "Connection length", "# Potential repeat connections", np.extract(con_search['rep_len'] < 10*min_len_repeat_connection, con_search['rep_len']), threshold=min_len_repeat_connection)
-        PlotXY(pdf, "Longest repeat connection", "Second longest connection", con_search['rep_len'], con_search['len_second'], category=np.where(con_search['accepted'], "accepted", "declined"))
-        #PlotXY(pdf, "Longest repeat connection", "Second longest connection", con_search['rep_len'], con_search['len_second'], category=con_search['accepted'], logx=True)
-    con_search = con_search[con_search['accepted']].copy()
-    
-    # Check that partner sides also survived all filters
-    con_search = con_search[(con_search.merge(con_search, left_on=['t_id','con_left','con_right'], right_on=['q_id','left_repeat','right_repeat'], how='left', indicator=True)['_merge'] == "both").values].copy()
+    if len(con_search):
+        con_search = con_search.merge(second_longest, on=['q_id','left_repeat','right_repeat'], how='left').fillna(0)
+        con_search['accepted'] = (con_search['rep_len'] >= min_len_repeat_connection) & (con_search['len_second']*repeat_len_factor_unique < con_search['rep_len'])
+        if pdf:
+            PlotHist(pdf, "Connection length", "# Potential repeat connections", con_search['rep_len'], logx=True, threshold=min_len_repeat_connection)
+            if np.sum(con_search['rep_len'] < 10*min_len_repeat_connection):
+                PlotHist(pdf, "Connection length", "# Potential repeat connections", np.extract(con_search['rep_len'] < 10*min_len_repeat_connection, con_search['rep_len']), threshold=min_len_repeat_connection)
+            PlotXY(pdf, "Longest repeat connection", "Second longest connection", con_search['rep_len'], con_search['len_second'], category=np.where(con_search['accepted'], "accepted", "declined"))
+            #PlotXY(pdf, "Longest repeat connection", "Second longest connection", con_search['rep_len'], con_search['len_second'], category=con_search['accepted'], logx=True)
+        con_search = con_search[con_search['accepted']].copy()
+        
+        # Check that partner sides also survived all filters
+        con_search = con_search[(con_search.merge(con_search, left_on=['t_id','con_left','con_right'], right_on=['q_id','left_repeat','right_repeat'], how='left', indicator=True)['_merge'] == "both").values].copy()
     
     # Store repeat connections
     contigs['rep_con_left'] = -1
     contigs['rep_con_side_left'] = ''
     contigs['rep_con_right'] = -1
     contigs['rep_con_side_right'] = ''
-    contigs.iloc[con_search.loc[con_search['left_repeat'], 'q_id'], contigs.columns.get_loc('rep_con_left')] = con_search.loc[con_search['left_repeat'], 't_id'].values
-    contigs.iloc[con_search.loc[con_search['left_repeat'], 'q_id'], contigs.columns.get_loc('rep_con_side_left')] = np.where(con_search.loc[con_search['left_repeat'], 'con_left'].values, 'l', 'r')
-    contigs.iloc[con_search.loc[con_search['right_repeat'], 'q_id'], contigs.columns.get_loc('rep_con_right')] = con_search.loc[con_search['right_repeat'], 't_id'].values
-    contigs.iloc[con_search.loc[con_search['right_repeat'], 'q_id'], contigs.columns.get_loc('rep_con_side_right')] = np.where(con_search.loc[con_search['right_repeat'], 'con_left'].values, 'l', 'r')
+    if len(con_search):
+        contigs.iloc[con_search.loc[con_search['left_repeat'], 'q_id'], contigs.columns.get_loc('rep_con_left')] = con_search.loc[con_search['left_repeat'], 't_id'].values
+        contigs.iloc[con_search.loc[con_search['left_repeat'], 'q_id'], contigs.columns.get_loc('rep_con_side_left')] = np.where(con_search.loc[con_search['left_repeat'], 'con_left'].values, 'l', 'r')
+        contigs.iloc[con_search.loc[con_search['right_repeat'], 'q_id'], contigs.columns.get_loc('rep_con_right')] = con_search.loc[con_search['right_repeat'], 't_id'].values
+        contigs.iloc[con_search.loc[con_search['right_repeat'], 'q_id'], contigs.columns.get_loc('rep_con_side_right')] = np.where(con_search.loc[con_search['right_repeat'], 'con_left'].values, 'l', 'r')
 
     ## Mask repeat ends
     # Keep only repeat positions and sort repeats by contig and start position to merge everything that is closer than max_repeat_extension
@@ -347,7 +351,8 @@ def MaskRepeatEnds(contigs, repeat_file, contig_ids, max_repeat_extension, min_l
         category = np.log10(contigs.loc[contigs['remove'] == False, 'length']).values.astype(int)
         category = [''.join(['>',a," bases"]) for a in np.power(10,category).astype(str)]
 
-        PlotHist(pdf, "% of bases masked", "# Contigs", masked, category=category, catname='length', logy=True)
+        if len(masked):
+            PlotHist(pdf, "% of bases masked", "# Contigs", masked, category=category, catname='length', logy=True)
 
     return contigs, repeat_table
 
@@ -384,31 +389,46 @@ def RemoveUnmappedContigs(contigs, mappings, remove_zero_hit_contigs):
     org_contig_info['len']['masked'] = np.sum(contigs.loc[np.logical_not(contigs['remove']) & (contigs['repeat_mask_right'] == 0), 'length'])
     org_contig_info['max'] = {}
     org_contig_info['max']['total'] = max(contigs['length'])
-    org_contig_info['max']['removed_total'] = max(contigs.loc[contigs['remove'], 'length'])
-    org_contig_info['max']['removed_no_mapping'] = max(contigs.loc[0==mapped_reads, 'length'])
-    org_contig_info['max']['removed_duplicates'] = max(contigs.loc[contigs['remove'] & (0<mapped_reads), 'length'])
-    org_contig_info['max']['masked'] = max(contigs.loc[np.logical_not(contigs['remove']) & (contigs['repeat_mask_right'] == 0), 'length'])
+    if 0 < org_contig_info['num']['removed_total']:
+        org_contig_info['max']['removed_total'] = max(contigs.loc[contigs['remove'], 'length'])
+    else:
+        org_contig_info['max']['removed_total'] = 0
+    if 0 < org_contig_info['num']['removed_no_mapping']:
+        org_contig_info['max']['removed_no_mapping'] = max(contigs.loc[0==mapped_reads, 'length'])
+    else:
+        org_contig_info['max']['removed_no_mapping'] = 0
+    if 0 < org_contig_info['num']['removed_duplicates']:
+        org_contig_info['max']['removed_duplicates'] = max(contigs.loc[contigs['remove'] & (0<mapped_reads), 'length'])
+    else:
+        org_contig_info['max']['removed_duplicates'] = 0
+    if 0 < org_contig_info['num']['masked']:
+        org_contig_info['max']['masked'] = max(contigs.loc[np.logical_not(contigs['remove']) & (contigs['repeat_mask_right'] == 0), 'length'])
+    else:
+        org_contig_info['max']['masked'] = 0
 
     return contigs, org_contig_info
 
 def RemoveUnanchoredMappings(mappings, contigs, center_repeats, min_mapping_length, pdf, max_dist_contig_end):
     # Filter reads only mapping to repeat ends
     mapping_lengths = np.minimum(
-                mappings['t_end'] - np.maximum(mappings['t_start'], contigs['repeat_mask_left'].iloc[mappings['t_id']]),
-                np.minimum(mappings['t_end'], contigs['repeat_mask_right'].iloc[mappings['t_id']]) - mappings['t_start'] )
+                mappings['t_end'].values - np.maximum(mappings['t_start'].values, contigs['repeat_mask_left'].iloc[mappings['t_id']].values),
+                np.minimum(mappings['t_end'].values, contigs['repeat_mask_right'].iloc[mappings['t_id']].values) - mappings['t_start'].values )
     mappings = mappings[min_mapping_length <= mapping_lengths].copy()
 
     if pdf:
         mapping_lengths[ 0 > mapping_lengths ] = 0 # Set negative values to zero (Only mapping to repeat)
-        PlotHist(pdf, "Mapping length", "# Mappings", np.extract(mapping_lengths < 10*min_mapping_length, mapping_lengths), threshold=min_mapping_length)
+        if np.sum(mapping_lengths < 10*min_mapping_length):
+            PlotHist(pdf, "Mapping length", "# Mappings", np.extract(mapping_lengths < 10*min_mapping_length, mapping_lengths), threshold=min_mapping_length)
         PlotHist(pdf, "Mapping length", "# Mappings", mapping_lengths, threshold=min_mapping_length, logx=True)
                  
         # Plot distance of mappings from contig ends, where the continuing read is longer than the continuing contig
         dists_contig_ends = mappings.loc[mappings['t_start'] < np.where('+' == mappings['strand'], mappings['q_start'], mappings['q_len']-mappings['q_end']), 't_start']
         dists_contig_ends = np.concatenate([dists_contig_ends, 
                                             np.extract( mappings['t_len']-mappings['t_end'] < np.where('+' == mappings['strand'], mappings['q_len']-mappings['q_end'], mappings['q_start']), mappings['t_len']-mappings['t_end'] )] )
-        PlotHist(pdf, "Distance to contig end", "# Reads reaching over contig ends", np.extract(dists_contig_ends < 10*max_dist_contig_end, dists_contig_ends), threshold=max_dist_contig_end, logy=True)
-        PlotHist(pdf, "Distance to contig end", "# Reads reaching over contig ends", dists_contig_ends, threshold=max_dist_contig_end, logx=True)
+        if len(dists_contig_ends):
+            if np.sum(dists_contig_ends < 10*max_dist_contig_end):
+                PlotHist(pdf, "Distance to contig end", "# Reads reaching over contig ends", np.extract(dists_contig_ends < 10*max_dist_contig_end, dists_contig_ends), threshold=max_dist_contig_end, logy=True)
+            PlotHist(pdf, "Distance to contig end", "# Reads reaching over contig ends", dists_contig_ends, threshold=max_dist_contig_end, logx=True)
 
     # Find and remove reads only mapping to center repeats (Distance to merge repeats should be larger than min_mapping_length, so we can consider here one repeat at a time)
     repeats = center_repeats.merge(mappings, left_on=['con_id'], right_on=['t_id'], how='left', indicator=True)
@@ -441,8 +461,10 @@ def BreakReadsAtAdapters(mappings, adapter_signal_max_dist, pdf):
 
     if pdf:
         potential_adapter_dist = location_shift[adapter]
-        PlotHist(pdf, "Distance for potential adapter signal", "# Signals", np.extract(potential_adapter_dist < 10*adapter_signal_max_dist, potential_adapter_dist), threshold=adapter_signal_max_dist, logy=True)
-        PlotHist(pdf, "Distance for potential adapter signal", "# Signals", potential_adapter_dist, threshold=adapter_signal_max_dist, logx=True)
+        if len(potential_adapter_dist):
+            if np.sum(potential_adapter_dist < 10*adapter_signal_max_dist):
+                PlotHist(pdf, "Distance for potential adapter signal", "# Signals", np.extract(potential_adapter_dist < 10*adapter_signal_max_dist, potential_adapter_dist), threshold=adapter_signal_max_dist, logy=True)
+            PlotHist(pdf, "Distance for potential adapter signal", "# Signals", potential_adapter_dist, threshold=adapter_signal_max_dist, logx=True)
 
     adapter = adapter & (location_shift <= adapter_signal_max_dist)
 
@@ -472,8 +494,10 @@ def GetBrokenMappings(mappings, max_dist_contig_end, min_length_contig_break, pd
 
     if pdf:
         dists_contig_ends = np.concatenate([left_breaks['t_len']-left_breaks['t_end'], right_breaks['t_start'] ])
-        PlotHist(pdf, "Distance to contig end", "# Potential contig breaks", np.extract(dists_contig_ends < 10*max_dist_contig_end, dists_contig_ends), threshold=max_dist_contig_end)
-        PlotHist(pdf, "Distance to contig end", "# Potential contig breaks", dists_contig_ends, threshold=max_dist_contig_end, logx=True)
+        if len(dists_contig_ends):
+            if np.sum(dists_contig_ends < 10*max_dist_contig_end):
+                PlotHist(pdf, "Distance to contig end", "# Potential contig breaks", np.extract(dists_contig_ends < 10*max_dist_contig_end, dists_contig_ends), threshold=max_dist_contig_end)
+            PlotHist(pdf, "Distance to contig end", "# Potential contig breaks", dists_contig_ends, threshold=max_dist_contig_end, logx=True)
 
     return left_breaks, right_breaks
 
@@ -490,11 +514,13 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
         loose_reads_ends_length = np.where('+' == loose_reads_ends['strand'], loose_reads_ends['q_start']-loose_reads_ends['read_start'], loose_reads_ends['read_end']-loose_reads_ends['q_end'])
         loose_reads_ends = mappings[(mappings['t_len']-mappings['t_end'] > max_dist_contig_end) & np.where('+' == mappings['strand'], -1 == mappings['next_con'], -1 == mappings['prev_con'])]
         loose_reads_ends_length = np.concatenate([loose_reads_ends_length, np.where('+' == loose_reads_ends['strand'], loose_reads_ends['read_end']-loose_reads_ends['q_end'], loose_reads_ends['q_start']-loose_reads_ends['read_start'])])
-        PlotHist(pdf, "Loose end length", "# Ends", np.extract(loose_reads_ends_length < 10*min_length_contig_break, loose_reads_ends_length), threshold=min_length_contig_break, logy=True)
-        PlotHist(pdf, "Loose end length", "# Ends", loose_reads_ends_length, threshold=min_length_contig_break, logx=True)
+        if len(loose_reads_ends_length):
+            if np.sum(loose_reads_ends_length < 10*min_length_contig_break):
+                PlotHist(pdf, "Loose end length", "# Ends", np.extract(loose_reads_ends_length < 10*min_length_contig_break, loose_reads_ends_length), threshold=min_length_contig_break, logy=True)
+            PlotHist(pdf, "Loose end length", "# Ends", loose_reads_ends_length, threshold=min_length_contig_break, logx=True)
 
     left_breaks, right_breaks = GetBrokenMappings(mappings, max_dist_contig_end, min_length_contig_break, pdf)
-
+    
     break_points = pd.DataFrame({ 'contig_id': np.concatenate([ left_breaks['t_id'], right_breaks['t_id'] ]),
                                   'side': np.concatenate([ np.full(len(left_breaks), 'l'), np.full(len(right_breaks), 'r') ]),
                                   'position': np.concatenate([ left_breaks['t_end'], right_breaks['t_start'] ]),
@@ -504,8 +530,10 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
 
     if pdf:
         break_point_dist = (break_points['position'] - break_points['position'].shift(1, fill_value=0))[break_points['contig_id'] == break_points['contig_id'].shift(1, fill_value=-1)]
-        PlotHist(pdf, "Break point distance", "# Break point pairs", break_point_dist[break_point_dist <= 10*max_break_point_distance], threshold=max_break_point_distance )
-        PlotHist(pdf, "Break point distance", "# Break point pairs", break_point_dist, threshold=max_break_point_distance, logx=True )
+        if len(break_point_dist):
+            if np.sum(break_point_dist <= 10*max_break_point_distance):
+                PlotHist(pdf, "Break point distance", "# Break point pairs", break_point_dist[break_point_dist <= 10*max_break_point_distance], threshold=max_break_point_distance )
+            PlotHist(pdf, "Break point distance", "# Break point pairs", break_point_dist, threshold=max_break_point_distance, logx=True )
 
     # Cluster break_points into groups
     break_points['group'] = ( (break_points['position'] - break_points['position'].shift(1, fill_value=0) > max_break_point_distance) |
@@ -525,7 +553,9 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
     break_groups = break_groups.reset_index().drop(columns=['min_l','max_l','min_r','max_r'])
 
     if pdf:
-        PlotHist(pdf, "# Breaking reads", "# Break points", np.concatenate([break_groups.loc[break_groups['left_breaks'] < max(100,10*min_num_reads), 'left_breaks'],break_groups.loc[break_groups['right_breaks'] < max(100,10*min_num_reads), 'right_breaks']]), threshold=min_num_reads, logy=True )
+        plot_breaks = np.concatenate([break_groups.loc[break_groups['left_breaks'] < max(100,10*min_num_reads), 'left_breaks'],break_groups.loc[break_groups['right_breaks'] < max(100,10*min_num_reads), 'right_breaks']])
+        if len(plot_breaks):
+            PlotHist(pdf, "# Breaking reads", "# Break points", plot_breaks, threshold=min_num_reads, logy=True )
         #PlotHist(pdf, "# Breaking reads", "# Break points", np.concatenate([break_groups['left_breaks'],break_groups['right_breaks']]), threshold=min_num_reads, logx=True )
 
     # Find continuous reads crossing the break
@@ -589,50 +619,61 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
         plot_undecided['status'] = 'not-accepted'
 
         plot_df = pd.concat([plot_valid, plot_undecided, plot_reject])
-
-        PlotXY(pdf, "Continuous read", "Breaking reads", plot_df['continues'].values, plot_df['break'], category=plot_df['status'], count=plot_df['count'] )
+        if len(plot_df):
+            PlotXY(pdf, "Continuous read", "Breaking reads", plot_df['continues'].values, plot_df['break'].values, category=plot_df['status'].values, count=plot_df['count'].values )
 
     break_groups = break_groups[ np.isin(break_groups['group'], np.unique(break_points.reset_index().loc[break_points['valid_break'].values,'group'])) ].copy()
 
-    if pdf:
-        break_groups['contig_length'] = contigs.iloc[break_groups['contig_id'], contigs.columns.get_loc('length')].values
-        dists_contig_ends = np.concatenate([ break_groups.loc[break_groups['left_breaks']*min_factor_alternatives <= break_groups['right_breaks'], 'end_pos'],
-                                            (break_groups['contig_length']-break_groups['start_pos'])[break_groups['left_breaks'] >= break_groups['right_breaks']*min_factor_alternatives] ])
-        PlotHist(pdf, "Distance to contig end", "# Single sided breaks", np.extract(dists_contig_ends < 10*max_dist_contig_end, dists_contig_ends), threshold=max_dist_contig_end)
-        PlotHist(pdf, "Distance to contig end", "# Single sided breaks", dists_contig_ends, threshold=max_dist_contig_end, logx=True)
-
-    break_groups['num'] = break_groups['contig_id'] == break_groups['contig_id'].shift(1, fill_value=-1)
-    break_groups['num'] = break_groups[['contig_id', 'num']].groupby('contig_id').cumsum().astype(int)
-    break_groups['pos'] = break_groups['start_pos'] + (break_groups['end_pos']-break_groups['start_pos']+1)//2
+    if len(break_groups):
+        if pdf:
+            break_groups['contig_length'] = contigs.iloc[break_groups['contig_id'], contigs.columns.get_loc('length')].values
+            dists_contig_ends = np.concatenate([ break_groups.loc[break_groups['left_breaks']*min_factor_alternatives <= break_groups['right_breaks'], 'end_pos'],
+                                                (break_groups['contig_length']-break_groups['start_pos'])[break_groups['left_breaks'] >= break_groups['right_breaks']*min_factor_alternatives] ])
+            if len(dists_contig_ends):
+                if np.sum(dists_contig_ends < 10*max_dist_contig_end):
+                    PlotHist(pdf, "Distance to contig end", "# Single sided breaks", np.extract(dists_contig_ends < 10*max_dist_contig_end, dists_contig_ends), threshold=max_dist_contig_end)
+                PlotHist(pdf, "Distance to contig end", "# Single sided breaks", dists_contig_ends, threshold=max_dist_contig_end, logx=True)
     
-    # Information about not-accepted breaks
-    keep_row_left = np.full(len(left_breaks),False)
-    keep_row_right = np.full(len(right_breaks),False)
-    for i in range(break_groups['num'].max()+1):
-        breaks = pd.DataFrame({'contig':np.arange(len(contigs)), 'start':sys.maxsize, 'end':-1})
-        breaks.iloc[break_groups.loc[i==break_groups['num'], 'contig_id'], [breaks.columns.get_loc('start'), breaks.columns.get_loc('end')]] = break_groups.loc[i==break_groups['num'], ['start_pos', 'end_pos']].values
-        lbreaks = breaks.iloc[left_breaks['t_id']]
-        rbreaks = breaks.iloc[right_breaks['t_id']]
-        keep_row_left = keep_row_left | ((lbreaks['start'].values <= left_breaks['t_end'].values) & (left_breaks['t_end'].values <= lbreaks['end'].values))
-        keep_row_right = keep_row_right | ((rbreaks['start'].values <= right_breaks['t_start'].values) & (right_breaks['t_start'].values <= rbreaks['end'].values))
+        break_groups['num'] = break_groups['contig_id'] == break_groups['contig_id'].shift(1, fill_value=-1)
+        break_groups['num'] = break_groups[['contig_id', 'num']].groupby('contig_id').cumsum().astype(int)
+        break_groups['pos'] = break_groups['start_pos'] + (break_groups['end_pos']-break_groups['start_pos']+1)//2
     
-    spurious_break_indexes = np.unique(np.concatenate([left_breaks[np.logical_not(keep_row_left)].index, right_breaks[np.logical_not(keep_row_right)].index]))
+        # Information about not-accepted breaks
+        keep_row_left = np.full(len(left_breaks),False)
+        keep_row_right = np.full(len(right_breaks),False)
+        for i in range(break_groups['num'].max()+1):
+            breaks = pd.DataFrame({'contig':np.arange(len(contigs)), 'start':sys.maxsize, 'end':-1})
+            breaks.iloc[break_groups.loc[i==break_groups['num'], 'contig_id'], [breaks.columns.get_loc('start'), breaks.columns.get_loc('end')]] = break_groups.loc[i==break_groups['num'], ['start_pos', 'end_pos']].values
+            lbreaks = breaks.iloc[left_breaks['t_id']]
+            rbreaks = breaks.iloc[right_breaks['t_id']]
+            keep_row_left = keep_row_left | ((lbreaks['start'].values <= left_breaks['t_end'].values) & (left_breaks['t_end'].values <= lbreaks['end'].values))
+            keep_row_right = keep_row_right | ((rbreaks['start'].values <= right_breaks['t_start'].values) & (right_breaks['t_start'].values <= rbreaks['end'].values))
+        
+        spurious_break_indexes = np.unique(np.concatenate([left_breaks[np.logical_not(keep_row_left)].index, right_breaks[np.logical_not(keep_row_right)].index]))
+    else:
+        # We don't have breaks, so all are spurious
+        spurious_break_indexes = np.unique(np.concatenate([left_breaks.index, right_breaks.index]))
 
     # All reads that are not extending contigs enough and do not have multiple mappings are non informative (except they overlap breaks)
     non_informative_mappings = mappings[(min_extension > mappings['q_start']) & (min_extension > mappings['q_len']-mappings['q_end']) & (mappings['q_name'].shift(1, fill_value='') != mappings['q_name']) & (mappings['q_name'].shift(-1, fill_value='') != mappings['q_name'])].index
     non_informative_mappings = np.setdiff1d(non_informative_mappings,np.concatenate([left_breaks.index, right_breaks.index])) # Remove breaking reads
     non_informative_mappings = mappings.loc[non_informative_mappings, ['t_id', 't_start', 't_end']]
-    # Remove continues reads overlapping breaks from non_informative_mappings
-    touching_breaks = []
-    for i in range(break_groups['num'].max()+1):
-        # Set breaks for every mapping, depending on their contig_id
-        breaks = pd.DataFrame({'contig':np.arange(len(contigs)), 'start':sys.maxsize//2, 'end':0, 'group':-1})
-        breaks.iloc[break_groups.loc[i==break_groups['num'], 'contig_id'], [breaks.columns.get_loc('start'), breaks.columns.get_loc('end')]] = break_groups.loc[i==break_groups['num'], ['start_pos', 'end_pos']].values
-        breaks = breaks.iloc[non_informative_mappings['t_id']]
-        # Find mappings that touch the previously set breaks (we could filter more, but this is the maximum set, so we don't declare informative mappings as non_informative_mappings, and the numbers we could filter more don't really matter speed wise)
-        touching_breaks.append(non_informative_mappings[(non_informative_mappings['t_start'] <= breaks['end'].values) & (non_informative_mappings['t_end'] >= breaks['start'].values)].index)
 
-    non_informative_mappings = np.setdiff1d(non_informative_mappings.index,np.concatenate(touching_breaks))
+    if len(break_groups):
+        # Remove continues reads overlapping breaks from non_informative_mappings
+        touching_breaks = []
+        for i in range(break_groups['num'].max()+1):
+            # Set breaks for every mapping, depending on their contig_id
+            breaks = pd.DataFrame({'contig':np.arange(len(contigs)), 'start':sys.maxsize//2, 'end':0, 'group':-1})
+            breaks.iloc[break_groups.loc[i==break_groups['num'], 'contig_id'], [breaks.columns.get_loc('start'), breaks.columns.get_loc('end')]] = break_groups.loc[i==break_groups['num'], ['start_pos', 'end_pos']].values
+            breaks = breaks.iloc[non_informative_mappings['t_id']]
+            # Find mappings that touch the previously set breaks (we could filter more, but this is the maximum set, so we don't declare informative mappings as non_informative_mappings, and the numbers we could filter more don't really matter speed wise)
+            touching_breaks.append(non_informative_mappings[(non_informative_mappings['t_start'] <= breaks['end'].values) & (non_informative_mappings['t_end'] >= breaks['start'].values)].index)
+
+        non_informative_mappings = np.setdiff1d(non_informative_mappings.index,np.concatenate(touching_breaks))
+    else:
+        # Without breaks no reads can overlap them
+        non_informative_mappings = non_informative_mappings.index
 
     return break_groups, spurious_break_indexes, non_informative_mappings
 
@@ -684,7 +725,7 @@ def GetContigParts(contigs, break_groups, pdf):
     tmp_contigs = contigs[contigs['remove'] & (contigs['org_dist_right'] != -1) & (contigs['org_dist_left'] != -1)].copy()
     tmp_contigs.reset_index(inplace=True)
     tmp_contigs['group'] = (tmp_contigs['index'] != tmp_contigs['index'].shift(1, fill_value=-1)).cumsum()
-    tmp_contigs = tmp_contigs.groupby('group', sort=False)['index','length','org_dist_right','org_dist_left'].agg(['first','last','sum'])
+    tmp_contigs = tmp_contigs.groupby('group', sort=False)[['index','length','org_dist_right','org_dist_left']].agg(['first','last','sum'])
     tmp_contigs['from'] = tmp_contigs[('index','first')]-1
     tmp_contigs['to'] = tmp_contigs[('index','last')]+1
     tmp_contigs['len'] = tmp_contigs[('org_dist_left','first')] + tmp_contigs[('length','sum')] + tmp_contigs[('org_dist_right','sum')]
@@ -785,8 +826,8 @@ def UpdateMappingsToContigParts(mappings, contigs, contig_parts, break_groups, m
     mappings.loc[0 < mappings['num_part'], 'left_con_side'] = 'r'
     mappings.loc[mappings['parts'] - mappings['num_part'] > 1, 'right_con'] = mappings.loc[mappings['parts'] - mappings['num_part'] > 1, 'conpart'] + 1
     mappings.loc[mappings['parts'] - mappings['num_part'] > 1, 'right_con_side'] = 'l'
-    mappings['con_from'] = np.maximum(mappings['t_start'], contig_parts.iloc[mappings['conpart'], contig_parts.columns.get_loc('start')])  # We cannot work with 0 < mappings['num_part'], because of reads that start before mappings['con_start'] but do not cross the break region and therefore don't have a mapping before
-    mappings['con_to'] = np.minimum(mappings['t_end'], contig_parts.iloc[mappings['conpart'], contig_parts.columns.get_loc('end')])
+    mappings['con_from'] = np.maximum(mappings['t_start'].values, contig_parts.iloc[mappings['conpart'], contig_parts.columns.get_loc('start')].values)  # We cannot work with 0 < mappings['num_part'], because of reads that start before mappings['con_start'] but do not cross the break region and therefore don't have a mapping before
+    mappings['con_to'] = np.minimum(mappings['t_end'].values, contig_parts.iloc[mappings['conpart'], contig_parts.columns.get_loc('end')].values)
     mappings['read_from'] = mappings['q_start']
     mappings['read_to'] = mappings['q_end']
     
@@ -975,7 +1016,6 @@ def CollectConnections(con_mappings):
     # Restructure con_mappings to see the possible ways
     # Copy and revert mappings + order as connections are always in both directions and not just the one mapping is directed in
     connections = con_mappings[['group','conpart','strand']].copy()
-
     connections_reversed = con_mappings.sort_values(['group','read_from'], ascending=[True,False])[['group','conpart','strand']]
     connections_reversed['strand'] = np.where(connections_reversed['strand'] == '+', '-', np.where(connections_reversed['strand'] == '-', '+', ''))
     connections_reversed['group'] += connections['group'].max() + 1
@@ -1176,24 +1216,31 @@ def GetLongRangeMappings(mappings, bridges, invalid_anchors):
 def HandleAlternativeConnections(contig_parts, bridges, mappings):
     invalid_anchors = np.unique(np.concatenate([bridges.loc[bridges['from_alt']>1, 'from'], bridges.loc[bridges['to_alt']>1, 'to']]))
 
-    # Add contig parts that have at least two alternative bridges to invalid_anchors as they must be repeated somehow in the genome until we have only unique connections left
-    last_len_invalid_anchors = 0
-    while last_len_invalid_anchors < len(invalid_anchors):
-        last_len_invalid_anchors = len(invalid_anchors)
-        long_range_mappings = GetLongRangeMappings(mappings, bridges, invalid_anchors)
-        long_range_connections = CollectConnections(long_range_mappings)
-        # We only need to check alternative_s as we have all connections in both directions in there
-        invalid_anchors = np.unique(np.concatenate([invalid_anchors, long_range_connections.loc[long_range_connections['alternatives_s'] > 1, 'conpart_s'].astype(int)]))
-
-    # Deactivate extensions for all invalid_anchors (could be circular molecules without exit and otherwise without an anchor repeat number cannot be properly resolved)
-    # Unique bridges between invalid_anchors are still applied later, to merge two contigs that are repeated together
-    contig_parts.iloc[invalid_anchors, contig_parts.columns.get_loc('left_con')] = -2
-    contig_parts.iloc[invalid_anchors, contig_parts.columns.get_loc('right_con')] = -2
+    if len(invalid_anchors):
+        # Add contig parts that have at least two alternative bridges to invalid_anchors as they must be repeated somehow in the genome until we have only unique connections left
+        last_len_invalid_anchors = 0
+        while last_len_invalid_anchors < len(invalid_anchors):
+            last_len_invalid_anchors = len(invalid_anchors)
+            long_range_mappings = GetLongRangeMappings(mappings, bridges, invalid_anchors)
+            if len(long_range_mappings):
+                long_range_connections = CollectConnections(long_range_mappings)
+                # We only need to check alternative_s as we have all connections in both directions in there
+                invalid_anchors = np.unique(np.concatenate([invalid_anchors, long_range_connections.loc[long_range_connections['alternatives_s'] > 1, 'conpart_s'].astype(int)]))
+    
+        # Deactivate extensions for all invalid_anchors (could be circular molecules without exit and otherwise without an anchor repeat number cannot be properly resolved)
+        # Unique bridges between invalid_anchors are still applied later, to merge two contigs that are repeated together
+        contig_parts.iloc[invalid_anchors, contig_parts.columns.get_loc('left_con')] = -2
+        contig_parts.iloc[invalid_anchors, contig_parts.columns.get_loc('right_con')] = -2
+    else:
+        long_range_mappings = []
     
     # Set connections for repeat_bridges (Partially overwriting the invalid_anchors from before, if we found a read spanning from a valid anchors to another through those invalid_anchors)
-    long_range_mappings = ExtendMappingInfo(long_range_mappings)
-    long_range_connections, anchored_contig_parts = GetReadInfoForBridges(long_range_connections, long_range_mappings)
-    contig_parts = InsertBridges(contig_parts, long_range_connections)
+    if len(long_range_mappings):
+        long_range_mappings = ExtendMappingInfo(long_range_mappings)
+        long_range_connections, anchored_contig_parts = GetReadInfoForBridges(long_range_connections, long_range_mappings)
+        contig_parts = InsertBridges(contig_parts, long_range_connections)
+    else:
+        anchored_contig_parts = []
 
     return contig_parts, anchored_contig_parts
 
@@ -1257,14 +1304,17 @@ def GetShortRangeConnections(bridges, mappings):
     return connections
 
 def HandleUniqueBridges(contig_parts, bridges, mappings, lowq_bridges):
-    connections = GetShortRangeConnections(bridges, mappings)
-    contig_parts = InsertBridges(contig_parts, connections)
+    if len(bridges):
+        connections = GetShortRangeConnections(bridges, mappings)
+        contig_parts = InsertBridges(contig_parts, connections)
 
+    
     # Mark low_quality bridges whether they are used or not (low quality bridges with alternatives have already been filtered out)
     contig_parts['right_lowq'] = False
-    contig_parts.iloc[ lowq_bridges.loc['r' == lowq_bridges['from_side'], 'from'].values, contig_parts.columns.get_loc('right_lowq')] = True
     contig_parts['left_lowq'] = False
-    contig_parts.iloc[ lowq_bridges.loc['l' == lowq_bridges['from_side'], 'from'].values, contig_parts.columns.get_loc('left_lowq')] = True
+    if len(lowq_bridges):
+        contig_parts.iloc[ lowq_bridges.loc['r' == lowq_bridges['from_side'], 'from'].values, contig_parts.columns.get_loc('right_lowq')] = True
+        contig_parts.iloc[ lowq_bridges.loc['l' == lowq_bridges['from_side'], 'from'].values, contig_parts.columns.get_loc('left_lowq')] = True
 
     # Remove contig connections that loop to an inverted version of itself
     # (This is necessary to account for inverse repeats that are not handled by the scaffolding later on, which only stops for circular scaffolds, so left-right connections)
@@ -1540,142 +1590,143 @@ def OrderByUnbrokenOriginalScaffolds(scaffold_result, contig_parts):
     ## Bring scaffolds in order of unbroken original scaffolding and remove circularities
     # Get connected scaffolds
     scaffold_order = scaffold_result.loc[(scaffold_result['org_dist_right'] > 0), ['scaffold','reverse']].rename(columns={'scaffold':'left_scaf', 'reverse':'left_rev'})
-    scaffold_order['right_scaf'] = scaffold_result.loc[(scaffold_result['org_dist_left'] > 0), 'scaffold'].values
-    scaffold_order['right_rev'] = scaffold_result.loc[(scaffold_result['org_dist_left'] > 0), 'reverse'].values
-    
-    # All scaffolds that are already in correct order and are not changed due to other pairs can be removed from ordering
-    complex_scaffolds, scaf_counts = np.unique(np.concatenate( [scaffold_order['left_scaf'], scaffold_order['right_scaf']] ), return_counts=True)
-    complex_scaffolds[scaf_counts > 1]
-    complex_scaffolds = complex_scaffolds[scaf_counts > 1]
-    scaffold_order = scaffold_order[ np.isin(scaffold_order['left_scaf'], complex_scaffolds) | np.isin(scaffold_order['right_scaf'], complex_scaffolds) | # Scaffolds involved in multiple orderings
-                                     scaffold_order['left_rev'] | scaffold_order['right_rev'] | # Scaffolds need to be reversed or left/right has to be updated
-                                     (scaffold_order['left_scaf']+1 != scaffold_order['right_scaf']) ] # Scaffold ids need to be changed
-    
-    # Break scaffolds that are connected to itself
-    break_ids = scaffold_order.loc[scaffold_order['left_scaf'] == scaffold_order['right_scaf'], 'left_scaf'].values
-    break_left = scaffold_result.loc[(np.isin(scaffold_result['scaffold'], break_ids)) & (scaffold_result['org_dist_left'] > 0), 'part_id'].values
-    break_right = scaffold_result.loc[(np.isin(scaffold_result['scaffold'], break_ids)) & (scaffold_result['org_dist_right'] > 0), 'part_id'].values
-
-    scaffold_result.iloc[break_left, scaffold_result.columns.get_loc('org_dist_left')] = -2
-    scaffold_result.iloc[break_right, scaffold_result.columns.get_loc('org_dist_right')] = -2
-    contig_parts.iloc[break_left, contig_parts.columns.get_loc('org_dist_left')] = -2
-    contig_parts.iloc[break_right, contig_parts.columns.get_loc('org_dist_right')] = -2
-    
-    scaffold_order = scaffold_order[scaffold_order['left_scaf'] !=  scaffold_order['right_scaf']].copy()
-    
-    # Group all scaffolds by the lowest id that is involved with it directly and over other scaffolds
-    scaffold_order['min_scaf'] = np.minimum(scaffold_order['left_scaf'], scaffold_order['right_scaf'])
-    scaffold_order['max_scaf'] = np.maximum(scaffold_order['left_scaf'], scaffold_order['right_scaf'])
-    
-    # Merge by min-max connections (min-min is already a single group)
-    ungrouped = np.isin(scaffold_order['min_scaf'], scaffold_order['max_scaf'])
-    while np.sum(ungrouped):
-        lowest_scaf = {h:l for h,l in zip(scaffold_order['max_scaf'], scaffold_order['min_scaf'])}
-        scaffold_order.loc[ungrouped, 'min_scaf'] = itemgetter(*scaffold_order.loc[ungrouped, 'min_scaf'])(lowest_scaf)
-        ungrouped = np.isin(scaffold_order['min_scaf'], scaffold_order['max_scaf'])
-    
-    # Merge by max-max connections
-    group_merges = [1]
-    while len(group_merges):
-        group_merges = scaffold_order[['min_scaf','max_scaf']].groupby('max_scaf').agg(['min','max','size'])
-        group_merges.columns = group_merges.columns.droplevel()
-        group_merges = group_merges[group_merges['min'] != group_merges['max']].copy()
-        if len(group_merges):
-            new_groups = {o:n for o,n in zip(group_merges['max'],group_merges['min'])}
-            scaffold_order.loc[ np.isin(scaffold_order['min_scaf'],group_merges['max']), 'min_scaf'] = itemgetter(*scaffold_order.loc[np.isin(scaffold_order['min_scaf'],group_merges['max']), 'min_scaf'])(new_groups)
-
-    
-    # Find circularities (unique scaffolds in group are less than connections+1)
-    scaffolds = pd.DataFrame({'scaffold':np.unique(scaffold_result['scaffold'])})
-    space_needed = pd.concat([ scaffold_order[['left_scaf','min_scaf']].rename(columns={'left_scaf':'scaf'}), scaffold_order[['right_scaf','min_scaf']].rename(columns={'right_scaf':'scaf'}) ]).groupby(['min_scaf','scaf']).first().reset_index().groupby('min_scaf').size()
-    space_needed2 = (scaffold_order.groupby('min_scaf').size()+1)
-    
-    break_ids = space_needed[space_needed != space_needed2].index.values
-    if len(break_ids):
-        # Remove first scaffold_order entry to break circularity
-        break_ids = scaffold_order.reset_index().loc[ np.isin(scaffold_order['min_scaf'], break_ids), 'min_scaf'].drop_duplicates().index.values
+    if len(scaffold_order):
+        scaffold_order['right_scaf'] = scaffold_result.loc[(scaffold_result['org_dist_left'] > 0), 'scaffold'].values
+        scaffold_order['right_rev'] = scaffold_result.loc[(scaffold_result['org_dist_left'] > 0), 'reverse'].values
         
-        # Get corresponding scaffolds
-        break_left = scaffold_order.iloc[ break_ids, scaffold_order.columns.get_loc('right_scaf') ].values
-        break_right = scaffold_order.iloc[ break_ids, scaffold_order.columns.get_loc('left_scaf') ].values
+        # All scaffolds that are already in correct order and are not changed due to other pairs can be removed from ordering
+        complex_scaffolds, scaf_counts = np.unique(np.concatenate( [scaffold_order['left_scaf'], scaffold_order['right_scaf']] ), return_counts=True)
+        complex_scaffolds[scaf_counts > 1]
+        complex_scaffolds = complex_scaffolds[scaf_counts > 1]
+        scaffold_order = scaffold_order[ np.isin(scaffold_order['left_scaf'], complex_scaffolds) | np.isin(scaffold_order['right_scaf'], complex_scaffolds) | # Scaffolds involved in multiple orderings
+                                         scaffold_order['left_rev'] | scaffold_order['right_rev'] | # Scaffolds need to be reversed or left/right has to be updated
+                                         (scaffold_order['left_scaf']+1 != scaffold_order['right_scaf']) ] # Scaffold ids need to be changed
         
-        # Get corresponding contigs
-        break_left = scaffold_result.loc[(np.isin(scaffold_result['scaffold'], break_left)) & (scaffold_result['org_dist_left'] > 0), 'part_id'].values
-        break_right = scaffold_result.loc[(np.isin(scaffold_result['scaffold'], break_right)) & (scaffold_result['org_dist_right'] > 0), 'part_id'].values
-        
-        # Break
-        scaffold_order = scaffold_order[ np.isin(np.arange(len(scaffold_order)), break_ids) == False ].copy()
-        
+        # Break scaffolds that are connected to itself
+        break_ids = scaffold_order.loc[scaffold_order['left_scaf'] == scaffold_order['right_scaf'], 'left_scaf'].values
+        break_left = scaffold_result.loc[(np.isin(scaffold_result['scaffold'], break_ids)) & (scaffold_result['org_dist_left'] > 0), 'part_id'].values
+        break_right = scaffold_result.loc[(np.isin(scaffold_result['scaffold'], break_ids)) & (scaffold_result['org_dist_right'] > 0), 'part_id'].values
+    
         scaffold_result.iloc[break_left, scaffold_result.columns.get_loc('org_dist_left')] = -2
         scaffold_result.iloc[break_right, scaffold_result.columns.get_loc('org_dist_right')] = -2
         contig_parts.iloc[break_left, contig_parts.columns.get_loc('org_dist_left')] = -2
         contig_parts.iloc[break_right, contig_parts.columns.get_loc('org_dist_right')] = -2
-
-    # Shift scaffold ids so that groups are together
-    scaffolds['shift'] = 0
-    scaffolds.iloc[space_needed.index+1, scaffolds.columns.get_loc('shift')] += space_needed.values
-    scaffolds.iloc[np.unique(np.concatenate( [scaffold_order['left_scaf'], scaffold_order['right_scaf']] ))+1, scaffolds.columns.get_loc('shift')] -= 1
-    scaffolds['shift'] = scaffolds['shift'].cumsum()
-    scaffolds['new_scaf'] = scaffolds['scaffold'] + scaffolds['shift']
-    new_scafs = {o:n for o,n in zip(scaffolds['scaffold'],scaffolds['new_scaf'])}
-    scaffold_order['min_scaf'] = itemgetter(*scaffold_order['min_scaf'])(new_scafs)
-    
-    # Get left and right scaffold original connections
-    scaffolds['left_con'] = -1
-    scaffolds['left_con_side'] = ''
-    scaffolds['right_con'] = -1
-    scaffolds['right_con_side'] = ''
-    scaffolds['group_min_scaf'] = scaffolds['new_scaf']
-    
-    scaffolds.iloc[ scaffold_order.loc[scaffold_order['right_rev']==False, 'right_scaf'].values, scaffolds.columns.get_loc('left_con') ] = scaffold_order.loc[scaffold_order['right_rev']==False, 'left_scaf'].values
-    scaffolds.iloc[ scaffold_order.loc[scaffold_order['right_rev'], 'right_scaf'].values, scaffolds.columns.get_loc('right_con') ] = scaffold_order.loc[scaffold_order['right_rev'], 'left_scaf'].values
-    scaffolds.iloc[ scaffold_order.loc[scaffold_order['left_rev']==False, 'left_scaf'].values, scaffolds.columns.get_loc('right_con') ] = scaffold_order.loc[scaffold_order['left_rev']==False, 'right_scaf'].values
-    scaffolds.iloc[ scaffold_order.loc[scaffold_order['left_rev'], 'left_scaf'].values, scaffolds.columns.get_loc('left_con') ] = scaffold_order.loc[scaffold_order['left_rev'], 'right_scaf'].values
-    
-    scaffolds.loc[ scaffolds['left_con'] >= 0, 'left_con_side'] = np.where(scaffolds.loc[ scaffolds['left_con'] >= 0, 'scaffold'].values == scaffolds.iloc[scaffolds.loc[ scaffolds['left_con'] >= 0, 'left_con'].values, scaffolds.columns.get_loc('left_con')].values, 'l', 'r')
-    scaffolds.loc[ scaffolds['right_con'] >= 0, 'right_con_side'] = np.where(scaffolds.loc[ scaffolds['right_con'] >= 0, 'scaffold'].values == scaffolds.iloc[scaffolds.loc[ scaffolds['right_con'] >= 0, 'right_con'].values, scaffolds.columns.get_loc('right_con')].values, 'r', 'l')
-    
-    scaffolds.iloc[ scaffold_order['right_scaf'].values, scaffolds.columns.get_loc('group_min_scaf') ] = scaffold_order['min_scaf'].values
-    scaffolds.iloc[ scaffold_order['left_scaf'].values, scaffolds.columns.get_loc('group_min_scaf') ] = scaffold_order['min_scaf'].values
-    
-    # Assign position and reverse starting from a arbitrary scaffold with only one connection in the meta-scaffold
-    scaffolds['pos'] = -1
-    scaffolds['reverse'] = False
-    
-    scaffolds.iloc[ scaffolds.loc[(scaffolds['left_con'] < 0) | (scaffolds['right_con'] < 0), ['scaffold','group_min_scaf']].groupby('group_min_scaf').first().values, scaffolds.columns.get_loc('pos')] = 0
-    scaffolds.loc[scaffolds['pos'] == 0, 'reverse'] = scaffolds.loc[scaffolds['pos'] == 0, 'left_con'].values > 0
-    
-    cur_scaffolds = scaffolds.loc[(scaffolds['pos'] == 0) & ((scaffolds['left_con'] >= 0) | (scaffolds['right_con'] >= 0))]
-    cur_pos = 1
-    while len(cur_scaffolds):
-        scaffolds.iloc[np.where(cur_scaffolds['reverse'], cur_scaffolds['left_con'], cur_scaffolds['right_con']), scaffolds.columns.get_loc('pos')] = cur_pos
-        scaffolds.iloc[np.where(cur_scaffolds['reverse'], cur_scaffolds['left_con'], cur_scaffolds['right_con']), scaffolds.columns.get_loc('reverse')] = np.where(cur_scaffolds['reverse'], cur_scaffolds['left_con_side'], cur_scaffolds['right_con_side']) == 'r'
         
-        cur_scaffolds = scaffolds.loc[(scaffolds['pos'] == cur_pos) & (scaffolds['left_con'] >= 0) & (scaffolds['right_con'] >= 0)]
-        cur_pos += 1
+        scaffold_order = scaffold_order[scaffold_order['left_scaf'] !=  scaffold_order['right_scaf']].copy()
+        
+        # Group all scaffolds by the lowest id that is involved with it directly and over other scaffolds
+        scaffold_order['min_scaf'] = np.minimum(scaffold_order['left_scaf'], scaffold_order['right_scaf'])
+        scaffold_order['max_scaf'] = np.maximum(scaffold_order['left_scaf'], scaffold_order['right_scaf'])
+
+        # Merge by min-max connections (min-min is already a single group)
+        ungrouped = np.isin(scaffold_order['min_scaf'], scaffold_order['max_scaf'])
+        while np.sum(ungrouped):
+            lowest_scaf = {h:l for h,l in zip(scaffold_order['max_scaf'], scaffold_order['min_scaf'])}
+            scaffold_order.loc[ungrouped, 'min_scaf'] = itemgetter(*scaffold_order.loc[ungrouped, 'min_scaf'])(lowest_scaf)
+            ungrouped = np.isin(scaffold_order['min_scaf'], scaffold_order['max_scaf'])
+        
+        # Merge by max-max connections
+        group_merges = [1]
+        while len(group_merges):
+            group_merges = scaffold_order[['min_scaf','max_scaf']].groupby('max_scaf').agg(['min','max','size'])
+            group_merges.columns = group_merges.columns.droplevel()
+            group_merges = group_merges[group_merges['min'] != group_merges['max']].copy()
+            if len(group_merges):
+                new_groups = {o:n for o,n in zip(group_merges['max'],group_merges['min'])}
+                scaffold_order.loc[ np.isin(scaffold_order['min_scaf'],group_merges['max']), 'min_scaf'] = itemgetter(*scaffold_order.loc[np.isin(scaffold_order['min_scaf'],group_merges['max']), 'min_scaf'])(new_groups)
     
-    # Inverse meta-scaffolds if that reduces the number of inversions for the single scaffolds
-    scaffolds['scaf_size'] = scaffold_result.groupby('scaffold').size().values
-    scaffolds = scaffolds.merge( scaffolds.groupby(['group_min_scaf','reverse'])['scaf_size'].sum().reset_index(name='size').pivot(index='group_min_scaf',columns='reverse',values='size').fillna(0).reset_index().rename(columns={False:'forward_count',True:'reverse_count'}), on='group_min_scaf', how='left')
+        
+        # Find circularities (unique scaffolds in group are less than connections+1)
+        scaffolds = pd.DataFrame({'scaffold':np.unique(scaffold_result['scaffold'])})
+        space_needed = pd.concat([ scaffold_order[['left_scaf','min_scaf']].rename(columns={'left_scaf':'scaf'}), scaffold_order[['right_scaf','min_scaf']].rename(columns={'right_scaf':'scaf'}) ]).groupby(['min_scaf','scaf']).first().reset_index().groupby('min_scaf').size()
+        space_needed2 = (scaffold_order.groupby('min_scaf').size()+1)
+        
+        break_ids = space_needed[space_needed != space_needed2].index.values
+        if len(break_ids):
+            # Remove first scaffold_order entry to break circularity
+            break_ids = scaffold_order.reset_index().loc[ np.isin(scaffold_order['min_scaf'], break_ids), 'min_scaf'].drop_duplicates().index.values
+            
+            # Get corresponding scaffolds
+            break_left = scaffold_order.iloc[ break_ids, scaffold_order.columns.get_loc('right_scaf') ].values
+            break_right = scaffold_order.iloc[ break_ids, scaffold_order.columns.get_loc('left_scaf') ].values
+            
+            # Get corresponding contigs
+            break_left = scaffold_result.loc[(np.isin(scaffold_result['scaffold'], break_left)) & (scaffold_result['org_dist_left'] > 0), 'part_id'].values
+            break_right = scaffold_result.loc[(np.isin(scaffold_result['scaffold'], break_right)) & (scaffold_result['org_dist_right'] > 0), 'part_id'].values
+            
+            # Break
+            scaffold_order = scaffold_order[ np.isin(np.arange(len(scaffold_order)), break_ids) == False ].copy()
+            
+            scaffold_result.iloc[break_left, scaffold_result.columns.get_loc('org_dist_left')] = -2
+            scaffold_result.iloc[break_right, scaffold_result.columns.get_loc('org_dist_right')] = -2
+            contig_parts.iloc[break_left, contig_parts.columns.get_loc('org_dist_left')] = -2
+            contig_parts.iloc[break_right, contig_parts.columns.get_loc('org_dist_right')] = -2
     
-    scaffolds.loc[scaffolds['forward_count'] < scaffolds['reverse_count'], 'reverse'] = np.logical_not(scaffolds.loc[scaffolds['forward_count'] < scaffolds['reverse_count'], 'reverse'].values)
-    scaffolds = scaffolds.merge( scaffolds.groupby('group_min_scaf')['scaf_size'].size().reset_index(name='group_size'), on='group_min_scaf', how='left')
-    scaffolds.loc[scaffolds['forward_count'] < scaffolds['reverse_count'], 'pos'] = scaffolds.loc[scaffolds['forward_count'] < scaffolds['reverse_count'], 'group_size'].values - scaffolds.loc[scaffolds['forward_count'] < scaffolds['reverse_count'], 'pos'].values - 1
+        # Shift scaffold ids so that groups are together
+        scaffolds['shift'] = 0
+        scaffolds.iloc[space_needed.index+1, scaffolds.columns.get_loc('shift')] += space_needed.values
+        scaffolds.iloc[np.unique(np.concatenate( [scaffold_order['left_scaf'], scaffold_order['right_scaf']] ))+1, scaffolds.columns.get_loc('shift')] -= 1
+        scaffolds['shift'] = scaffolds['shift'].cumsum()
+        scaffolds['new_scaf'] = scaffolds['scaffold'] + scaffolds['shift']
+        new_scafs = {o:n for o,n in zip(scaffolds['scaffold'],scaffolds['new_scaf'])}
+        scaffold_order['min_scaf'] = itemgetter(*scaffold_order['min_scaf'])(new_scafs)
+        
+        # Get left and right scaffold original connections
+        scaffolds['left_con'] = -1
+        scaffolds['left_con_side'] = ''
+        scaffolds['right_con'] = -1
+        scaffolds['right_con_side'] = ''
+        scaffolds['group_min_scaf'] = scaffolds['new_scaf']
     
-    # Apply changes
-    scaffolds['new_scaf'] = scaffolds['group_min_scaf'] + scaffolds['pos']
-    
-    rev_scafs = np.isin(scaffold_result['scaffold'], scaffolds.loc[scaffolds['reverse'], 'scaffold'].values)
-    scaffold_result.loc[rev_scafs, 'reverse'] = np.logical_not(scaffold_result.loc[rev_scafs, 'reverse'])
-    scaffold_result.loc[rev_scafs, 'pos'] = scaffold_result.loc[rev_scafs, 'scaf_size'] - scaffold_result.loc[rev_scafs, 'pos'] - 1
-    
-    new_scafs = {o:n for o,n in zip(scaffolds['scaffold'],scaffolds['new_scaf'])}
-    scaffold_result['scaffold'] = itemgetter(*scaffold_result['scaffold'])(new_scafs)
-    
-    # Set org_dist_left/right based on scaffold (not the contig anymore): Flip left/right if contig is reversed
-    tmp_dist = scaffold_result.loc[scaffold_result['reverse'],'org_dist_left'].copy().values
-    scaffold_result.loc[scaffold_result['reverse'],'org_dist_left'] = scaffold_result.loc[scaffold_result['reverse'],'org_dist_right'].values
-    scaffold_result.loc[scaffold_result['reverse'],'org_dist_right'] = tmp_dist
+        scaffolds.iloc[ scaffold_order.loc[scaffold_order['right_rev']==False, 'right_scaf'].values, scaffolds.columns.get_loc('left_con') ] = scaffold_order.loc[scaffold_order['right_rev']==False, 'left_scaf'].values
+        scaffolds.iloc[ scaffold_order.loc[scaffold_order['right_rev'], 'right_scaf'].values, scaffolds.columns.get_loc('right_con') ] = scaffold_order.loc[scaffold_order['right_rev'], 'left_scaf'].values
+        scaffolds.iloc[ scaffold_order.loc[scaffold_order['left_rev']==False, 'left_scaf'].values, scaffolds.columns.get_loc('right_con') ] = scaffold_order.loc[scaffold_order['left_rev']==False, 'right_scaf'].values
+        scaffolds.iloc[ scaffold_order.loc[scaffold_order['left_rev'], 'left_scaf'].values, scaffolds.columns.get_loc('left_con') ] = scaffold_order.loc[scaffold_order['left_rev'], 'right_scaf'].values
+        
+        scaffolds.loc[ scaffolds['left_con'] >= 0, 'left_con_side'] = np.where(scaffolds.loc[ scaffolds['left_con'] >= 0, 'scaffold'].values == scaffolds.iloc[scaffolds.loc[ scaffolds['left_con'] >= 0, 'left_con'].values, scaffolds.columns.get_loc('left_con')].values, 'l', 'r')
+        scaffolds.loc[ scaffolds['right_con'] >= 0, 'right_con_side'] = np.where(scaffolds.loc[ scaffolds['right_con'] >= 0, 'scaffold'].values == scaffolds.iloc[scaffolds.loc[ scaffolds['right_con'] >= 0, 'right_con'].values, scaffolds.columns.get_loc('right_con')].values, 'r', 'l')
+        
+        scaffolds.iloc[ scaffold_order['right_scaf'].values, scaffolds.columns.get_loc('group_min_scaf') ] = scaffold_order['min_scaf'].values
+        scaffolds.iloc[ scaffold_order['left_scaf'].values, scaffolds.columns.get_loc('group_min_scaf') ] = scaffold_order['min_scaf'].values
+        
+        # Assign position and reverse starting from a arbitrary scaffold with only one connection in the meta-scaffold
+        scaffolds['pos'] = -1
+        scaffolds['reverse'] = False
+        
+        scaffolds.iloc[ scaffolds.loc[(scaffolds['left_con'] < 0) | (scaffolds['right_con'] < 0), ['scaffold','group_min_scaf']].groupby('group_min_scaf').first().values, scaffolds.columns.get_loc('pos')] = 0
+        scaffolds.loc[scaffolds['pos'] == 0, 'reverse'] = scaffolds.loc[scaffolds['pos'] == 0, 'left_con'].values > 0
+        
+        cur_scaffolds = scaffolds.loc[(scaffolds['pos'] == 0) & ((scaffolds['left_con'] >= 0) | (scaffolds['right_con'] >= 0))]
+        cur_pos = 1
+        while len(cur_scaffolds):
+            scaffolds.iloc[np.where(cur_scaffolds['reverse'], cur_scaffolds['left_con'], cur_scaffolds['right_con']), scaffolds.columns.get_loc('pos')] = cur_pos
+            scaffolds.iloc[np.where(cur_scaffolds['reverse'], cur_scaffolds['left_con'], cur_scaffolds['right_con']), scaffolds.columns.get_loc('reverse')] = np.where(cur_scaffolds['reverse'], cur_scaffolds['left_con_side'], cur_scaffolds['right_con_side']) == 'r'
+            
+            cur_scaffolds = scaffolds.loc[(scaffolds['pos'] == cur_pos) & (scaffolds['left_con'] >= 0) & (scaffolds['right_con'] >= 0)]
+            cur_pos += 1
+        
+        # Inverse meta-scaffolds if that reduces the number of inversions for the single scaffolds
+        scaffolds['scaf_size'] = scaffold_result.groupby('scaffold').size().values
+        scaffolds = scaffolds.merge( scaffolds.groupby(['group_min_scaf','reverse'])['scaf_size'].sum().reset_index(name='size').pivot(index='group_min_scaf',columns='reverse',values='size').fillna(0).reset_index().rename(columns={False:'forward_count',True:'reverse_count'}), on='group_min_scaf', how='left')
+        
+        scaffolds.loc[scaffolds['forward_count'] < scaffolds['reverse_count'], 'reverse'] = np.logical_not(scaffolds.loc[scaffolds['forward_count'] < scaffolds['reverse_count'], 'reverse'].values)
+        scaffolds = scaffolds.merge( scaffolds.groupby('group_min_scaf')['scaf_size'].size().reset_index(name='group_size'), on='group_min_scaf', how='left')
+        scaffolds.loc[scaffolds['forward_count'] < scaffolds['reverse_count'], 'pos'] = scaffolds.loc[scaffolds['forward_count'] < scaffolds['reverse_count'], 'group_size'].values - scaffolds.loc[scaffolds['forward_count'] < scaffolds['reverse_count'], 'pos'].values - 1
+        
+        # Apply changes
+        scaffolds['new_scaf'] = scaffolds['group_min_scaf'] + scaffolds['pos']
+        
+        rev_scafs = np.isin(scaffold_result['scaffold'], scaffolds.loc[scaffolds['reverse'], 'scaffold'].values)
+        scaffold_result.loc[rev_scafs, 'reverse'] = np.logical_not(scaffold_result.loc[rev_scafs, 'reverse'])
+        scaffold_result.loc[rev_scafs, 'pos'] = scaffold_result.loc[rev_scafs, 'scaf_size'] - scaffold_result.loc[rev_scafs, 'pos'] - 1
+        
+        new_scafs = {o:n for o,n in zip(scaffolds['scaffold'],scaffolds['new_scaf'])}
+        scaffold_result['scaffold'] = itemgetter(*scaffold_result['scaffold'])(new_scafs)
+        
+        # Set org_dist_left/right based on scaffold (not the contig anymore): Flip left/right if contig is reversed
+        tmp_dist = scaffold_result.loc[scaffold_result['reverse'],'org_dist_left'].copy().values
+        scaffold_result.loc[scaffold_result['reverse'],'org_dist_left'] = scaffold_result.loc[scaffold_result['reverse'],'org_dist_right'].values
+        scaffold_result.loc[scaffold_result['reverse'],'org_dist_right'] = tmp_dist
     
     return scaffold_result, contig_parts
 
@@ -1797,8 +1848,10 @@ def GetScaffoldExtendingMappings(mappings, contig_parts, scaffold_info, max_dist
     # Only keep long enough extensions
     if pdf:
         extension_lengths = np.concatenate([mappings.loc[0<mappings['left_ext'],'left_ext'], mappings.loc[0<mappings['right_ext'],'right_ext']])
-        PlotHist(pdf, "Extension length", "# Extensions", np.extract(extension_lengths < 10*min_extension, extension_lengths), threshold=min_extension)
-        PlotHist(pdf, "Extension length", "# Extensions", extension_lengths, threshold=min_extension, logx=True)
+        if len(extension_lengths):
+            if np.sum(extension_lengths < 10*min_extension):
+                PlotHist(pdf, "Extension length", "# Extensions", np.extract(extension_lengths < 10*min_extension, extension_lengths), threshold=min_extension)
+            PlotHist(pdf, "Extension length", "# Extensions", extension_lengths, threshold=min_extension, logx=True)
         del extension_lengths
     
     mappings = mappings[(min_extension<=mappings['left_ext']) | (min_extension<=mappings['right_ext'])].copy()
@@ -2231,85 +2284,94 @@ def ClusterExtension(extensions, min_num_reads):
     return extensions
 
 def ExtendScaffolds(scaffold_table, extensions, mappings, min_num_reads, max_mapping_uncertainty):
-    # Create table on how long mappings agree in the gap with at least min_num_reads-1 (-1 because they always agree with themselves)
-    len_agree = extensions[['scaffold','side','q_index','q_agree']].sort_values(['scaffold','side','q_index','q_agree'], ascending=[True,True,True,False])
-    len_agree['n_longest'] = 1
-    len_agree['n_longest'] = len_agree[['scaffold','side','q_index','n_longest']].groupby(['scaffold','side','q_index'], sort=False).cumsum()
-    len_agree = len_agree[len_agree['n_longest'] == max(1,min_num_reads-1)]
-    len_agree.drop(columns=['n_longest'], inplace=True)
-    len_mappings = mappings.iloc[len_agree['q_index'].values]
-    len_agree['q_ext_len'] = np.where( np.logical_xor('+' == len_mappings['strand'], 'l' == len_mappings['side']), len_mappings['read_end']-len_mappings['read_to'], len_mappings['read_from'] )
+    if len(extensions) and len(mappings):
+        # Create table on how long mappings agree in the gap with at least min_num_reads-1 (-1 because they always agree with themselves)
+        len_agree = extensions[['scaffold','side','q_index','q_agree']].sort_values(['scaffold','side','q_index','q_agree'], ascending=[True,True,True,False])
+        len_agree['n_longest'] = 1
+        len_agree['n_longest'] = len_agree[['scaffold','side','q_index','n_longest']].groupby(['scaffold','side','q_index'], sort=False).cumsum()
+        len_agree = len_agree[len_agree['n_longest'] == max(1,min_num_reads-1)]
+        len_agree.drop(columns=['n_longest'], inplace=True)
+        len_mappings = mappings.iloc[len_agree['q_index'].values]
+        len_agree['q_ext_len'] = np.where( np.logical_xor('+' == len_mappings['strand'], 'l' == len_mappings['side']), len_mappings['read_end']-len_mappings['read_to'], len_mappings['read_from'] )
+        
+        # Take the read that has the longest agreement with at least min_num_reads-1 and see if and at what position another bundle of min_num_reads diverge from it (extend until that position or as long as min_num_reads-1 agree)
+        len_agree.sort_values(['scaffold','side','q_agree'], ascending=[True,True,False], inplace=True)
+        extending_reads = len_agree.groupby(['scaffold','side'], sort=False).first().reset_index()
+        len_agree = len_agree.merge(extending_reads[['scaffold','side','q_index']].rename(columns={'q_index':'t_index'}), on=['scaffold','side'], how='inner')
+        len_agree = len_agree[len_agree['q_index'] != len_agree['t_index']].copy()
+        len_agree = len_agree.merge(extensions[['scaffold','side','q_index','t_index','q_agree']].rename(columns={'q_agree':'qt_agree'}), on=['scaffold','side','q_index','t_index'], how='left')
+        len_agree['qt_agree'].fillna(0, inplace=True)
+        len_agree = len_agree[ len_agree['q_agree'] > len_agree['qt_agree']+max_mapping_uncertainty].copy()
+        len_agree = len_agree.merge(extensions[['scaffold','side','q_index','t_index','q_agree']].rename(columns={'q_index':'t_index','t_index':'q_index','q_agree':'tq_agree'}), on=['scaffold','side','q_index','t_index'], how='left')
+        len_agree['tq_agree'].fillna(0, inplace=True)
+        
+        len_agree.sort_values(['scaffold','side','tq_agree'], inplace=True)
+        len_agree['n_disagree'] = 1
+        len_agree['n_disagree'] = len_agree[['scaffold','side','n_disagree']].groupby(['scaffold','side'], sort=False).cumsum()
+        len_agree = len_agree[ len_agree['n_disagree'] == min_num_reads ].copy()
+        extending_reads = extending_reads.merge(len_agree[['scaffold','side','tq_agree']].rename(columns={'tq_agree':'valid_ext'}), on=['scaffold','side'], how='left')
+        extending_reads.loc[np.isnan(extending_reads['valid_ext']),'valid_ext'] = extending_reads.loc[np.isnan(extending_reads['valid_ext']),'q_agree'].values
+        extending_reads = extending_reads[extending_reads['valid_ext'] > 0.0].copy()
+        
+        # Change structure of extending_reads to the same as scaffold_table
+        # Start by adding read information
+        ext_mappings = mappings.iloc[extending_reads['q_index'].values]
+        extending_reads['name'] = ext_mappings['read_name'].values
+        extending_reads['start'] = np.where( np.logical_xor('+' == ext_mappings['strand'], 'l' == ext_mappings['side']), ext_mappings['read_to'].values, ext_mappings['read_from'].values-extending_reads['valid_ext'].values.astype(int) )
+        extending_reads['end'] = np.where( np.logical_xor('+' == ext_mappings['strand'], 'l' == ext_mappings['side']), ext_mappings['read_to'].values+extending_reads['valid_ext'].values.astype(int), ext_mappings['read_from'].values )
+        extending_reads['reverse'] = ('-' == ext_mappings['strand'].values)
+        
+        # Cut contigs where it is required by the extensions
+        scaffold_table['side'] = np.where(0 == scaffold_table['pos'], 'l', '')
+        scaffold_table = scaffold_table.merge(ext_mappings[['scaffold','side','dist_start']].rename(columns={'dist_start':'left_start'}), on=['scaffold','side'], how='left')
+        scaffold_table['side'] = np.where(scaffold_table['scaf_size'] == scaffold_table['pos']+1, 'r', '')
+        scaffold_table = scaffold_table.merge(ext_mappings[['scaffold','side','dist_start']].rename(columns={'dist_start':'right_start'}), on=['scaffold','side'], how='left')
+        scaffold_table.loc[(False == scaffold_table['reverse']) & (False == np.isnan(scaffold_table['left_start'])), 'start'] += scaffold_table.loc[(False == scaffold_table['reverse']) & (False == np.isnan(scaffold_table['left_start'])), 'left_start']
+        scaffold_table.loc[scaffold_table['reverse'] & (False == np.isnan(scaffold_table['left_start'])), 'end'] -= scaffold_table.loc[scaffold_table['reverse'] & (False == np.isnan(scaffold_table['left_start'])), 'left_start']
+        scaffold_table.loc[(False == scaffold_table['reverse']) & (False == np.isnan(scaffold_table['right_start'])), 'end'] -= scaffold_table.loc[(False == scaffold_table['reverse']) & (False == np.isnan(scaffold_table['right_start'])), 'right_start']
+        scaffold_table.loc[scaffold_table['reverse'] & (False == np.isnan(scaffold_table['right_start'])), 'start'] += scaffold_table.loc[scaffold_table['reverse'] & (False == np.isnan(scaffold_table['right_start'])), 'right_start']
+        scaffold_table['start'] = scaffold_table['start'].astype(int)
+        scaffold_table['end'] = scaffold_table['end'].astype(int)
+        
+        # Update scaffold information in scaffold_table and add it to extending_reads
+        ext_count = scaffold_table.groupby(['scaffold'], sort=False).agg({'left_start':['size','count'], 'right_start':['count']})
+        scaffold_table['scaf_size'] += np.repeat(ext_count['left_start','count'].values + ext_count['right_start','count'].values, ext_count['left_start','size'])
+        scaffold_table['pos'] += np.repeat(ext_count['left_start','count'].values, ext_count['left_start','size'])
+        
+        extending_reads = extending_reads.merge(scaffold_table[['scaffold','scaf_size']].groupby(['scaffold'], sort=False).first(), on=['scaffold'], how='left')
+        extending_reads['pos'] = np.where(extending_reads['side'] == 'l', 0, extending_reads['scaf_size']-1)
+        
+        extending_reads = extending_reads.merge(scaffold_table[['scaffold','side','org_dist_right']], on=['scaffold','side'], how='left')
+        extending_reads['org_dist_right'] = extending_reads['org_dist_right'].fillna(-1).astype(int)
+        scaffold_table['side'] = np.where(1 == scaffold_table['pos'], 'l', '') # Position of left contig with extension is now 1, because we already shifted (For non-extended scaffold that is not the left-most part, but we don't care, because those scaffolds are not in extending_reads)
+        extending_reads = extending_reads.merge(scaffold_table[['scaffold','side','org_dist_left']], on=['scaffold','side'], how='left')
+        extending_reads['org_dist_left'] = extending_reads['org_dist_left'].fillna(-1).astype(int)
+        
+        scaffold_table.loc[False == np.isnan(scaffold_table['left_start']), 'org_dist_left'] = -1
+        scaffold_table.loc[False == np.isnan(scaffold_table['right_start']), 'org_dist_right'] = -1
+        scaffold_table.drop(columns=['side','left_start','right_start'], inplace=True)
     
-    # Take the read that has the longest agreement with at least min_num_reads-1 and see if and at what position another bundle of min_num_reads diverge from it (extend until that position or as long as min_num_reads-1 agree)
-    len_agree.sort_values(['scaffold','side','q_agree'], ascending=[True,True,False], inplace=True)
-    extending_reads = len_agree.groupby(['scaffold','side'], sort=False).first().reset_index()
-    len_agree = len_agree.merge(extending_reads[['scaffold','side','q_index']].rename(columns={'q_index':'t_index'}), on=['scaffold','side'], how='inner')
-    len_agree = len_agree[len_agree['q_index'] != len_agree['t_index']].copy()
-    len_agree = len_agree.merge(extensions[['scaffold','side','q_index','t_index','q_agree']].rename(columns={'q_agree':'qt_agree'}), on=['scaffold','side','q_index','t_index'], how='left')
-    len_agree['qt_agree'].fillna(0, inplace=True)
-    len_agree = len_agree[ len_agree['q_agree'] > len_agree['qt_agree']+max_mapping_uncertainty].copy()
-    len_agree = len_agree.merge(extensions[['scaffold','side','q_index','t_index','q_agree']].rename(columns={'q_index':'t_index','t_index':'q_index','q_agree':'tq_agree'}), on=['scaffold','side','q_index','t_index'], how='left')
-    len_agree['tq_agree'].fillna(0, inplace=True)
+        # Add extending_reads to scaffold_table and sort again
+        extending_reads['type'] = 'read'
+        scaffold_table = scaffold_table.append( extending_reads[['scaffold','pos','scaf_size','type','name','start','end','reverse','org_dist_left','org_dist_right']] )
+        scaffold_table.sort_values(['scaffold','pos'], inplace=True)
     
-    len_agree.sort_values(['scaffold','side','tq_agree'], inplace=True)
-    len_agree['n_disagree'] = 1
-    len_agree['n_disagree'] = len_agree[['scaffold','side','n_disagree']].groupby(['scaffold','side'], sort=False).cumsum()
-    len_agree = len_agree[ len_agree['n_disagree'] == min_num_reads ].copy()
-    extending_reads = extending_reads.merge(len_agree[['scaffold','side','tq_agree']].rename(columns={'tq_agree':'valid_ext'}), on=['scaffold','side'], how='left')
-    extending_reads.loc[np.isnan(extending_reads['valid_ext']),'valid_ext'] = extending_reads.loc[np.isnan(extending_reads['valid_ext']),'q_agree'].values
-    extending_reads = extending_reads[extending_reads['valid_ext'] > 0.0].copy()
-    
-    # Change structure of extending_reads to the same as scaffold_table
-    # Start by adding read information
-    ext_mappings = mappings.iloc[extending_reads['q_index'].values]
-    extending_reads['name'] = ext_mappings['read_name'].values
-    extending_reads['start'] = np.where( np.logical_xor('+' == ext_mappings['strand'], 'l' == ext_mappings['side']), ext_mappings['read_to'].values, ext_mappings['read_from'].values-extending_reads['valid_ext'].values.astype(int) )
-    extending_reads['end'] = np.where( np.logical_xor('+' == ext_mappings['strand'], 'l' == ext_mappings['side']), ext_mappings['read_to'].values+extending_reads['valid_ext'].values.astype(int), ext_mappings['read_from'].values )
-    extending_reads['reverse'] = ('-' == ext_mappings['strand'].values)
-    
-    # Cut contigs where it is required by the extensions
-    scaffold_table['side'] = np.where(0 == scaffold_table['pos'], 'l', '')
-    scaffold_table = scaffold_table.merge(ext_mappings[['scaffold','side','dist_start']].rename(columns={'dist_start':'left_start'}), on=['scaffold','side'], how='left')
-    scaffold_table['side'] = np.where(scaffold_table['scaf_size'] == scaffold_table['pos']+1, 'r', '')
-    scaffold_table = scaffold_table.merge(ext_mappings[['scaffold','side','dist_start']].rename(columns={'dist_start':'right_start'}), on=['scaffold','side'], how='left')
-    scaffold_table.loc[(False == scaffold_table['reverse']) & (False == np.isnan(scaffold_table['left_start'])), 'start'] += scaffold_table.loc[(False == scaffold_table['reverse']) & (False == np.isnan(scaffold_table['left_start'])), 'left_start']
-    scaffold_table.loc[scaffold_table['reverse'] & (False == np.isnan(scaffold_table['left_start'])), 'end'] -= scaffold_table.loc[scaffold_table['reverse'] & (False == np.isnan(scaffold_table['left_start'])), 'left_start']
-    scaffold_table.loc[(False == scaffold_table['reverse']) & (False == np.isnan(scaffold_table['right_start'])), 'end'] -= scaffold_table.loc[(False == scaffold_table['reverse']) & (False == np.isnan(scaffold_table['right_start'])), 'right_start']
-    scaffold_table.loc[scaffold_table['reverse'] & (False == np.isnan(scaffold_table['right_start'])), 'start'] += scaffold_table.loc[scaffold_table['reverse'] & (False == np.isnan(scaffold_table['right_start'])), 'right_start']
-    scaffold_table['start'] = scaffold_table['start'].astype(int)
-    scaffold_table['end'] = scaffold_table['end'].astype(int)
-    
-    # Update scaffold information in scaffold_table and add it to extending_reads
-    ext_count = scaffold_table.groupby(['scaffold'], sort=False).agg({'left_start':['size','count'], 'right_start':['count']})
-    scaffold_table['scaf_size'] += np.repeat(ext_count['left_start','count'].values + ext_count['right_start','count'].values, ext_count['left_start','size'])
-    scaffold_table['pos'] += np.repeat(ext_count['left_start','count'].values, ext_count['left_start','size'])
-    
-    extending_reads = extending_reads.merge(scaffold_table[['scaffold','scaf_size']].groupby(['scaffold'], sort=False).first(), on=['scaffold'], how='left')
-    extending_reads['pos'] = np.where(extending_reads['side'] == 'l', 0, extending_reads['scaf_size']-1)
-    
-    extending_reads = extending_reads.merge(scaffold_table[['scaffold','side','org_dist_right']], on=['scaffold','side'], how='left')
-    extending_reads['org_dist_right'] = extending_reads['org_dist_right'].fillna(-1).astype(int)
-    scaffold_table['side'] = np.where(1 == scaffold_table['pos'], 'l', '') # Position of left contig with extension is now 1, because we already shifted (For non-extended scaffold that is not the left-most part, but we don't care, because those scaffolds are not in extending_reads)
-    extending_reads = extending_reads.merge(scaffold_table[['scaffold','side','org_dist_left']], on=['scaffold','side'], how='left')
-    extending_reads['org_dist_left'] = extending_reads['org_dist_left'].fillna(-1).astype(int)
-    
-    scaffold_table.loc[False == np.isnan(scaffold_table['left_start']), 'org_dist_left'] = -1
-    scaffold_table.loc[False == np.isnan(scaffold_table['right_start']), 'org_dist_right'] = -1
-    scaffold_table.drop(columns=['side','left_start','right_start'], inplace=True)
-    
-    # Add extending_reads to scaffold_table and sort again
-    extending_reads['type'] = 'read'
-    scaffold_table = scaffold_table.append( extending_reads[['scaffold','pos','scaf_size','type','name','start','end','reverse','org_dist_left','org_dist_right']] )
-    scaffold_table.sort_values(['scaffold','pos'], inplace=True)
-    
-    extension_info = {}
-    extension_info['count'] = len(extending_reads)
-    extension_info['left'] = len(extending_reads[extending_reads['side'] == 'l'])
-    extension_info['right'] = len(extending_reads[extending_reads['side'] == 'r'])
-    extension_info['mean'] = int(round(np.mean(extending_reads['valid_ext'])))
-    extension_info['min'] = int(np.min(extending_reads['valid_ext']))
-    extension_info['max'] = int(np.max(extending_reads['valid_ext']))
-    
+        extension_info = {}
+        extension_info['count'] = len(extending_reads)
+        extension_info['left'] = len(extending_reads[extending_reads['side'] == 'l'])
+        extension_info['right'] = len(extending_reads[extending_reads['side'] == 'r'])
+        extension_info['mean'] = int(round(np.mean(extending_reads['valid_ext'])))
+        extension_info['min'] = int(np.min(extending_reads['valid_ext']))
+        extension_info['max'] = int(np.max(extending_reads['valid_ext']))
+    else:
+        extension_info = {}
+        extension_info['count'] = 0
+        extension_info['left'] = 0
+        extension_info['right'] = 0
+        extension_info['mean'] = 0
+        extension_info['min'] = 0
+        extension_info['max'] = 0
+        
     return scaffold_table, extension_info
 
 def MiniGapExtend(all_vs_all_mapping_file, prefix):
@@ -2359,6 +2421,15 @@ def MiniGapFinish(assembly_file, read_file, read_format, scaffold_file, output_f
     print( str(timedelta(seconds=clock())), "Loading scaffold info from: {}".format(scaffold_file))
     scaffold_table = pd.read_csv(scaffold_file)
     
+    # Add _partX to the contig names if they appear multiple times
+    scaffold_table.sort_values(['type','name','start','end'], inplace=True)
+    times_used = scaffold_table.groupby(['type','name'], sort=False).size().reset_index(name='size')
+    scaffold_table['times_used'] = np.repeat(times_used['size'].values, times_used['size'].values)
+    scaffold_table['part'] = 1
+    scaffold_table['part'] = scaffold_table.groupby(['type','name'])['part'].cumsum()
+    scaffold_table['outname'] = np.where('contig' != scaffold_table['type'], "", np.where(1 == scaffold_table['times_used'], scaffold_table['name'], scaffold_table['name']+"_part"+scaffold_table['part'].astype(str)))
+    scaffold_table.sort_values(['scaffold','pos'], inplace=True)
+    
     print( str(timedelta(seconds=clock())), "Writing modified assembly to: {}".format(output_file))
     with gzip.open(output_file, 'wb') if 'gz' == output_file.rsplit('.',1)[-1] else open(output_file, 'w') as fout:
         cur_scaffold = 0
@@ -2369,6 +2440,7 @@ def MiniGapFinish(assembly_file, read_file, read_format, scaffold_file, output_f
             if cur_scaffold != row.scaffold:
                 if cur_scaffold < row.scaffold:
                     # Write scaffold to disc
+                    fout.write('>')
                     fout.write('_'.join(name))
                     fout.write('\n')
                     fout.write(''.join(seq))
@@ -2379,11 +2451,11 @@ def MiniGapFinish(assembly_file, read_file, read_format, scaffold_file, output_f
                     name = []
                     seq = []
                 else:
-                    print("Encountered scaffold {} while handling scaffold {}. The loaded scaffold table is invalid." )
+                    print("Encountered scaffold {} while handling scaffold {}. The loaded scaffold table is invalid.".format(row.scaffold, cur_scaffold) )
             
             # Add sequences to scaffold
             if 'contig' == row.type:
-                name.append(row.name)
+                name.append(row.outname)
                 
                 if row.reverse:
                     seq.append(str(contigs[row.name][row.start:row.end].reverse_complement()))
@@ -2400,11 +2472,12 @@ def MiniGapFinish(assembly_file, read_file, read_format, scaffold_file, output_f
                 seq.append( 'N' * row.org_dist_right )
                 cur_scaffold += 1 # Combine this scaffold with the next
             
-            # Write out last scaffold
-            fout.write('_'.join(name))
-            fout.write('\n')
-            fout.write(''.join(seq))
-            fout.write('\n')
+        # Write out last scaffold
+        fout.write('>')
+        fout.write('_'.join(name))
+        fout.write('\n')
+        fout.write(''.join(seq))
+        fout.write('\n')
         
         print( str(timedelta(seconds=clock())), "Finished" )
 
