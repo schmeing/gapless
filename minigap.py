@@ -12,6 +12,7 @@ import numpy as np
 from operator import itemgetter
 import os
 import pandas as pd
+from PIL import Image, ImageDraw, ImageFont
 import re
 import seaborn as sns
 import sys
@@ -2033,7 +2034,7 @@ def PrintStats(contig_parts, org_contig_info, min_num_reads):
     PrintStatsRow(1,"Sides being circular or repetitive",len(scaffolds['circular']['right']) + len(scaffolds['circular']['left']),total_num_scaffold_sides)
     PrintUnconnectedStats(scaffolds['unconnected'], total_num_scaffold_sides, 1)
 
-def MiniGapScaffold(assembly_file, mapping_file, repeat_file, prefix=False, stats=None):
+def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapping_length, min_length_contig_break, prefix=False, stats=None):
     # Put in default parameters if nothing was specified
     if False == prefix:
         if ".gz" == assembly_file[-3:len(assembly_file)]:
@@ -2047,12 +2048,9 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, prefix=False, stat
     remove_duplicated_contigs = True
     
     adapter_signal_max_dist = 3000
-    min_mapq = 20
     remove_zero_hit_contigs = True
-    min_mapping_length = 500
     min_extension = 500
     max_dist_contig_end = 2000
-    min_length_contig_break = 1000
     max_break_point_distance = 2000
     
     min_num_reads = 3
@@ -2203,7 +2201,7 @@ def LoadReads(all_vs_all_mapping_file, mappings, min_length_contig_break):
     extensions = reads[(reads['q_scaffold'] == reads['t_scaffold']) & (reads['q_side'] == reads['t_side'])].drop(columns=['t_scaffold','t_side']).rename(columns={'q_scaffold':'scaffold','q_side':'side'}).copy()
     connections = reads[(reads['q_scaffold'] != reads['t_scaffold']) | (reads['q_side'] != reads['t_side'])].copy()
 
-    # Filter extensions where the all vs. all mapping does not touch the the contig mapping of query and target or the reads diverge more than min_length_contig_break or their mapping length within the contig mapping
+    # Filter extensions where the all vs. all mapping does not touch the the contig mapping of query and target or the reads diverge more than min_length_contig_break of their mapping length within the contig mapping
     extensions['q_max_divergence'] = np.minimum(min_length_contig_break, np.where(np.logical_xor('+' == extensions['q_strand'], 'l' == extensions['side']), extensions['q_read_to']-extensions['q_start'], extensions['q_end']-extensions['q_read_from']))
     extensions['t_max_divergence'] = np.minimum(min_length_contig_break, np.where(np.logical_xor('+' == extensions['t_strand'], 'l' == extensions['side']), extensions['t_read_to']-extensions['t_start'], extensions['t_end']-extensions['t_read_from']))
     extensions = extensions[(0 < extensions['q_max_divergence']) & (0 < extensions['t_max_divergence'])].copy() # all vs. all mappings do not touch contig mapping
@@ -2374,11 +2372,10 @@ def ExtendScaffolds(scaffold_table, extensions, mappings, min_num_reads, max_map
         
     return scaffold_table, extension_info
 
-def MiniGapExtend(all_vs_all_mapping_file, prefix):
+def MiniGapExtend(all_vs_all_mapping_file, prefix, min_length_contig_break):
     # Define parameters
     min_extension = 500    
     min_num_reads = 3
-    min_length_contig_break = 1000
     max_mapping_uncertainty = 200
     
     print( str(timedelta(seconds=clock())), "Preparing data from files")
@@ -2481,6 +2478,265 @@ def MiniGapFinish(assembly_file, read_file, read_format, scaffold_file, output_f
         
         print( str(timedelta(seconds=clock())), "Finished" )
 
+def GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length):
+    mappings = ReadPaf(mapping_file)
+    
+    # Filter mappings
+    mappings = mappings[(min_mapq <= mappings['mapq']) & (min_mapping_length <= mappings['t_end'] - mappings['t_start'])].copy()
+    
+    # Find mappings inside defined regions
+    mappings['in_region'] = False
+    for reg in regions:
+         mappings.loc[ (reg['scaffold'] == mappings['t_name']) & (reg['start'] < mappings['t_end']) & (reg['end'] >= mappings['t_start']) , 'in_region'] = True
+         
+    # Only keep mappings that are in defined regions or are the previous or next mappings of a read in the region
+    mappings.sort_values(['q_name','q_start','q_end'], inplace=True)
+    mappings = mappings[ mappings['in_region'] | (mappings['in_region'].shift(-1, fill_value=False) & (mappings['q_name'] == mappings['q_name'].shift(-1, fill_value=''))) | (mappings['in_region'].shift(1, fill_value=False) & (mappings['q_name'] == mappings['q_name'].shift(1, fill_value=''))) ].copy()
+    
+    # Get left and right scaffold of read (first ignore strand and later switch next and prev if necessary)
+    mappings['left_scaf'] = np.where(mappings['q_name'] != mappings['q_name'].shift(1, fill_value=''), '', mappings['t_name'].shift(1, fill_value=''))
+    mappings['right_scaf'] = np.where(mappings['q_name'] != mappings['q_name'].shift(-1, fill_value=''), '', mappings['t_name'].shift(-1, fill_value=''))
+    # Get distance to next mapping or distance to read end if no next mapping exists
+    mappings['left_dist'] = np.where('' == mappings['left_scaf'], mappings['q_start'], mappings['q_start']-mappings['q_end'].shift(1, fill_value=0))
+    mappings['right_dist'] = np.where('' == mappings['right_scaf'], mappings['q_len']-mappings['q_end'], mappings['q_start'].shift(-1, fill_value=0)-mappings['q_end'])
+    # Switch left and right for negative strand
+    tmp = mappings.loc['-' == mappings['strand'], 'left_scaf']
+    mappings.loc['-' == mappings['strand'], 'left_scaf'] = mappings.loc['-' == mappings['strand'], 'right_scaf']
+    mappings.loc['-' == mappings['strand'], 'right_scaf'] = tmp
+    tmp = mappings.loc['-' == mappings['strand'], 'left_dist']
+    mappings.loc['-' == mappings['strand'], 'left_dist'] = mappings.loc['-' == mappings['strand'], 'right_dist']
+    mappings.loc['-' == mappings['strand'], 'right_dist'] = tmp
+    mappings.reset_index(drop=True, inplace=True)
+
+    # Assign region the mapping belongs to, duplicate mappings if they belong to multiple regions
+    if 1 == len(regions):
+        # With only one region it is simple
+        mappings['region'] = np.where(mappings['in_region'], 0, -1)
+        mappings['start'] = regions[0]['start']
+        mappings['end'] = regions[0]['end']
+        mappings['scaffold'] = regions[0]['scaffold']
+    else:
+        region_order = []
+        same_scaffold = []
+        for i, reg in enumerate(regions):
+            if len(same_scaffold) and reg['scaffold'] != regions[i-1]['scaffold']:
+                region_order.append(same_scaffold)
+                same_scaffold = []
+                
+            same_scaffold.append( (reg['start'], i) )
+
+        region_order.append(same_scaffold)
+
+        for i in range(len(region_order)):
+            region_order[i].sort()
+
+        inverted_order = [reg[1] for scaf in region_order for reg in scaf[::-1]]
+        region_order = [reg[1] for scaf in region_order for reg in scaf]
+    
+        # Duplicate all entries and remove the incorrect ones
+        mappings = mappings.loc[np.repeat(mappings.index, len(region_order))].copy()
+        mappings['region'] = np.where(mappings['strand'] == '+', region_order*(int(len(mappings)/len(region_order))), inverted_order*(int(len(mappings)/len(region_order))))
+        mappings = mappings[mappings['in_region'] | (mappings['region'] == 0)].copy() # The mappings not in any region do not need to be duplicated
+        mappings.loc[mappings['in_region']==False, 'region'] = -1
+        
+        mappings = mappings.merge(pd.DataFrame.from_dict(regions).reset_index().rename(columns={'index':'region'}), on=['region'], how='left')
+        mappings = mappings[(mappings['region'] == -1) | ((mappings['t_name'] == mappings['scaffold']) & (mappings['t_end'] > mappings['start']) & (mappings['t_start'] <= mappings['end']))].copy()
+        
+        
+    # If the mapping reaches out of the region of interest, ignore left/right scaffold
+    mappings['overrun_left'] = mappings['start'] > mappings['t_start']
+    mappings.loc[mappings['overrun_left'], 'left_scaf'] = ''
+    mappings.loc[mappings['overrun_left'], 'left_dist'] = 0
+    mappings['overrun_right'] = mappings['end'] < mappings['t_end']-1
+    mappings.loc[mappings['overrun_right'], 'right_scaf'] = ''
+    mappings.loc[mappings['overrun_right'], 'right_dist'] = 0
+    
+    # Remove mappings that are less than min_mapping_length in the region, except if they belong to a read with multiple mappings
+    mappings = mappings[ ((min_mapping_length <= mappings['t_end'] - mappings['start']) & (min_mapping_length <= mappings['end'] - mappings['t_start'])) | (mappings['q_name'] == mappings['q_name'].shift(1, fill_value="")) | (mappings['q_name'] == mappings['q_name'].shift(-1, fill_value="")) ].copy()
+    
+    mappings.drop(columns=['in_region','start','end','scaffold'], inplace=True)
+        
+    # Check if reads connect regions and if so in what way
+    mappings['con_prev_reg'] = 'no'
+    if 1 < len(regions):
+        # Find indirect connections, where the previous region has a mapping somewhere before the current mapping
+        for s in range(2,np.max(mappings.groupby(['q_name'], sort=False).size())+1):
+            mappings.loc[('+' == mappings['strand']) & (mappings['q_name'] == mappings['q_name'].shift(s, fill_value="")) & (0 < mappings['region']) & (mappings['region']-1 == mappings['region'].shift(s, fill_value=-1)), 'con_prev_reg'] = 'indirect'
+            mappings.loc[('-' == mappings['strand']) & (mappings['q_name'] == mappings['q_name'].shift(-s, fill_value="")) & (0 < mappings['region']) & (mappings['region']-1 == mappings['region'].shift(-s, fill_value=-1)), 'con_prev_reg'] = 'indirect'
+        
+        # Find direct connections
+        mappings.loc[('+' == mappings['strand']) & (mappings['q_name'] == mappings['q_name'].shift(1, fill_value="")) & ('+' == mappings['strand'].shift(1, fill_value="")) &\
+                     (0 < mappings['region']) & (mappings['region']-1 == mappings['region'].shift(1, fill_value=-1)), 'con_prev_reg'] = 'direct'
+        mappings.loc[('-' == mappings['strand']) & (mappings['q_name'] == mappings['q_name'].shift(-1, fill_value="")) & ('-' == mappings['strand'].shift(-1, fill_value="")) &\
+                 (0 < mappings['region']) & (mappings['region']-1 == mappings['region'].shift(-1, fill_value=-1)), 'con_prev_reg'] = 'direct'
+        # Clear scaffold connection info for direct connections
+        mappings.loc['direct' == mappings['con_prev_reg'], 'left_scaf'] = ''
+        mappings.loc['direct' == mappings['con_prev_reg'], 'left_dist'] = 0
+        mappings.loc[('+' == mappings['strand']) & ('direct' == mappings['con_prev_reg'].shift(-1, fill_value='')), 'right_scaf'] = ''
+        mappings.loc[('+' == mappings['strand']) & ('direct' == mappings['con_prev_reg'].shift(-1, fill_value='')), 'right_dist'] = 0
+        mappings.loc[('-' == mappings['strand']) & ('direct' == mappings['con_prev_reg'].shift(1, fill_value='')), 'right_scaf'] = ''
+        mappings.loc[('-' == mappings['strand']) & ('direct' == mappings['con_prev_reg'].shift(1, fill_value='')), 'right_dist'] = 0
+        
+        # Find same mappings connecting reads (full connection)
+        mappings.loc[('+' == mappings['strand']) & ('direct' == mappings['con_prev_reg']) &  (mappings['q_start'] == mappings['q_start'].shift(1, fill_value="")) &  (mappings['q_end'] == mappings['q_end'].shift(1, fill_value="")), 'con_prev_reg'] = 'full'
+        mappings.loc[('-' == mappings['strand']) & ('direct' == mappings['con_prev_reg']) &  (mappings['q_start'] == mappings['q_start'].shift(-1, fill_value="")) &  (mappings['q_end'] == mappings['q_end'].shift(-1, fill_value="")), 'con_prev_reg'] = 'full'
+        
+    # Remove mappings that are not in a region
+    mappings = mappings[0 <= mappings['region']].copy()
+    
+    # Assign read ids to the mappings sorted from left to right by appearance on screen to give position in drawing
+    tmp = mappings.groupby(['q_name'], sort=False)['region'].agg(['size','min'])
+    mappings['min_region'] = np.repeat(tmp['min'].values, tmp['size'].values)
+    mappings['t_min_start'] = np.where(mappings['min_region'] == mappings['region'], mappings['t_start'], sys.maxsize)
+    mappings['t_max_end'] = np.where(mappings['min_region'] == mappings['region'], mappings['t_end'], 0)
+    tmp = mappings.groupby(['q_name'], sort=False)[['t_min_start','t_max_end']].agg({'t_min_start':['size','min'], 't_max_end':['max']})
+    mappings['t_min_start'] = np.repeat(tmp[('t_min_start','min')].values, tmp[('t_min_start','size')].values)
+    mappings['t_max_end'] = np.repeat(tmp[('t_max_end','max')].values, tmp[('t_min_start','size')].values)
+    mappings.sort_values(['min_region','t_min_start','t_max_end','q_name','region','t_start','t_end'], ascending=[True,True,True,True,False,False,False], inplace=True)
+    mappings['read_id'] = (mappings['q_name'] != mappings['q_name'].shift(1, fill_value="")).cumsum()
+    mappings.drop(columns=['min_region','t_min_start','t_max_end'], inplace=True)
+    
+    return mappings
+
+def DrawRegions(draw, fnt, regions, total_x, region_part_height, read_section_height):
+    region_bar_height = 10
+    region_bar_read_separation = 5
+    border_width_x = 50
+    region_separation_width = 50
+    pixels_separating_ticks = 100
+    tick_width = 2
+    tick_length = 2
+    region_text_dist = 18
+
+    region_bar_y_bottom = region_part_height - region_bar_read_separation
+    region_bar_y_top = region_bar_y_bottom - region_bar_height
+    length_to_pixels = (total_x - 2*border_width_x - (len(regions)-1)*region_separation_width) / sum( [reg['end']-reg['start'] for reg in regions] )
+    
+    cur_length = 0
+    for i, reg in enumerate(regions):
+        regions[i]['start_x'] = border_width_x + i*region_separation_width + int(round(cur_length * length_to_pixels))
+        cur_length += reg['end']-reg['start']
+        regions[i]['end_x'] = border_width_x + i*region_separation_width + int(round(cur_length * length_to_pixels))
+
+        draw.rectangle((regions[i]['start_x'], region_bar_y_top, regions[i]['end_x'], region_bar_y_bottom), fill=(0, 0, 0), outline=(0, 0, 0))
+        w, h = draw.textsize(regions[i]['scaffold'], font=fnt)
+        draw.text(((regions[i]['start_x'] + regions[i]['end_x'] - w)/2, region_bar_y_top-2*region_text_dist), regions[i]['scaffold'], font=fnt, fill=(0,0,0))
+        
+        ticks = []
+        ticks.append( (regions[i]['start_x'], str(regions[i]['start'])) )
+        tick_num = max(0, int( (regions[i]['end_x']-regions[i]['start_x']) / pixels_separating_ticks ) - 1 )
+        for n in range(1, tick_num+1):
+            # First find ideal x (without regions[i]['start_x'] yet)
+            x = int( (regions[i]['end_x']-regions[i]['start_x']) / (tick_num+1) * n )
+            # Then calculate pos accordingly, round it to the next int and set x according to rounded pos
+            pos = regions[i]['start']+x/length_to_pixels
+            x = regions[i]['start_x'] + int(x + ( int( round(pos) ) - pos)*length_to_pixels )
+            ticks.append( (x, str(int( round(pos) ))) )
+        ticks.append( (regions[i]['end_x']-1, str(regions[i]['end'])) )
+        
+        for x, pos in ticks:
+            draw.line(((x, region_bar_y_bottom+1), (x, region_bar_y_bottom+read_section_height)), fill=(175, 175, 175), width=tick_width)
+            draw.line(((x, region_bar_y_top-tick_length), (x, region_bar_y_top)), fill=(0, 0, 0), width=tick_width)
+            w, h = draw.textsize(pos, font=fnt)
+            draw.text((x-w/2,region_bar_y_top-region_text_dist), pos, font=fnt, fill=(0,0,0))
+
+    return regions, length_to_pixels
+
+def GetMapQColor(mapq):
+    if mapq < 10:
+        return (255, 255, 255)
+    else:
+        return tuple([ int(round(255*c)) for c in sns.color_palette("Blues")[min(5,int(mapq/10)-1)] ])
+
+def DrawArrow(draw, x, y, width, color, direction, head_len):
+    if '+' == direction:
+        draw.polygon(((x[1], y), (x[1]-head_len, y+width), (x[0], y+width), (x[0]+head_len, y), (x[0], y-width), (x[1]-head_len, y-width)), fill=color, outline=GetMapQColor(60))
+    else:
+        draw.polygon(((x[0], y), (x[0]+head_len, y-width), (x[1], y-width), (x[1]-head_len, y), (x[1], y+width), (x[0]+head_len, y+width)), fill=color, outline=GetMapQColor(60))
+        
+def DrawCross(draw, x, y, size, color):
+    draw.line(((x-size, y-size), (x+size, y+size)), fill=color, width=4)
+    draw.line(((x+size, y-size), (x-size, y+size)), fill=color, width=4)
+
+def DrawMappings(draw, fnt, regions, mappings, min_length_contig_break, region_part_height, pixel_per_read, length_to_pixels):
+    arrow_width = 3
+    arrow_head_len = 10
+    last_read_id = -1
+    for row in mappings.itertuples(index=False):
+        # Draw line every 10 reads
+        y = region_part_height + row.read_id*pixel_per_read
+        if last_read_id != row.read_id and 0 == row.read_id % 10:
+            for reg in regions:
+                draw.line(((reg['start_x'], y), (reg['end_x'], y)), fill=(175, 175, 174), width=1)
+        
+        # Get positions
+        x1 = max(regions[row.region]['start_x'] - (arrow_head_len if row.overrun_left else 0), regions[row.region]['start_x'] + (row.t_start-regions[row.region]['start'])*length_to_pixels)
+        x2 = min(regions[row.region]['end_x'] + (arrow_head_len if row.overrun_right else 0), regions[row.region]['start_x'] + (row.t_end-regions[row.region]['start'])*length_to_pixels)
+        y = y - int(pixel_per_read/2)
+        x0 = max(regions[row.region]['start_x'] - arrow_head_len, x1 - row.left_dist*length_to_pixels)
+        x3 = min(regions[row.region]['end_x'] + arrow_head_len, x2 + row.right_dist*length_to_pixels)
+
+        # Draw read continuation
+        if last_read_id != row.read_id and x2 != x3:
+            draw.line(((x2 if row.strand == '+' else x2-arrow_head_len, y), (x3, y)), fill=(0, 0, 0), width=1)
+        if x0 != x1:
+            draw.line(((x0, y), (x1 if row.strand == '-' else x1+arrow_head_len, y)), fill=(0, 0, 0), width=1)
+
+        # Draw mapping
+        DrawArrow(draw, (x1, x2), y, arrow_width, GetMapQColor(row.mapq), row.strand, arrow_head_len)
+        
+        # Draw breaks
+        if row.left_dist >= min_length_contig_break:
+            DrawCross(draw, x1, y, 6, (217,173,60))
+        if row.right_dist >= min_length_contig_break:
+            DrawCross(draw, x2, y, 6, (217,173,60))
+        
+        last_read_id = row.read_id
+
+
+def MiniGapVisualize(region_defs, mapping_file, output, min_mapq, min_mapping_length, min_length_contig_break):
+    regions = []
+    for reg in region_defs:
+        split = reg.split(':')
+        if 2 != len(split):
+            print("Incorrect region definition: ", reg)
+            return 1
+        else:
+            scaf = split[0]
+            split = split[1].split('-')
+            if 2 != len(split):
+                print("Incorrect region definition: ", reg)
+                return 1
+            else:
+                regions.append( {'scaffold':scaf, 'start':int(split[0]), 'end':int(split[1])} )
+                
+    for i, reg in enumerate(regions):
+        for reg2 in regions[:i]:
+            if reg['scaffold'] == reg2['scaffold'] and reg['start'] <= reg2['end'] and reg['end'] >= reg2['start']:
+                print("Overlapping regions are not permitted: ", reg, " ", reg[2])
+                return 1
+            
+    # Prepare mappings
+    mappings = GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length)
+    
+    # Prepare drawing
+    total_x = 1000
+    region_part_height = 55
+    pixel_per_read = 13
+    read_section_height = np.max(mappings['read_id'])*pixel_per_read
+    img = Image.new('RGB', (total_x,region_part_height + read_section_height), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    fnt = ImageFont.truetype("Pillow/Tests/fonts/FreeMono.ttf", 12)
+    
+    # Draw
+    regions, length_to_pixels = DrawRegions(draw, fnt, regions, total_x, region_part_height, read_section_height)
+    DrawMappings(draw, fnt, regions, mappings, min_length_contig_break, region_part_height, pixel_per_read, length_to_pixels)
+
+    # Save drawing
+    img.save(output)
+        
+    return 0
+
 def MiniGapTest():
     # contigs, contig_ids = ReadContigs(assembly_file)
     # contigs, center_repeats = MaskRepeatEnds(contigs, repeat_file, contig_ids, max_repeat_extension, min_len_repeat_connection, repeat_len_factor_unique, remove_duplicated_contigs, pdf)
@@ -2499,6 +2755,7 @@ def Usage(module=""):
         print("scaffold      Scaffolds contigs and assigns reads to gaps")
         print("extend        Extend scaffold ends")
         print("finish        Create new fasta assembly file")
+        print("visualize     Visualizes regions to manually inspect breaks or joins")
         print("test          Short test")
     elif "split" == module:
         print("Usage: minigap.py split [OPTIONS] {assembly}.fa")
@@ -2512,11 +2769,15 @@ def Usage(module=""):
         print("  -h, --help                Display this help and exit")
         print("  -p, --prefix FILE         Prefix for output files ({assembly})")
         print("  -s, --stats FILE.pdf      Output file for plots with statistics regarding input parameters (deactivated)")
+        print("      --minLenBreak INT     Minimum length for a read to diverge from a contig to consider a contig break")
+        print("      --minMapLength INT    Minimum length of individual mappings of reads (500)")
+        print("      --minMapQ INT         Minimum mapping quality of reads (20)")
     elif "extend" == module:
         print("Usage: minigap.py extend -p {prefix} {all_vs_all}.paf")
         print("Extend scaffold ends with reads reaching over the ends.")
         print("  -h, --help                Display this help and exit")
         print("  -p, --prefix FILE         Prefix for output files of scaffolding step (mandatory)")
+        print("      --minLenBreak INT     Minimum length for two reads to diverge to consider them incompatible for this contig")
     elif "finish" == module:
         print("Usage: minigap.py finish [OPTIONS] -s {scaffolds}.csv {assembly}.fa {reads}.fq")
         print("Creates previously defined scaffolds. Only providing necessary reads increases speed and substantially reduces memory requirements.")
@@ -2524,6 +2785,14 @@ def Usage(module=""):
         print("  -f, --format FORMAT       Format of {reads}.fq (fasta/fastq) (Default: fastq)")
         print("  -o, --output FILE.fa      Output file for modified assembly ({assembly}_minigap.fa)")
         print("  -s, --scaffolds FILE.csv  Csv file from previous steps describing the scaffolding (mandatory)")
+    elif "visualize" == module:
+        print("Usage: minigap.py visualize [OPTIONS] -o {output}.pdf {mapping}.paf {scaffold}:{start}-{end} [{scaffold}:{start}-{end} ...]")
+        print("Visualizes specified regions to manually inspect breaks or joins.")
+        print("  -h, --help                Display this help and exit")
+        print("  -o, --output FILE.pdf     Output file for visualization (mandatory)")
+        print("      --minLenBreak INT     Minimum length for a read to diverge from a contig to consider a contig break")
+        print("      --minMapLength INT    Minimum length of individual mappings of reads (500)")
+        print("      --minMapQ INT         Minimum mapping quality of reads (20)")
         
 def main(argv):
     if 0 == len(argv):
@@ -2566,7 +2835,7 @@ def main(argv):
         MiniGapSplit(args[0],o_file,min_n)
     elif "scaffold" == module:
         try:
-            optlist, args = getopt.getopt(argv, 'hp:s:', ['help','prefix=','stats='])
+            optlist, args = getopt.getopt(argv, 'hp:s:', ['help','prefix=','stats=','--minLenBreak=','minMapLength=','minMapQ='])
         except getopt.GetoptError:
             print("Unknown option\n")
             Usage(module)
@@ -2574,6 +2843,9 @@ def main(argv):
             
         prefix = False
         stats = None
+        min_length_contig_break = 1000
+        min_mapping_length = 500
+        min_mapq = 20
         for opt, par in optlist:
             if opt in ("-h", "--help"):
                 Usage(module)
@@ -2586,28 +2858,54 @@ def main(argv):
                     print("stats argument needs to end on .pdf")
                     Usage(module)
                     sys.exit(1)
+            elif opt == "--minLenBreak":
+                try:
+                    min_length_contig_break = int(par)
+                except ValueError:
+                    print("--minLenBreak option only accepts integers")
+                    sys.exit(1)
+            elif opt == "--minMapLength":
+                try:
+                    min_mapping_length = int(par)
+                except ValueError:
+                    print("--minMapLength option only accepts integers")
+                    sys.exit(1)
+            elif opt == "--minMapQ":
+                try:
+                    min_mapq = int(par)
+                except ValueError:
+                    print("--minMapQ option only accepts integers")
+                    sys.exit(1)
+
                     
         if 3 != len(args):
             print("Wrong number of files. Exactly three files are required.\n")
             Usage(module)
             sys.exit(2)
 
-        MiniGapScaffold(args[0], args[1], args[2], prefix, stats)
+        MiniGapScaffold(args[0], args[1], args[2], min_mapq, min_mapping_length, min_length_contig_break, prefix, stats)
     elif "extend" == module:
         try:
-            optlist, args = getopt.getopt(argv, 'hp:', ['help','prefix='])
+            optlist, args = getopt.getopt(argv, 'hp:', ['help','prefix=','--minLenBreak'])
         except getopt.GetoptError:
             print("Unknown option\n")
             Usage(module)
             sys.exit(1)
             
         prefix = False
+        min_length_contig_break = 1000
         for opt, par in optlist:
             if opt in ("-h", "--help"):
                 Usage(module)
                 sys.exit()
             elif opt in ("-p", "--prefix"):
                 prefix = par
+            elif opt == "--minLenBreak":
+                try:
+                    min_length_contig_break = int(par)
+                except ValueError:
+                    print("--minLenBreak option only accepts integers")
+                    sys.exit(1)
                     
         if 1 != len(args):
             print("Wrong number of files. Exactly one file is required.\n")
@@ -2619,7 +2917,7 @@ def main(argv):
             Usage(module)
             sys.exit(1)
 
-        MiniGapExtend(args[0], prefix)
+        MiniGapExtend(args[0], prefix, min_length_contig_break)
     elif "finish" == module:
         try:
             optlist, args = getopt.getopt(argv, 'hf:o:s:', ['help','format=','output=','scaffolds='])
@@ -2659,8 +2957,57 @@ def main(argv):
             Usage(module)
             sys.exit(1)
 
-
         MiniGapFinish(args[0], args[1], read_format, scaffolds, output)
+    elif "visualize" == module:
+        try:
+            optlist, args = getopt.getopt(argv, 'ho:', ['help','output=','--minLenBreak=','minMapLength=','minMapQ='])
+        except getopt.GetoptError:
+            print("Unknown option\n")
+            Usage(module)
+            sys.exit(1)
+            
+        output = False
+        min_length_contig_break = 1000
+        min_mapping_length = 500
+        min_mapq = 20
+        for opt, par in optlist:
+            if opt in ("-h", "--help"):
+                Usage(module)
+                sys.exit()
+            elif opt in ("-o", "--output"):
+                output = par
+            elif opt == "--minLenBreak":
+                try:
+                    min_length_contig_break = int(par)
+                except ValueError:
+                    print("--minLenBreak option only accepts integers")
+                    sys.exit(1)
+            elif opt == "--minMapLength":
+                try:
+                    min_mapping_length = int(par)
+                except ValueError:
+                    print("--minMapLength option only accepts integers")
+                    sys.exit(1)
+            elif opt == "--minMapQ":
+                try:
+                    min_mapq = int(par)
+                except ValueError:
+                    print("--minMapQ option only accepts integers")
+                    sys.exit(1)
+            
+        if 2 > len(args):
+            print("Wrong number of arguments. The mapping file and at least one region definition are needed.\n")
+            Usage(module)
+            sys.exit(2)
+            
+        if False == output:
+            print("output argument is mandatory")
+            Usage(module)
+            sys.exit(1)
+            
+        return_code = MiniGapVisualize(args[1:], args[0], output, min_mapq, min_mapping_length, min_length_contig_break)
+        if return_code:
+            sys.exit(return_code)
     elif "test" == module:
         MiniGapTest()
     else:
