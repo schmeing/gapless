@@ -2506,7 +2506,7 @@ def MiniGapFinish(assembly_file, read_file, read_format, scaffold_file, output_f
         
         print( str(timedelta(seconds=clock())), "Finished" )
 
-def GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length, keep_all_subreads, subread_alignment_precision):
+def GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length, keep_all_subreads, subread_alignment_precision, min_length_contig_break, max_dist_contig_end):
     mappings = ReadPaf(mapping_file)
     
     # Filter mappings
@@ -2531,6 +2531,10 @@ def GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length, kee
     # Get distance to next mapping or distance to read end if no next mapping exists
     mappings['left_dist'] = np.where('' == mappings['left_scaf'], mappings['q_start'], mappings['q_start']-mappings['q_end'].shift(1, fill_value=0))
     mappings['right_dist'] = np.where('' == mappings['right_scaf'], mappings['q_len']-mappings['q_end'], mappings['q_start'].shift(-1, fill_value=0)-mappings['q_end'])
+    # Get length of continued read after mapping end
+    mappings['left_len'] = mappings['q_start']
+    mappings['right_len'] = mappings['q_len']-mappings['q_end']
+
     # Switch left and right for negative strand
     tmp = mappings.loc['-' == mappings['strand'], 'left_scaf']
     mappings.loc['-' == mappings['strand'], 'left_scaf'] = mappings.loc['-' == mappings['strand'], 'right_scaf']
@@ -2538,6 +2542,9 @@ def GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length, kee
     tmp = mappings.loc['-' == mappings['strand'], 'left_dist']
     mappings.loc['-' == mappings['strand'], 'left_dist'] = mappings.loc['-' == mappings['strand'], 'right_dist']
     mappings.loc['-' == mappings['strand'], 'right_dist'] = tmp
+    tmp = mappings.loc['-' == mappings['strand'], 'left_len']
+    mappings.loc['-' == mappings['strand'], 'left_len'] = mappings.loc['-' == mappings['strand'], 'right_len']
+    mappings.loc['-' == mappings['strand'], 'right_len'] = tmp
     mappings.reset_index(drop=True, inplace=True)
 
     # Assign region the mapping belongs to, duplicate mappings if they belong to multiple regions
@@ -2579,9 +2586,11 @@ def GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length, kee
     mappings['overrun_left'] = mappings['start'] > mappings['t_start']
     mappings.loc[mappings['overrun_left'], 'left_scaf'] = ''
     mappings.loc[mappings['overrun_left'], 'left_dist'] = 0
+    mappings.loc[mappings['overrun_left'], 'left_len'] = 0
     mappings['overrun_right'] = mappings['end'] < mappings['t_end']-1
     mappings.loc[mappings['overrun_right'], 'right_scaf'] = ''
     mappings.loc[mappings['overrun_right'], 'right_dist'] = 0
+    mappings.loc[mappings['overrun_right'], 'right_len'] = 0
     
     # Remove mappings that are less than min_mapping_length in the region, except if they belong to a read with multiple mappings
     mappings = mappings[ ((min_mapping_length <= mappings['t_end'] - mappings['start']) & (min_mapping_length <= mappings['end'] - mappings['t_start'])) | (mappings['q_name'] == mappings['q_name'].shift(1, fill_value="")) | (mappings['q_name'] == mappings['q_name'].shift(-1, fill_value="")) ].copy()
@@ -2603,11 +2612,8 @@ def GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length, kee
                  (0 < mappings['region']) & (mappings['region']-1 == mappings['region'].shift(-1, fill_value=-1)), 'con_prev_reg'] = 'direct'
         # Clear scaffold connection info for direct connections
         mappings.loc['direct' == mappings['con_prev_reg'], 'left_scaf'] = ''
-        mappings.loc['direct' == mappings['con_prev_reg'], 'left_dist'] = 0
         mappings.loc[('+' == mappings['strand']) & ('direct' == mappings['con_prev_reg'].shift(-1, fill_value='')), 'right_scaf'] = ''
-        mappings.loc[('+' == mappings['strand']) & ('direct' == mappings['con_prev_reg'].shift(-1, fill_value='')), 'right_dist'] = 0
         mappings.loc[('-' == mappings['strand']) & ('direct' == mappings['con_prev_reg'].shift(1, fill_value='')), 'right_scaf'] = ''
-        mappings.loc[('-' == mappings['strand']) & ('direct' == mappings['con_prev_reg'].shift(1, fill_value='')), 'right_dist'] = 0
         
         # Find same mappings connecting reads (full connection)
         mappings.loc[('+' == mappings['strand']) & ('direct' == mappings['con_prev_reg']) &  (mappings['q_start'] == mappings['q_start'].shift(1, fill_value="")) &  (mappings['q_end'] == mappings['q_end'].shift(1, fill_value="")), 'con_prev_reg'] = 'full'
@@ -2627,6 +2633,15 @@ def GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length, kee
     mappings.sort_values(['min_region','t_min_start','t_max_end','q_name','region','t_start','t_end'], ascending=[True,True,True,True,False,False,False], inplace=True)
     mappings['read_id'] = (mappings['q_name'] != mappings['q_name'].shift(1, fill_value="")).cumsum()
     mappings.drop(columns=['min_region','t_min_start','t_max_end'], inplace=True)
+    
+    # Check whether the reads support a contig break within the region
+    mappings['left_break'] = ((mappings['t_len']-mappings['t_end'] > max_dist_contig_end) &
+                             ( (mappings['left_scaf'] != '') | (np.where('+' == mappings['strand'], mappings['q_start'], mappings['q_len']-mappings['q_end']) > min_length_contig_break) ) &
+                             (mappings['overrun_left'] == False))
+
+    mappings['right_break'] = ((mappings['t_start'] > max_dist_contig_end) &
+                              ( (mappings['right_scaf'] != '') | (np.where('+' == mappings['strand'], mappings['q_len']-mappings['q_end'], mappings['q_start']) > min_length_contig_break) ) &
+                              (mappings['overrun_right'] == False))
     
     return mappings
 
@@ -2690,7 +2705,7 @@ def DrawCross(draw, x, y, size, color):
     draw.line(((x-size, y-size), (x+size, y+size)), fill=color, width=4)
     draw.line(((x+size, y-size), (x-size, y+size)), fill=color, width=4)
 
-def DrawMappings(draw, fnt, regions, mappings, min_length_contig_break, region_part_height, pixel_per_read, length_to_pixels):
+def DrawMappings(draw, fnt, regions, mappings, region_part_height, pixel_per_read, length_to_pixels):
     arrow_width = 3
     arrow_head_len = 10
     last_read_id = -1
@@ -2705,8 +2720,8 @@ def DrawMappings(draw, fnt, regions, mappings, min_length_contig_break, region_p
         x1 = max(regions[row.region]['start_x'] - (arrow_head_len if row.overrun_left else 0), regions[row.region]['start_x'] + (row.t_start-regions[row.region]['start'])*length_to_pixels)
         x2 = min(regions[row.region]['end_x'] + (arrow_head_len if row.overrun_right else 0), regions[row.region]['start_x'] + (row.t_end-regions[row.region]['start'])*length_to_pixels)
         y = y - int(pixel_per_read/2)
-        x0 = max(regions[row.region]['start_x'] - arrow_head_len, x1 - row.left_dist*length_to_pixels)
-        x3 = min(regions[row.region]['end_x'] + arrow_head_len, x2 + row.right_dist*length_to_pixels)
+        x0 = max(regions[row.region]['start_x'] - arrow_head_len, x1 - row.left_len*length_to_pixels)
+        x3 = min(regions[row.region]['end_x'] + arrow_head_len, x2 + row.right_len*length_to_pixels)
 
         # Draw read continuation
         if last_read_id != row.read_id and x2 != x3:
@@ -2718,9 +2733,9 @@ def DrawMappings(draw, fnt, regions, mappings, min_length_contig_break, region_p
         DrawArrow(draw, (x1, x2), y, arrow_width, GetMapQColor(row.mapq), row.strand, arrow_head_len)
         
         # Draw breaks
-        if row.left_dist >= min_length_contig_break:
+        if row.left_break:
             DrawCross(draw, x1, y, 6, (217,173,60))
-        if row.right_dist >= min_length_contig_break:
+        if row.right_break:
             DrawCross(draw, x2, y, 6, (217,173,60))
         
         last_read_id = row.read_id
@@ -2728,19 +2743,20 @@ def DrawMappings(draw, fnt, regions, mappings, min_length_contig_break, region_p
 
 def MiniGapVisualize(region_defs, mapping_file, output, min_mapq, min_mapping_length, min_length_contig_break, keep_all_subreads):
     subread_alignment_precision = 100
+    max_dist_contig_end = 2000
     
     regions = []
     for reg in region_defs:
         split = reg.split(':')
         if 2 != len(split):
             print("Incorrect region definition: ", reg)
-            return 1
+            sys.exit(1)
         else:
             scaf = split[0]
             split = split[1].split('-')
             if 2 != len(split):
                 print("Incorrect region definition: ", reg)
-                return 1
+                sys.exit(1)
             else:
                 regions.append( {'scaffold':scaf, 'start':int(split[0]), 'end':int(split[1])} )
                 
@@ -2748,28 +2764,31 @@ def MiniGapVisualize(region_defs, mapping_file, output, min_mapq, min_mapping_le
         for reg2 in regions[:i]:
             if reg['scaffold'] == reg2['scaffold'] and reg['start'] <= reg2['end'] and reg['end'] >= reg2['start']:
                 print("Overlapping regions are not permitted: ", reg, " ", reg[2])
-                return 1
+                sys.exit(1)
             
     # Prepare mappings
-    mappings = GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length, keep_all_subreads, subread_alignment_precision)
+    mappings = GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length, keep_all_subreads, subread_alignment_precision, min_length_contig_break, max_dist_contig_end)
     
     # Prepare drawing
     total_x = 1000
     region_part_height = 55
     pixel_per_read = 13
-    read_section_height = np.max(mappings['read_id'])*pixel_per_read
+    
+    if len(mappings):
+        read_section_height = np.max(mappings['read_id'])*pixel_per_read
+    else:
+        read_section_height = 0
+        
     img = Image.new('RGB', (total_x,region_part_height + read_section_height), (255, 255, 255))
     draw = ImageDraw.Draw(img)
     fnt = ImageFont.truetype("Pillow/Tests/fonts/FreeMono.ttf", 12)
     
     # Draw
     regions, length_to_pixels = DrawRegions(draw, fnt, regions, total_x, region_part_height, read_section_height)
-    DrawMappings(draw, fnt, regions, mappings, min_length_contig_break, region_part_height, pixel_per_read, length_to_pixels)
+    DrawMappings(draw, fnt, regions, mappings, region_part_height, pixel_per_read, length_to_pixels)
 
     # Save drawing
     img.save(output)
-        
-    return 0
 
 def MiniGapTest():
     # contigs, contig_ids = ReadContigs(assembly_file)
@@ -3043,9 +3062,7 @@ def main(argv):
             Usage(module)
             sys.exit(1)
             
-        return_code = MiniGapVisualize(args[1:], args[0], output, min_mapq, min_mapping_length, min_length_contig_break, keep_all_subreads)
-        if return_code:
-            sys.exit(return_code)
+        MiniGapVisualize(args[1:], args[0], output, min_mapq, min_mapping_length, min_length_contig_break, keep_all_subreads)
     elif "test" == module:
         MiniGapTest()
     else:
