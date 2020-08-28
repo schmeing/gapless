@@ -7,6 +7,7 @@ import gzip
 from matplotlib import use as mpl_use
 mpl_use('Agg')
 from matplotlib.backends.backend_pdf import PdfPages
+import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 import numpy as np
 from operator import itemgetter
@@ -142,8 +143,6 @@ def stackhist(x, y, **kws):
     data = [d for _, d in grouped]
     labels = [l for l, _ in grouped]
     plt.hist(data, histtype="barstacked", label=labels)
-
-import matplotlib.patches as patches
 
 def PlotHist(pdf, xtitle, ytitle, values, category=[], catname='category', threshold=None, logx=False, logy=False):
     plt.close()
@@ -357,13 +356,40 @@ def MaskRepeatEnds(contigs, repeat_file, contig_ids, max_repeat_extension, min_l
 
     return contigs, repeat_table
 
-def ReadMappings(mapping_file, contig_ids, min_mapq, pdf):
+def GetBestSubreads(mappings, subread_alignment_precision):
+    # Return if we do not have subreads
+
+    
+    # Identify groups of subread mappings (of which only one is required)
+    mappings['subread'] = [ re.sub(r'^(.*?/.*?)/.+', r'\1', qname) for qname in mappings['q_name'].values ]
+    mappings.sort_values(['subread','t_name','t_start','t_end'], inplace=True)
+    mappings['group'] = (( (mappings['subread'] != mappings['subread'].shift(1, fill_value="")) | (mappings['t_name'] != mappings['t_name'].shift(1, fill_value="")) | ((mappings['t_start']-mappings['t_start'].shift(1, fill_value=0) > subread_alignment_precision) & (np.abs(mappings['t_end'] - mappings['t_end'].shift(1, fill_value=0)) > subread_alignment_precision)) )).cumsum()
+    
+    # Keep only the best subread (over all mappings)
+    mappings.sort_values(['group','mapq','matches'], ascending=[True,False,False], inplace=True)
+    mappings['pos'] = mappings.groupby(['group'], sort=False).cumcount()
+    mappings.sort_values(['q_name'], inplace=True)
+    tmp = mappings.groupby(['q_name'], sort=False)['pos'].agg(['size','max','mean'])
+    mappings['max_pos'] = np.repeat(tmp['max'].values, tmp['size'].values)
+    mappings['mean_pos'] = np.repeat(tmp['mean'].values, tmp['size'].values)
+    mappings.sort_values(['group','max_pos','mean_pos'], inplace=True)
+    mappings = mappings.groupby(['group'], sort=False).first().reset_index()
+    
+    mappings.drop(columns=['subread','group','pos','max_pos','mean_pos'], inplace=True)
+    
+    return mappings
+
+def ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, subread_alignment_precision, pdf):
     mappings = ReadPaf(mapping_file)
 
     # Filter low mapping qualities
     if pdf:
         PlotHist(pdf, "Mapping quality", "# Mappings", mappings['mapq'], threshold=min_mapq, logy=True)
     mappings = mappings[min_mapq <= mappings['mapq']].copy()
+
+    # Remove all but the best subread
+    if not keep_all_subreads:
+        mappings = GetBestSubreads(mappings, subread_alignment_precision)
 
     mappings['t_id'] = itemgetter(*mappings['t_name'])(contig_ids)
 
@@ -439,46 +465,47 @@ def RemoveUnanchoredMappings(mappings, contigs, center_repeats, min_mapping_leng
 
     return mappings
 
-def BreakReadsAtAdapters(mappings, adapter_signal_max_dist, pdf):
+def BreakReadsAtAdapters(mappings, adapter_signal_max_dist, keep_all_subreads):
     # Sort mappings by starting position and provide information on next/previous mapping (if from same read)
     mappings.sort_values(['q_name','q_start'], inplace=True)
-
+    
     mappings['next_con'] = mappings['t_id'].shift(-1, fill_value=-1)
     mappings.loc[mappings['q_name'].shift(-1, fill_value='') != mappings['q_name'], 'next_con'] = -1
     mappings['next_strand'] = mappings['strand'].shift(-1, fill_value='')
     mappings.loc[-1 == mappings['next_con'], 'next_strand'] = ''
-
+    
     mappings['prev_con'] = mappings['t_id'].shift(1, fill_value=-1)
     mappings.loc[mappings['q_name'].shift(1, fill_value='') != mappings['q_name'], 'prev_con'] = -1
     mappings['prev_strand'] = mappings['strand'].shift(1, fill_value='')
     mappings.loc[-1 == mappings['prev_con'], 'prev_strand'] = ''
-
-    # Account for left-over adapters
+    
+    # Find potential left-over adapters
     mappings['read_start'] = 0
     mappings['read_end'] = mappings['q_len']
-
-    adapter = (mappings['next_con'] == mappings['t_id']) & (mappings['next_strand'] != mappings['strand'])
-    location_shift = np.abs(np.where('+' == mappings['strand'], mappings['t_end'] - mappings['t_end'].shift(-1, fill_value=0), mappings['t_start'] - mappings['t_start'].shift(-1, fill_value=0)))
-
-    if pdf:
-        potential_adapter_dist = location_shift[adapter]
-        if len(potential_adapter_dist):
-            if np.sum(potential_adapter_dist < 10*adapter_signal_max_dist):
-                PlotHist(pdf, "Distance for potential adapter signal", "# Signals", np.extract(potential_adapter_dist < 10*adapter_signal_max_dist, potential_adapter_dist), threshold=adapter_signal_max_dist, logy=True)
-            PlotHist(pdf, "Distance for potential adapter signal", "# Signals", potential_adapter_dist, threshold=adapter_signal_max_dist, logx=True)
-
-    adapter = adapter & (location_shift <= adapter_signal_max_dist)
-
-    mappings.loc[adapter, 'next_con'] = -1
-    mappings.loc[adapter, 'next_strand'] = ''
-    mappings.loc[adapter, 'read_end'] = mappings.loc[adapter, 'q_end'] # If the adapter was missed it's probably a bad part of the read, so better ignore it and don't use it for extensions
-    mappings['read_end'] = mappings.loc[::-1, ['q_name','read_end']].groupby('q_name', sort=False).cummin()[::-1]
-
-    adapter = adapter.shift(1, fill_value=False)
-    mappings.loc[adapter, 'prev_con'] = -1
-    mappings.loc[adapter, 'prev_strand'] = ''
-    mappings.loc[adapter, 'read_start'] = mappings.loc[adapter, 'q_start'] # If the adapter was missed it's probably a bad part of the read, so better ignore it and don't use it for extensions
-    mappings['read_start'] = mappings[['q_name','read_start']].groupby('q_name', sort=False).cummax()
+    
+    if keep_all_subreads:
+        # If we only keep the best subreads, we already removed most of the duplication and cannot separate the reads at adapters anymore, which results in spurious breaks
+        adapter = (mappings['next_con'] == mappings['t_id']) & (mappings['next_strand'] != mappings['strand'])
+        location_shift = np.abs(np.where('+' == mappings['strand'], mappings['t_end'] - mappings['t_end'].shift(-1, fill_value=0), mappings['t_start'] - mappings['t_start'].shift(-1, fill_value=0)))
+    
+        adapter = adapter & (location_shift <= adapter_signal_max_dist)
+    
+        # We need to be very sure that this is an adapter signal, because we do not want to miss a signal for a break point due to a missed inverted repeat
+        # For this we require that they must have at least one mapping before and after the two with the adapter that are compatible with the adapter hypothesis
+        adapter = adapter & (mappings['prev_con'] >= 0) & (mappings['prev_con'] == mappings['next_con'].shift(-1, fill_value=-1)) & (mappings['prev_strand'] != mappings['next_strand'].shift(-1, fill_value=''))
+        adapter = adapter & (np.abs(np.where('-' == mappings['strand'], mappings['t_end'] - mappings['t_end'].shift(-1, fill_value=0), mappings['t_start'] - mappings['t_start'].shift(-1, fill_value=0))) <= adapter_signal_max_dist)
+    
+        # Split the read at the adapter
+        mappings.loc[adapter, 'next_con'] = -1
+        mappings.loc[adapter, 'next_strand'] = ''
+        mappings.loc[adapter, 'read_end'] = mappings.loc[adapter, 'q_end'] # If the adapter was missed it's probably a bad part of the read, so better ignore it and don't use it for extensions
+        mappings['read_end'] = mappings.loc[::-1, ['q_name','read_end']].groupby('q_name', sort=False).cummin()[::-1]
+    
+        adapter = adapter.shift(1, fill_value=False)
+        mappings.loc[adapter, 'prev_con'] = -1
+        mappings.loc[adapter, 'prev_strand'] = ''
+        mappings.loc[adapter, 'read_start'] = mappings.loc[adapter, 'q_start'] # If the adapter was missed it's probably a bad part of the read, so better ignore it and don't use it for extensions
+        mappings['read_start'] = mappings[['q_name','read_start']].groupby('q_name', sort=False).cummax()
 
     return mappings
 
@@ -2047,7 +2074,6 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     repeat_len_factor_unique = 10
     remove_duplicated_contigs = True
     
-    adapter_signal_max_dist = 3000
     remove_zero_hit_contigs = True
     min_extension = 500
     max_dist_contig_end = 2000
@@ -2055,6 +2081,8 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     
     min_num_reads = 3
     min_factor_alternatives = 2
+    keep_all_subreads = False
+    subread_alignment_precision = 100
     org_scaffold_trust = "basic" # blind: If there is a read that supports it use the org scaffold; Do not break contigs
                                  # full: If there is no confirmed other option use the org scaffold
                                  # basic: If there is no alternative bridge use the org scaffold
@@ -2078,13 +2106,13 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     contigs, center_repeats = MaskRepeatEnds(contigs, repeat_file, contig_ids, max_repeat_extension, min_len_repeat_connection, repeat_len_factor_unique, remove_duplicated_contigs, pdf)
     
     print( str(timedelta(seconds=clock())), "Filtering mappings")
-    mappings = ReadMappings(mapping_file, contig_ids, min_mapq, pdf)
+    mappings = ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, subread_alignment_precision, pdf)
     contigs, org_contig_info = RemoveUnmappedContigs(contigs, mappings, remove_zero_hit_contigs)
     mappings = RemoveUnanchoredMappings(mappings, contigs, center_repeats, min_mapping_length, pdf, max_dist_contig_end)
     del center_repeats
     
     print( str(timedelta(seconds=clock())), "Account for left-over adapters")
-    mappings = BreakReadsAtAdapters(mappings, adapter_signal_max_dist, pdf)
+    mappings = BreakReadsAtAdapters(mappings, subread_alignment_precision, keep_all_subreads)
     
     print( str(timedelta(seconds=clock())), "Search for possible break points")
     if "blind" == org_scaffold_trust:
@@ -2478,11 +2506,15 @@ def MiniGapFinish(assembly_file, read_file, read_format, scaffold_file, output_f
         
         print( str(timedelta(seconds=clock())), "Finished" )
 
-def GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length):
+def GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length, keep_all_subreads, subread_alignment_precision):
     mappings = ReadPaf(mapping_file)
     
     # Filter mappings
     mappings = mappings[(min_mapq <= mappings['mapq']) & (min_mapping_length <= mappings['t_end'] - mappings['t_start'])].copy()
+    
+    # Remove all but the best subread
+    if not keep_all_subreads:
+        mappings = GetBestSubreads(mappings, subread_alignment_precision)
     
     # Find mappings inside defined regions
     mappings['in_region'] = False
@@ -2694,7 +2726,9 @@ def DrawMappings(draw, fnt, regions, mappings, min_length_contig_break, region_p
         last_read_id = row.read_id
 
 
-def MiniGapVisualize(region_defs, mapping_file, output, min_mapq, min_mapping_length, min_length_contig_break):
+def MiniGapVisualize(region_defs, mapping_file, output, min_mapq, min_mapping_length, min_length_contig_break, keep_all_subreads):
+    subread_alignment_precision = 100
+    
     regions = []
     for reg in region_defs:
         split = reg.split(':')
@@ -2717,7 +2751,7 @@ def MiniGapVisualize(region_defs, mapping_file, output, min_mapq, min_mapping_le
                 return 1
             
     # Prepare mappings
-    mappings = GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length)
+    mappings = GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length, keep_all_subreads, subread_alignment_precision)
     
     # Prepare drawing
     total_x = 1000
@@ -2790,6 +2824,7 @@ def Usage(module=""):
         print("Visualizes specified regions to manually inspect breaks or joins.")
         print("  -h, --help                Display this help and exit")
         print("  -o, --output FILE.pdf     Output file for visualization (mandatory)")
+        print("      --keepAllSubreads     Shows all subreads instead of only the best")
         print("      --minLenBreak INT     Minimum length for a read to diverge from a contig to consider a contig break")
         print("      --minMapLength INT    Minimum length of individual mappings of reads (500)")
         print("      --minMapQ INT         Minimum mapping quality of reads (20)")
@@ -2960,13 +2995,14 @@ def main(argv):
         MiniGapFinish(args[0], args[1], read_format, scaffolds, output)
     elif "visualize" == module:
         try:
-            optlist, args = getopt.getopt(argv, 'ho:', ['help','output=','--minLenBreak=','minMapLength=','minMapQ='])
+            optlist, args = getopt.getopt(argv, 'ho:', ['help','output=','--keepAllSubreads','--minLenBreak=','minMapLength=','minMapQ='])
         except getopt.GetoptError:
             print("Unknown option\n")
             Usage(module)
             sys.exit(1)
             
         output = False
+        keep_all_subreads = False
         min_length_contig_break = 1000
         min_mapping_length = 500
         min_mapq = 20
@@ -2976,6 +3012,8 @@ def main(argv):
                 sys.exit()
             elif opt in ("-o", "--output"):
                 output = par
+            elif opt == "--keepAllSubreads":
+                keep_all_subreads = True
             elif opt == "--minLenBreak":
                 try:
                     min_length_contig_break = int(par)
@@ -3005,7 +3043,7 @@ def main(argv):
             Usage(module)
             sys.exit(1)
             
-        return_code = MiniGapVisualize(args[1:], args[0], output, min_mapq, min_mapping_length, min_length_contig_break)
+        return_code = MiniGapVisualize(args[1:], args[0], output, min_mapq, min_mapping_length, min_length_contig_break, keep_all_subreads)
         if return_code:
             sys.exit(return_code)
     elif "test" == module:
