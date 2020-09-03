@@ -1642,7 +1642,7 @@ def OrderByUnbrokenOriginalScaffolds(scaffold_result, contig_parts):
         space_needed = np.unique(groups, return_counts=True) # unique scaffolds in group
         space_needed = pd.Series(space_needed[1], index=pd.Series(space_needed[0], name='group'))
         space_needed2 = (scaffold_order.groupby('group').size()+1) # number of connections
-
+        
         break_ids = space_needed[space_needed != space_needed2].index.values
         if len(break_ids):
             # Remove first scaffold_order entry to break circularity
@@ -1703,6 +1703,11 @@ def OrderByUnbrokenOriginalScaffolds(scaffold_result, contig_parts):
         # Inverse meta-scaffolds if that reduces the number of inversions for the single scaffolds
         scaffolds['scaf_size'] = scaffold_result.groupby('scaffold').size().values
         scaffolds = scaffolds.merge( scaffolds.groupby(['group','reverse'])['scaf_size'].sum().reset_index(name='size').pivot(index='group',columns='reverse',values='size').fillna(0).reset_index().rename(columns={False:'forward_count',True:'reverse_count'}), on='group', how='left')
+        
+        if 'forward_count' not in scaffolds.columns.values:
+            scaffolds['forward_count'] = 0
+        if 'reverse_count' not in scaffolds.columns.values:
+            scaffolds['reverse_count'] = 0
         
         scaffolds.loc[scaffolds['forward_count'] < scaffolds['reverse_count'], 'reverse'] = np.logical_not(scaffolds.loc[scaffolds['forward_count'] < scaffolds['reverse_count'], 'reverse'].values)
         scaffolds = scaffolds.merge( scaffolds.groupby('group').size().reset_index(name='group_size'), on='group', how='left')
