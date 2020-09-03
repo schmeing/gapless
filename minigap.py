@@ -1609,19 +1609,11 @@ def OrderByUnbrokenOriginalScaffolds(scaffold_result, contig_parts):
         scaffold_order['right_scaf'] = scaffold_result.loc[(scaffold_result['org_dist_left'] > 0), 'scaffold'].values
         scaffold_order['right_rev'] = scaffold_result.loc[(scaffold_result['org_dist_left'] > 0), 'reverse'].values
         
-        # All scaffolds that are already in correct order and are not changed due to other pairs can be removed from ordering
-        complex_scaffolds, scaf_counts = np.unique(np.concatenate( [scaffold_order['left_scaf'], scaffold_order['right_scaf']] ), return_counts=True)
-        complex_scaffolds[scaf_counts > 1]
-        complex_scaffolds = complex_scaffolds[scaf_counts > 1]
-        scaffold_order = scaffold_order[ np.isin(scaffold_order['left_scaf'], complex_scaffolds) | np.isin(scaffold_order['right_scaf'], complex_scaffolds) | # Scaffolds involved in multiple orderings
-                                         scaffold_order['left_rev'] | scaffold_order['right_rev'] | # Scaffolds need to be reversed or left/right has to be updated
-                                         (scaffold_order['left_scaf']+1 != scaffold_order['right_scaf']) ] # Scaffold ids need to be changed
-        
         # Break scaffolds that are connected to itself
         break_ids = scaffold_order.loc[scaffold_order['left_scaf'] == scaffold_order['right_scaf'], 'left_scaf'].values
         break_left = scaffold_result.loc[(np.isin(scaffold_result['scaffold'], break_ids)) & (scaffold_result['org_dist_left'] > 0), 'part_id'].values
         break_right = scaffold_result.loc[(np.isin(scaffold_result['scaffold'], break_ids)) & (scaffold_result['org_dist_right'] > 0), 'part_id'].values
-    
+        
         scaffold_result.iloc[break_left, scaffold_result.columns.get_loc('org_dist_left')] = -2
         scaffold_result.iloc[break_right, scaffold_result.columns.get_loc('org_dist_right')] = -2
         contig_parts.iloc[break_left, contig_parts.columns.get_loc('org_dist_left')] = -2
@@ -1630,36 +1622,25 @@ def OrderByUnbrokenOriginalScaffolds(scaffold_result, contig_parts):
         scaffold_order = scaffold_order[scaffold_order['left_scaf'] !=  scaffold_order['right_scaf']].copy()
         
         # Group all scaffolds by the lowest id that is involved with it directly and over other scaffolds
-        scaffold_order['min_scaf'] = np.minimum(scaffold_order['left_scaf'], scaffold_order['right_scaf'])
-        scaffold_order['max_scaf'] = np.maximum(scaffold_order['left_scaf'], scaffold_order['right_scaf'])
+        scaffold_order['group'] = np.minimum(scaffold_order['left_scaf'], scaffold_order['right_scaf'])
+        groups = pd.concat([scaffold_order[['left_scaf','group']].rename(columns={'left_scaf':'scaf'}), scaffold_order[['right_scaf','group']].rename(columns={'right_scaf':'scaf'})]).groupby('scaf')['group'].min()
+        new_groups = np.minimum(groups.loc[scaffold_order['left_scaf'].values].values,groups.loc[scaffold_order['right_scaf'].values].values)
+        while np.sum( scaffold_order['group'] != new_groups ):
+            groups.loc[scaffold_order['group'].values] = np.minimum(groups.loc[scaffold_order['group'].values], new_groups) # To improve convergence set lowest scaffold in group (whose id is the group id) to new group
+            groups.loc[scaffold_order['left_scaf'].values] = np.minimum(groups.loc[scaffold_order['left_scaf'].values], new_groups)
+            groups.loc[scaffold_order['right_scaf'].values] = np.minimum(groups.loc[scaffold_order['right_scaf'].values], new_groups)
+            scaffold_order['group'] = new_groups
+            new_groups = np.minimum(groups.loc[scaffold_order['left_scaf'].values].values,groups.loc[scaffold_order['right_scaf'].values].values)
 
-        # Merge by min-max connections (min-min is already a single group)
-        ungrouped = np.isin(scaffold_order['min_scaf'], scaffold_order['max_scaf'])
-        while np.sum(ungrouped):
-            lowest_scaf = {h:l for h,l in zip(scaffold_order['max_scaf'], scaffold_order['min_scaf'])}
-            scaffold_order.loc[ungrouped, 'min_scaf'] = itemgetter(*scaffold_order.loc[ungrouped, 'min_scaf'])(lowest_scaf)
-            ungrouped = np.isin(scaffold_order['min_scaf'], scaffold_order['max_scaf'])
-        
-        # Merge by max-max connections
-        group_merges = [1]
-        while len(group_merges):
-            group_merges = scaffold_order[['min_scaf','max_scaf']].groupby('max_scaf').agg(['min','max','size'])
-            group_merges.columns = group_merges.columns.droplevel()
-            group_merges = group_merges[group_merges['min'] != group_merges['max']].copy()
-            if len(group_merges):
-                new_groups = {o:n for o,n in zip(group_merges['max'],group_merges['min'])}
-                scaffold_order.loc[ np.isin(scaffold_order['min_scaf'],group_merges['max']), 'min_scaf'] = itemgetter(*scaffold_order.loc[np.isin(scaffold_order['min_scaf'],group_merges['max']), 'min_scaf'])(new_groups)
-    
-        
         # Find circularities (unique scaffolds in group are less than connections+1)
-        scaffolds = pd.DataFrame({'scaffold':np.unique(scaffold_result['scaffold'])})
-        space_needed = pd.concat([ scaffold_order[['left_scaf','min_scaf']].rename(columns={'left_scaf':'scaf'}), scaffold_order[['right_scaf','min_scaf']].rename(columns={'right_scaf':'scaf'}) ]).groupby(['min_scaf','scaf']).first().reset_index().groupby('min_scaf').size()
-        space_needed2 = (scaffold_order.groupby('min_scaf').size()+1)
-        
+        space_needed = np.unique(groups, return_counts=True) # unique scaffolds in group
+        space_needed = pd.Series(space_needed[1], index=pd.Series(space_needed[0], name='group'))
+        space_needed2 = (scaffold_order.groupby('group').size()+1) # number of connections
+
         break_ids = space_needed[space_needed != space_needed2].index.values
         if len(break_ids):
             # Remove first scaffold_order entry to break circularity
-            break_ids = scaffold_order.reset_index().loc[ np.isin(scaffold_order['min_scaf'], break_ids), 'min_scaf'].drop_duplicates().index.values
+            break_ids = scaffold_order.reset_index().loc[ np.isin(scaffold_order['group'], break_ids), 'group'].drop_duplicates().index.values
             
             # Get corresponding scaffolds
             break_left = scaffold_order.iloc[ break_ids, scaffold_order.columns.get_loc('right_scaf') ].values
@@ -1676,23 +1657,14 @@ def OrderByUnbrokenOriginalScaffolds(scaffold_result, contig_parts):
             scaffold_result.iloc[break_right, scaffold_result.columns.get_loc('org_dist_right')] = -2
             contig_parts.iloc[break_left, contig_parts.columns.get_loc('org_dist_left')] = -2
             contig_parts.iloc[break_right, contig_parts.columns.get_loc('org_dist_right')] = -2
-    
-        # Shift scaffold ids so that groups are together
-        scaffolds['shift'] = 0
-        scaffolds.iloc[space_needed.index+1, scaffolds.columns.get_loc('shift')] += space_needed.values
-        scaffolds.iloc[np.unique(np.concatenate( [scaffold_order['left_scaf'], scaffold_order['right_scaf']] ))+1, scaffolds.columns.get_loc('shift')] -= 1
-        scaffolds['shift'] = scaffolds['shift'].cumsum()
-        scaffolds['new_scaf'] = scaffolds['scaffold'] + scaffolds['shift']
-        new_scafs = {o:n for o,n in zip(scaffolds['scaffold'],scaffolds['new_scaf'])}
-        scaffold_order['min_scaf'] = itemgetter(*scaffold_order['min_scaf'])(new_scafs)
         
         # Get left and right scaffold original connections
+        scaffolds = pd.DataFrame({'scaffold':np.unique(scaffold_result['scaffold'])})        
         scaffolds['left_con'] = -1
         scaffolds['left_con_side'] = ''
         scaffolds['right_con'] = -1
         scaffolds['right_con_side'] = ''
-        scaffolds['group_min_scaf'] = scaffolds['new_scaf']
-    
+        
         scaffolds.iloc[ scaffold_order.loc[scaffold_order['right_rev']==False, 'right_scaf'].values, scaffolds.columns.get_loc('left_con') ] = scaffold_order.loc[scaffold_order['right_rev']==False, 'left_scaf'].values
         scaffolds.iloc[ scaffold_order.loc[scaffold_order['right_rev'], 'right_scaf'].values, scaffolds.columns.get_loc('right_con') ] = scaffold_order.loc[scaffold_order['right_rev'], 'left_scaf'].values
         scaffolds.iloc[ scaffold_order.loc[scaffold_order['left_rev']==False, 'left_scaf'].values, scaffolds.columns.get_loc('right_con') ] = scaffold_order.loc[scaffold_order['left_rev']==False, 'right_scaf'].values
@@ -1700,15 +1672,17 @@ def OrderByUnbrokenOriginalScaffolds(scaffold_result, contig_parts):
         
         scaffolds.loc[ scaffolds['left_con'] >= 0, 'left_con_side'] = np.where(scaffolds.loc[ scaffolds['left_con'] >= 0, 'scaffold'].values == scaffolds.iloc[scaffolds.loc[ scaffolds['left_con'] >= 0, 'left_con'].values, scaffolds.columns.get_loc('left_con')].values, 'l', 'r')
         scaffolds.loc[ scaffolds['right_con'] >= 0, 'right_con_side'] = np.where(scaffolds.loc[ scaffolds['right_con'] >= 0, 'scaffold'].values == scaffolds.iloc[scaffolds.loc[ scaffolds['right_con'] >= 0, 'right_con'].values, scaffolds.columns.get_loc('right_con')].values, 'r', 'l')
+
+        # Add the group info to scaffolds
+        scaffolds['group'] = scaffolds['scaffold']
+        scaffolds.iloc[ scaffold_order['right_scaf'].values, scaffolds.columns.get_loc('group') ] = scaffold_order['group'].values
+        scaffolds.iloc[ scaffold_order['left_scaf'].values, scaffolds.columns.get_loc('group') ] = scaffold_order['group'].values
         
-        scaffolds.iloc[ scaffold_order['right_scaf'].values, scaffolds.columns.get_loc('group_min_scaf') ] = scaffold_order['min_scaf'].values
-        scaffolds.iloc[ scaffold_order['left_scaf'].values, scaffolds.columns.get_loc('group_min_scaf') ] = scaffold_order['min_scaf'].values
-        
-        # Assign position and reverse starting from a arbitrary scaffold with only one connection in the meta-scaffold
+        # Assign position and reverse starting from an arbitrary scaffold with only one connection in the meta-scaffold
         scaffolds['pos'] = -1
         scaffolds['reverse'] = False
         
-        scaffolds.iloc[ scaffolds.loc[(scaffolds['left_con'] < 0) | (scaffolds['right_con'] < 0), ['scaffold','group_min_scaf']].groupby('group_min_scaf').first().values, scaffolds.columns.get_loc('pos')] = 0
+        scaffolds.iloc[ scaffolds.loc[(scaffolds['left_con'] < 0) | (scaffolds['right_con'] < 0), ['scaffold','group']].groupby('group').first().values, scaffolds.columns.get_loc('pos')] = 0
         scaffolds.loc[scaffolds['pos'] == 0, 'reverse'] = scaffolds.loc[scaffolds['pos'] == 0, 'left_con'].values > 0
         
         cur_scaffolds = scaffolds.loc[(scaffolds['pos'] == 0) & ((scaffolds['left_con'] >= 0) | (scaffolds['right_con'] >= 0))]
@@ -1722,19 +1696,19 @@ def OrderByUnbrokenOriginalScaffolds(scaffold_result, contig_parts):
         
         # Inverse meta-scaffolds if that reduces the number of inversions for the single scaffolds
         scaffolds['scaf_size'] = scaffold_result.groupby('scaffold').size().values
-        scaffolds = scaffolds.merge( scaffolds.groupby(['group_min_scaf','reverse'])['scaf_size'].sum().reset_index(name='size').pivot(index='group_min_scaf',columns='reverse',values='size').fillna(0).reset_index().rename(columns={False:'forward_count',True:'reverse_count'}), on='group_min_scaf', how='left')
+        scaffolds = scaffolds.merge( scaffolds.groupby(['group','reverse'])['scaf_size'].sum().reset_index(name='size').pivot(index='group',columns='reverse',values='size').fillna(0).reset_index().rename(columns={False:'forward_count',True:'reverse_count'}), on='group', how='left')
         
         scaffolds.loc[scaffolds['forward_count'] < scaffolds['reverse_count'], 'reverse'] = np.logical_not(scaffolds.loc[scaffolds['forward_count'] < scaffolds['reverse_count'], 'reverse'].values)
-        scaffolds = scaffolds.merge( scaffolds.groupby('group_min_scaf')['scaf_size'].size().reset_index(name='group_size'), on='group_min_scaf', how='left')
+        scaffolds = scaffolds.merge( scaffolds.groupby('group').size().reset_index(name='group_size'), on='group', how='left')
         scaffolds.loc[scaffolds['forward_count'] < scaffolds['reverse_count'], 'pos'] = scaffolds.loc[scaffolds['forward_count'] < scaffolds['reverse_count'], 'group_size'].values - scaffolds.loc[scaffolds['forward_count'] < scaffolds['reverse_count'], 'pos'].values - 1
         
         # Apply changes
-        scaffolds['new_scaf'] = scaffolds['group_min_scaf'] + scaffolds['pos']
-        
         rev_scafs = np.isin(scaffold_result['scaffold'], scaffolds.loc[scaffolds['reverse'], 'scaffold'].values)
         scaffold_result.loc[rev_scafs, 'reverse'] = np.logical_not(scaffold_result.loc[rev_scafs, 'reverse'])
         scaffold_result.loc[rev_scafs, 'pos'] = scaffold_result.loc[rev_scafs, 'scaf_size'] - scaffold_result.loc[rev_scafs, 'pos'] - 1
         
+        scaffolds.sort_values(['group','pos'], inplace=True)
+        scaffolds['new_scaf'] = range(len(scaffolds))
         new_scafs = {o:n for o,n in zip(scaffolds['scaffold'],scaffolds['new_scaf'])}
         scaffold_result['scaffold'] = itemgetter(*scaffold_result['scaffold'])(new_scafs)
         
@@ -1765,16 +1739,16 @@ def CreateNewScaffolds(contig_parts):
         scaffolds = GetScaffolds(scaffold_result)
         scaffolds, scaffold_result, contig_parts = HandleCircularScaffolds(scaffolds, scaffold_result, contig_parts)
         scaffold_result = HandleRightRightScaffoldConnections(scaffold_result, scaffolds)
-    
+        
         # Handle left-right scaffold connections
         scaffolds = GetScaffolds(scaffold_result)
         scaffolds, scaffold_result, contig_parts = HandleCircularScaffolds(scaffolds, scaffold_result, contig_parts)
         scaffold_result, contig_parts = HandleLeftRightScaffoldConnections(scaffold_result, contig_parts, scaffolds)
-    
+        
         # Handle left-left scaffold connections (We don't need to handle circular scaffolds here, because that is done already in HandleLeftRightScaffoldConnections as it is needed there due to a loop)
         scaffolds = GetScaffolds(scaffold_result)
         scaffold_result = HandleLeftLeftScaffoldConnections(scaffold_result, scaffolds)
-    
+        
         num_scaffolds_old = num_scaffolds
         num_scaffolds = max(scaffold_result['scaffold'])+1
 
@@ -2102,7 +2076,7 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     
     print( str(timedelta(seconds=clock())), "Account for left-over adapters")
     mappings = BreakReadsAtAdapters(mappings, subread_alignment_precision, keep_all_subreads)
-    
+
     print( str(timedelta(seconds=clock())), "Search for possible break points")
     if "blind" == org_scaffold_trust:
         # Do not break contigs
