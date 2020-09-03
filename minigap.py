@@ -2312,56 +2312,65 @@ def ExtendScaffolds(scaffold_table, extensions, mappings, min_num_reads, max_map
         extending_reads.loc[np.isnan(extending_reads['valid_ext']),'valid_ext'] = extending_reads.loc[np.isnan(extending_reads['valid_ext']),'q_agree'].values
         extending_reads = extending_reads[extending_reads['valid_ext'] > 0.0].copy()
         
-        # Change structure of extending_reads to the same as scaffold_table
-        # Start by adding read information
-        ext_mappings = mappings.iloc[extending_reads['q_index'].values]
-        extending_reads['name'] = ext_mappings['read_name'].values
-        extending_reads['start'] = np.where( np.logical_xor('+' == ext_mappings['strand'], 'l' == ext_mappings['side']), ext_mappings['read_to'].values, ext_mappings['read_from'].values-extending_reads['valid_ext'].values.astype(int) )
-        extending_reads['end'] = np.where( np.logical_xor('+' == ext_mappings['strand'], 'l' == ext_mappings['side']), ext_mappings['read_to'].values+extending_reads['valid_ext'].values.astype(int), ext_mappings['read_from'].values )
-        extending_reads['reverse'] = ('-' == ext_mappings['strand'].values)
+        if len(extending_reads):
+            # Change structure of extending_reads to the same as scaffold_table
+            # Start by adding read information
+            ext_mappings = mappings.iloc[extending_reads['q_index'].values]
+            extending_reads['name'] = ext_mappings['read_name'].values
+            extending_reads['start'] = np.where( np.logical_xor('+' == ext_mappings['strand'], 'l' == ext_mappings['side']), ext_mappings['read_to'].values, ext_mappings['read_from'].values-extending_reads['valid_ext'].values.astype(int) )
+            extending_reads['end'] = np.where( np.logical_xor('+' == ext_mappings['strand'], 'l' == ext_mappings['side']), ext_mappings['read_to'].values+extending_reads['valid_ext'].values.astype(int), ext_mappings['read_from'].values )
+            extending_reads['reverse'] = ('-' == ext_mappings['strand'].values)
+            
+            # Cut contigs where it is required by the extensions
+            scaffold_table['side'] = np.where(0 == scaffold_table['pos'], 'l', '')
+            scaffold_table = scaffold_table.merge(ext_mappings[['scaffold','side','dist_start']].rename(columns={'dist_start':'left_start'}), on=['scaffold','side'], how='left')
+            scaffold_table['side'] = np.where(scaffold_table['scaf_size'] == scaffold_table['pos']+1, 'r', '')
+            scaffold_table = scaffold_table.merge(ext_mappings[['scaffold','side','dist_start']].rename(columns={'dist_start':'right_start'}), on=['scaffold','side'], how='left')
+            scaffold_table.loc[(False == scaffold_table['reverse']) & (False == np.isnan(scaffold_table['left_start'])), 'start'] += scaffold_table.loc[(False == scaffold_table['reverse']) & (False == np.isnan(scaffold_table['left_start'])), 'left_start']
+            scaffold_table.loc[scaffold_table['reverse'] & (False == np.isnan(scaffold_table['left_start'])), 'end'] -= scaffold_table.loc[scaffold_table['reverse'] & (False == np.isnan(scaffold_table['left_start'])), 'left_start']
+            scaffold_table.loc[(False == scaffold_table['reverse']) & (False == np.isnan(scaffold_table['right_start'])), 'end'] -= scaffold_table.loc[(False == scaffold_table['reverse']) & (False == np.isnan(scaffold_table['right_start'])), 'right_start']
+            scaffold_table.loc[scaffold_table['reverse'] & (False == np.isnan(scaffold_table['right_start'])), 'start'] += scaffold_table.loc[scaffold_table['reverse'] & (False == np.isnan(scaffold_table['right_start'])), 'right_start']
+            scaffold_table['start'] = scaffold_table['start'].astype(int)
+            scaffold_table['end'] = scaffold_table['end'].astype(int)
+            
+            # Update scaffold information in scaffold_table and add it to extending_reads
+            ext_count = scaffold_table.groupby(['scaffold'], sort=False).agg({'left_start':['size','count'], 'right_start':['count']})
+            scaffold_table['scaf_size'] += np.repeat(ext_count['left_start','count'].values + ext_count['right_start','count'].values, ext_count['left_start','size'])
+            scaffold_table['pos'] += np.repeat(ext_count['left_start','count'].values, ext_count['left_start','size'])
+            
+            extending_reads = extending_reads.merge(scaffold_table[['scaffold','scaf_size']].groupby(['scaffold'], sort=False).first(), on=['scaffold'], how='left')
+            extending_reads['pos'] = np.where(extending_reads['side'] == 'l', 0, extending_reads['scaf_size']-1)
+            
+            extending_reads = extending_reads.merge(scaffold_table[['scaffold','side','org_dist_right']], on=['scaffold','side'], how='left')
+            extending_reads['org_dist_right'] = extending_reads['org_dist_right'].fillna(-1).astype(int)
+            scaffold_table['side'] = np.where(1 == scaffold_table['pos'], 'l', '') # Position of left contig with extension is now 1, because we already shifted (For non-extended scaffold that is not the left-most part, but we don't care, because those scaffolds are not in extending_reads)
+            extending_reads = extending_reads.merge(scaffold_table[['scaffold','side','org_dist_left']], on=['scaffold','side'], how='left')
+            extending_reads['org_dist_left'] = extending_reads['org_dist_left'].fillna(-1).astype(int)
+            
+            scaffold_table.loc[False == np.isnan(scaffold_table['left_start']), 'org_dist_left'] = -1
+            scaffold_table.loc[False == np.isnan(scaffold_table['right_start']), 'org_dist_right'] = -1
+            scaffold_table.drop(columns=['side','left_start','right_start'], inplace=True)
         
-        # Cut contigs where it is required by the extensions
-        scaffold_table['side'] = np.where(0 == scaffold_table['pos'], 'l', '')
-        scaffold_table = scaffold_table.merge(ext_mappings[['scaffold','side','dist_start']].rename(columns={'dist_start':'left_start'}), on=['scaffold','side'], how='left')
-        scaffold_table['side'] = np.where(scaffold_table['scaf_size'] == scaffold_table['pos']+1, 'r', '')
-        scaffold_table = scaffold_table.merge(ext_mappings[['scaffold','side','dist_start']].rename(columns={'dist_start':'right_start'}), on=['scaffold','side'], how='left')
-        scaffold_table.loc[(False == scaffold_table['reverse']) & (False == np.isnan(scaffold_table['left_start'])), 'start'] += scaffold_table.loc[(False == scaffold_table['reverse']) & (False == np.isnan(scaffold_table['left_start'])), 'left_start']
-        scaffold_table.loc[scaffold_table['reverse'] & (False == np.isnan(scaffold_table['left_start'])), 'end'] -= scaffold_table.loc[scaffold_table['reverse'] & (False == np.isnan(scaffold_table['left_start'])), 'left_start']
-        scaffold_table.loc[(False == scaffold_table['reverse']) & (False == np.isnan(scaffold_table['right_start'])), 'end'] -= scaffold_table.loc[(False == scaffold_table['reverse']) & (False == np.isnan(scaffold_table['right_start'])), 'right_start']
-        scaffold_table.loc[scaffold_table['reverse'] & (False == np.isnan(scaffold_table['right_start'])), 'start'] += scaffold_table.loc[scaffold_table['reverse'] & (False == np.isnan(scaffold_table['right_start'])), 'right_start']
-        scaffold_table['start'] = scaffold_table['start'].astype(int)
-        scaffold_table['end'] = scaffold_table['end'].astype(int)
+            # Add extending_reads to scaffold_table and sort again
+            extending_reads['type'] = 'read'
+            scaffold_table = scaffold_table.append( extending_reads[['scaffold','pos','scaf_size','type','name','start','end','reverse','org_dist_left','org_dist_right']] )
+            scaffold_table.sort_values(['scaffold','pos'], inplace=True)
         
-        # Update scaffold information in scaffold_table and add it to extending_reads
-        ext_count = scaffold_table.groupby(['scaffold'], sort=False).agg({'left_start':['size','count'], 'right_start':['count']})
-        scaffold_table['scaf_size'] += np.repeat(ext_count['left_start','count'].values + ext_count['right_start','count'].values, ext_count['left_start','size'])
-        scaffold_table['pos'] += np.repeat(ext_count['left_start','count'].values, ext_count['left_start','size'])
-        
-        extending_reads = extending_reads.merge(scaffold_table[['scaffold','scaf_size']].groupby(['scaffold'], sort=False).first(), on=['scaffold'], how='left')
-        extending_reads['pos'] = np.where(extending_reads['side'] == 'l', 0, extending_reads['scaf_size']-1)
-        
-        extending_reads = extending_reads.merge(scaffold_table[['scaffold','side','org_dist_right']], on=['scaffold','side'], how='left')
-        extending_reads['org_dist_right'] = extending_reads['org_dist_right'].fillna(-1).astype(int)
-        scaffold_table['side'] = np.where(1 == scaffold_table['pos'], 'l', '') # Position of left contig with extension is now 1, because we already shifted (For non-extended scaffold that is not the left-most part, but we don't care, because those scaffolds are not in extending_reads)
-        extending_reads = extending_reads.merge(scaffold_table[['scaffold','side','org_dist_left']], on=['scaffold','side'], how='left')
-        extending_reads['org_dist_left'] = extending_reads['org_dist_left'].fillna(-1).astype(int)
-        
-        scaffold_table.loc[False == np.isnan(scaffold_table['left_start']), 'org_dist_left'] = -1
-        scaffold_table.loc[False == np.isnan(scaffold_table['right_start']), 'org_dist_right'] = -1
-        scaffold_table.drop(columns=['side','left_start','right_start'], inplace=True)
-    
-        # Add extending_reads to scaffold_table and sort again
-        extending_reads['type'] = 'read'
-        scaffold_table = scaffold_table.append( extending_reads[['scaffold','pos','scaf_size','type','name','start','end','reverse','org_dist_left','org_dist_right']] )
-        scaffold_table.sort_values(['scaffold','pos'], inplace=True)
-    
-        extension_info = {}
-        extension_info['count'] = len(extending_reads)
-        extension_info['left'] = len(extending_reads[extending_reads['side'] == 'l'])
-        extension_info['right'] = len(extending_reads[extending_reads['side'] == 'r'])
-        extension_info['mean'] = int(round(np.mean(extending_reads['valid_ext'])))
-        extension_info['min'] = int(np.min(extending_reads['valid_ext']))
-        extension_info['max'] = int(np.max(extending_reads['valid_ext']))
+            extension_info = {}
+            extension_info['count'] = len(extending_reads)
+            extension_info['left'] = len(extending_reads[extending_reads['side'] == 'l'])
+            extension_info['right'] = len(extending_reads[extending_reads['side'] == 'r'])
+            extension_info['mean'] = int(round(np.mean(extending_reads['valid_ext'])))
+            extension_info['min'] = int(np.min(extending_reads['valid_ext']))
+            extension_info['max'] = int(np.max(extending_reads['valid_ext']))
+        else:
+            extension_info = {}
+            extension_info['count'] = 0
+            extension_info['left'] = 0
+            extension_info['right'] = 0
+            extension_info['mean'] = 0
+            extension_info['min'] = 0
+            extension_info['max'] = 0
     else:
         extension_info = {}
         extension_info['count'] = 0
