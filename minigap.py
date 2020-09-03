@@ -105,13 +105,19 @@ def ReadContigs(assembly_file):
             if 2 == len(chunk):
                 coords = chunk[1].split('-')
                 if 2 == len(coords):
-                    if 0 < contig_end and chunk[0] == last_scaffold:
-                        distances_next.append(int(coords[0]) - contig_end - 1)
-                    elif 0 <= contig_end:
-                        distances_next.append(-1)
-
-                    contig_end = int(coords[1])
-                    last_scaffold = chunk[0]
+                    try:
+                        if 0 < contig_end and chunk[0] == last_scaffold:
+                            distances_next.append(int(coords[0]) - contig_end - 1)
+                        elif 0 <= contig_end:
+                            distances_next.append(-1)
+    
+                        contig_end = int(coords[1])
+                        last_scaffold = chunk[0]
+                    except ValueError:
+                        print('Cannot interpret "_chunk{}-{}" as a position encoding in: '.format(coords[0], coords[1]), record.description)
+                        if 0 <= contig_end:
+                            distances_next.append(-1)
+                        contig_end = 0
                 else:
                     print("Position encoding in contig identifier wrong:", record.description)
                     if 0 <= contig_end:
@@ -2408,19 +2414,11 @@ def MiniGapFinish(assembly_file, read_file, read_format, scaffold_file, output_f
     print( str(timedelta(seconds=clock())), "Loading scaffold info from: {}".format(scaffold_file))
     scaffold_table = pd.read_csv(scaffold_file)
     
-    # Add _partX to the contig names if they appear multiple times
-    scaffold_table.sort_values(['type','name','start','end'], inplace=True)
-    times_used = scaffold_table.groupby(['type','name'], sort=False).size().reset_index(name='size')
-    scaffold_table['times_used'] = np.repeat(times_used['size'].values, times_used['size'].values)
-    scaffold_table['part'] = 1
-    scaffold_table['part'] = scaffold_table.groupby(['type','name'])['part'].cumsum()
-    scaffold_table['outname'] = np.where('contig' != scaffold_table['type'], "", np.where(1 == scaffold_table['times_used'], scaffold_table['name'], scaffold_table['name']+"_part"+scaffold_table['part'].astype(str)))
-    scaffold_table.sort_values(['scaffold','pos'], inplace=True)
-    
     print( str(timedelta(seconds=clock())), "Writing modified assembly to: {}".format(output_file))
     with gzip.open(output_file, 'wb') if 'gz' == output_file.rsplit('.',1)[-1] else open(output_file, 'w') as fout:
         cur_scaffold = 0
-        name = []
+        name = "miniscaffold1"
+        out_count = 2
         seq = []
         for row in scaffold_table.itertuples(index=False):
             # Check if scaffold changed
@@ -2428,22 +2426,21 @@ def MiniGapFinish(assembly_file, read_file, read_format, scaffold_file, output_f
                 if cur_scaffold < row.scaffold:
                     # Write scaffold to disc
                     fout.write('>')
-                    fout.write('_'.join(name))
+                    fout.write(name)
                     fout.write('\n')
                     fout.write(''.join(seq))
                     fout.write('\n')
 
                     # Start new scaffold
                     cur_scaffold = row.scaffold
-                    name = []
+                    name = "miniscaffold{}".format(out_count)
+                    out_count += 1
                     seq = []
                 else:
                     print("Encountered scaffold {} while handling scaffold {}. The loaded scaffold table is invalid.".format(row.scaffold, cur_scaffold) )
             
             # Add sequences to scaffold
             if 'contig' == row.type:
-                name.append(row.outname)
-                
                 if row.reverse:
                     seq.append(str(contigs[row.name][row.start:row.end].reverse_complement()))
                 else:
@@ -2461,7 +2458,7 @@ def MiniGapFinish(assembly_file, read_file, read_format, scaffold_file, output_f
             
         # Write out last scaffold
         fout.write('>')
-        fout.write('_'.join(name))
+        fout.write(name)
         fout.write('\n')
         fout.write(''.join(seq))
         fout.write('\n')
