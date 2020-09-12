@@ -141,6 +141,53 @@ def ReadContigs(assembly_file):
 
     return contigs, contig_ids
 
+def calculateN50(len_values):
+    # len_values must be sorted from lowest to highest
+    len_total = np.sum(len_values)
+    len_sum = 0
+    len_N50 = 0 # Use as index first
+    while len_sum < len_total/2:
+        len_N50 -= 1
+        len_sum += len_values[len_N50]
+    len_N50 = len_values[len_N50]
+
+    return len_N50, len_total
+
+def GetInputInfo(result_info, contigs):
+    # Calculate lengths
+    con_len = contigs['length'].values
+
+    scaf_len = contigs[['org_dist_left']].copy()
+    scaf_len['length'] = con_len
+    scaf_len.loc[scaf_len['org_dist_left'] >= 0, 'length'] += scaf_len.loc[scaf_len['org_dist_left'] >= 0, 'org_dist_left']
+    scaf_len['scaffold'] = (scaf_len['org_dist_left'] == -1).cumsum()
+    scaf_len = scaf_len.groupby('scaffold', sort=False)['length'].sum().values
+
+    # Calculate N50
+    con_len.sort()
+    con_N50, con_total = calculateN50(con_len)
+
+    scaf_len.sort()
+    scaf_N50, scaf_total = calculateN50(scaf_len)
+
+    # Store output stats
+    result_info['input'] = {}
+    result_info['input']['contigs'] = {}
+    result_info['input']['contigs']['num'] = len(con_len)
+    result_info['input']['contigs']['total'] = con_total
+    result_info['input']['contigs']['min'] = con_len[0]
+    result_info['input']['contigs']['max'] = con_len[-1]
+    result_info['input']['contigs']['N50'] = con_N50
+    
+    result_info['input']['scaffolds'] = {}
+    result_info['input']['scaffolds']['num'] = len(scaf_len)
+    result_info['input']['scaffolds']['total'] = scaf_total
+    result_info['input']['scaffolds']['min'] = scaf_len[0]
+    result_info['input']['scaffolds']['max'] = scaf_len[-1]
+    result_info['input']['scaffolds']['N50'] = scaf_N50
+
+    return result_info
+
 def ReadPaf(file_name):
     return pd.read_csv(file_name, sep='\t', header=None, usecols=range(12), names=['q_name','q_len','q_start','q_end','strand','t_name','t_len','t_start','t_end','matches','alignment_length','mapq'], dtype={'q_len':np.int32, 'q_start':np.int32, 'q_end':np.int32, 't_len':np.int32, 't_start':np.int32, 't_end':np.int32, 'matches':np.int32, 'alignment_length':np.int32, 'mapq':np.int16})
 
@@ -407,39 +454,7 @@ def RemoveUnmappedContigs(contigs, mappings, remove_zero_hit_contigs):
     if remove_zero_hit_contigs:
         contigs.loc[0==mapped_reads, 'remove'] = True
 
-    org_contig_info = {}
-    org_contig_info['num'] = {}
-    org_contig_info['num']['total'] = len(contigs)
-    org_contig_info['num']['removed_total'] = np.sum(contigs['remove'])
-    org_contig_info['num']['removed_no_mapping'] = np.sum(0==mapped_reads)
-    org_contig_info['num']['removed_duplicates'] = org_contig_info['num']['removed_total'] - org_contig_info['num']['removed_no_mapping']
-    org_contig_info['num']['masked'] = np.sum(np.logical_not(contigs['remove']) & (contigs['repeat_mask_right'] == 0))
-    org_contig_info['len'] = {}
-    org_contig_info['len']['total'] = np.sum(contigs['length'])
-    org_contig_info['len']['removed_total'] = np.sum(contigs.loc[contigs['remove'], 'length'])
-    org_contig_info['len']['removed_no_mapping'] = np.sum(contigs.loc[0==mapped_reads, 'length'])
-    org_contig_info['len']['removed_duplicates'] = org_contig_info['len']['removed_total'] - org_contig_info['len']['removed_no_mapping']
-    org_contig_info['len']['masked'] = np.sum(contigs.loc[np.logical_not(contigs['remove']) & (contigs['repeat_mask_right'] == 0), 'length'])
-    org_contig_info['max'] = {}
-    org_contig_info['max']['total'] = max(contigs['length'])
-    if 0 < org_contig_info['num']['removed_total']:
-        org_contig_info['max']['removed_total'] = max(contigs.loc[contigs['remove'], 'length'])
-    else:
-        org_contig_info['max']['removed_total'] = 0
-    if 0 < org_contig_info['num']['removed_no_mapping']:
-        org_contig_info['max']['removed_no_mapping'] = max(contigs.loc[0==mapped_reads, 'length'])
-    else:
-        org_contig_info['max']['removed_no_mapping'] = 0
-    if 0 < org_contig_info['num']['removed_duplicates']:
-        org_contig_info['max']['removed_duplicates'] = max(contigs.loc[contigs['remove'] & (0<mapped_reads), 'length'])
-    else:
-        org_contig_info['max']['removed_duplicates'] = 0
-    if 0 < org_contig_info['num']['masked']:
-        org_contig_info['max']['masked'] = max(contigs.loc[np.logical_not(contigs['remove']) & (contigs['repeat_mask_right'] == 0), 'length'])
-    else:
-        org_contig_info['max']['masked'] = 0
-
-    return contigs, org_contig_info
+    return contigs
 
 def RemoveUnanchoredMappings(mappings, contigs, center_repeats, min_mapping_length, pdf, max_dist_contig_end):
     # Filter reads only mapping to repeat ends
@@ -515,6 +530,15 @@ def BreakReadsAtAdapters(mappings, adapter_signal_max_dist, keep_all_subreads):
 
     return mappings
 
+def CallAllBreaksSpurious(mappings, contigs, max_dist_contig_end, min_length_contig_break, min_extension, pdf):
+    left_breaks, right_breaks = GetBrokenMappings(mappings, max_dist_contig_end, min_length_contig_break, pdf)
+
+    break_groups = []
+    spurious_break_indexes = np.unique(np.concatenate([left_breaks.index, right_breaks.index]))
+    non_informative_mappings = GetNonInformativeMappings(mappings, contigs, min_extension, break_groups, left_breaks, right_breaks)
+
+    return break_groups, spurious_break_indexes, non_informative_mappings
+
 def GetBrokenMappings(mappings, max_dist_contig_end, min_length_contig_break, pdf):
     # Find reads that have a break point and map on the left/right side(contig orientation) of it
     left_breaks = mappings[ (mappings['t_len']-mappings['t_end'] > max_dist_contig_end) &
@@ -560,15 +584,6 @@ def GetNonInformativeMappings(mappings, contigs, min_extension, break_groups, le
         
     return non_informative_mappings
 
-def CallAllBreaksSpurious(mappings, contigs, max_dist_contig_end, min_length_contig_break, min_extension, pdf):
-    left_breaks, right_breaks = GetBrokenMappings(mappings, max_dist_contig_end, min_length_contig_break, pdf)
-
-    break_groups = []
-    spurious_break_indexes = np.unique(np.concatenate([left_breaks.index, right_breaks.index]))
-    non_informative_mappings = GetNonInformativeMappings(mappings, contigs, min_extension, break_groups, left_breaks, right_breaks)
-
-    return break_groups, spurious_break_indexes, non_informative_mappings
-
 def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, min_length_contig_break, max_break_point_distance, min_num_reads, min_factor_alternatives, min_extension, merge_block_length, org_scaffold_trust, pdf):
     if pdf:
         loose_reads_ends = mappings[(mappings['t_start'] > max_dist_contig_end) & np.where('+' == mappings['strand'], -1 == mappings['prev_con'], -1 == mappings['next_con'])]
@@ -581,18 +596,20 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
             PlotHist(pdf, "Loose end length", "# Ends", loose_reads_ends_length, threshold=min_length_contig_break, logx=True)
 
     left_breaks, right_breaks = GetBrokenMappings(mappings, max_dist_contig_end, min_length_contig_break, pdf)
+    left_connected = np.where('+' == left_breaks['strand'], 0 <= left_breaks['next_con'], 0 <= left_breaks['prev_con'])
+    right_connected = np.where('+' == right_breaks['strand'], 0 <= right_breaks['prev_con'], 0 <= right_breaks['next_con'])
     
     break_points = pd.DataFrame({ 'contig_id': np.concatenate([ left_breaks['t_id'], right_breaks['t_id'] ]),
                                   'side': np.concatenate([ np.full(len(left_breaks), 'l'), np.full(len(right_breaks), 'r') ]),
                                   'position': np.concatenate([ left_breaks['t_end'], right_breaks['t_start'] ]),
                                   'mapq': np.concatenate([ left_breaks['mapq'], right_breaks['mapq'] ]),
-                                  'map_len': np.concatenate([ left_breaks['t_end']-left_breaks['t_start'], right_breaks['t_end']-right_breaks['t_start'] ])})
+                                  'map_len': np.concatenate([ left_breaks['t_end']-left_breaks['t_start'], right_breaks['t_end']-right_breaks['t_start'] ]),
+                                  'connected': np.concatenate([ left_connected, right_connected ]) })
     break_points = break_points[ break_points['map_len'] >= min_mapping_length+max_break_point_distance ].copy() # require half the mapping length for breaks as we will later require for continously mapping reads that veto breaks, since breaking reads only map on one side
     break_points.drop(columns=['map_len'], inplace=True)
     break_points.sort_values(['contig_id','position'], inplace=True)
     if min_num_reads > 1:
         break_points = break_points[ ((break_points['contig_id'] == break_points['contig_id'].shift(-1, fill_value=-1)) & (break_points['position']+max_break_point_distance >= break_points['position'].shift(-1, fill_value=-1))) | ((break_points['contig_id'] == break_points['contig_id'].shift(1, fill_value=-1)) & (break_points['position']-max_break_point_distance <= break_points['position'].shift(1, fill_value=-1))) ].copy() # require at least one supporting break within +- max_break_point_distance
-
 
     if pdf:
         break_point_dist = (break_points['position'] - break_points['position'].shift(1, fill_value=0))[break_points['contig_id'] == break_points['contig_id'].shift(1, fill_value=-1)]
@@ -605,13 +622,14 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
         # Check how many reads support a break_point with breaks within +- max_break_point_distance
         break_points['break_id'] = range(len(break_points))
         break_points['group'] = ((break_points['contig_id'] != break_points['contig_id'].shift(1, fill_value=-1)) | (break_points['position']-max_break_point_distance > break_points['position'].shift(1, fill_value=0))).cumsum() # Group reads that potentially support each other
-        break_points = break_points.merge( break_points[['contig_id','group','position','mapq']].rename(columns={'position':'supp_pos', 'mapq':'supp_mapq'}), on=['contig_id','group'], how='outer') # Create one entry for every potentially supporting read
+        break_points = break_points.merge( break_points[['contig_id','group','position','mapq', 'connected']].rename(columns={'position':'supp_pos', 'mapq':'supp_mapq', 'connected':'supp_con'}), on=['contig_id','group'], how='outer') # Create one entry for every potentially supporting read
         break_points = break_points[ (break_points['position']+max_break_point_distance >= break_points['supp_pos']) & (break_points['position']-max_break_point_distance <= break_points['supp_pos']) ].copy() # Filter reads that do not support
         break_points.drop(columns=['group','supp_pos','mapq'], inplace=True)
         break_points.rename(columns={'supp_mapq':'mapq'}, inplace=True)
         break_points.sort_values(['break_id','mapq'], ascending=[True,False], inplace=True)
-        break_points = break_points.groupby(['break_id','contig_id','position','side','mapq'], sort=False).size().reset_index(name='support') # Count supporting reads by mapping quality
+        break_points = break_points.groupby(['break_id','contig_id','position','side','mapq','connected'], sort=False)['supp_con'].agg(['sum','size']).reset_index().rename(columns={'sum':'con_supp', 'size':'support'}) # Count supporting reads by mapping quality
         break_points['support'] = break_points.groupby(['break_id'])['support'].cumsum() # Add support from higher mapping qualities to lower mapping qualities
+        break_points['con_supp'] = break_points.groupby(['break_id'])['con_supp'].cumsum()
         
         # Require a support of at least min_num_reads at some mapping quality level
         max_support = break_points.groupby(['break_id'], sort=False)['support'].agg(['max','size'])
@@ -626,12 +644,18 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
         tmp_mappings = tmp_mappings.loc[ np.repeat( tmp_mappings.index.values, tmp_mappings['t_end']//merge_block_length - tmp_mappings['t_start']//merge_block_length + 1 ) ].copy()
         tmp_mappings['merge_block'] = tmp_mappings.reset_index().groupby(['index']).cumcount().values + tmp_mappings['t_start']//merge_block_length
         break_points = break_points.merge( tmp_mappings.rename(columns={'t_id':'contig_id', 'mapq':'veto_mapq'}), on=['contig_id','merge_block'], how='left') # Create one entry for every mapping that potentially overlaps the break
+        break_points.loc[np.isnan(break_points['veto_mapq']), 't_start'] = 0
+        break_points.loc[np.isnan(break_points['veto_mapq']), 't_end'] = sys.maxsize
+        break_points.loc[np.isnan(break_points['veto_mapq']), 'veto_mapq'] = -1
+        break_points['veto_mapq'] = break_points['veto_mapq'].astype(int)
         break_points = break_points[(break_points['t_start']+min_mapping_length+max_break_point_distance <= break_points['position']) &
                                     (break_points['t_end']-min_mapping_length-max_break_point_distance >= break_points['position'])].copy()
         break_points.drop(columns=['merge_block','t_start','t_end'], inplace=True)
         break_points.sort_values(['break_id','mapq','veto_mapq'], ascending=[True,False,False], inplace=True)
-        break_points = break_points.groupby(['break_id','contig_id','position','side','mapq','veto_mapq','lower_mapq','upper_mapq','support'], sort=False).size().reset_index(name='vetos').reset_index()
+        break_points = break_points.groupby(['break_id','contig_id','position','side','mapq','veto_mapq','lower_mapq','upper_mapq','con_supp','support'], sort=False).size().reset_index(name='vetos').reset_index()
         break_points['vetos'] = break_points.groupby(['break_id','mapq'])['vetos'].cumsum() # Add vetos from higher mapping qualities to lower mapping qualities
+        break_points.loc[break_points['veto_mapq'] == -1, 'vetos'] = 0 # Where we set veto_mapq to -1 are no vetos present
+        break_points.loc[break_points['veto_mapq'] == -1, 'veto_mapq'] = break_points.loc[break_points['veto_mapq'] == -1, 'mapq']
         
         # Insert duplicates so that we haven entry with veto_mapq == mapq for every mapq
         break_points['duplicate1'] = (break_points['veto_mapq'] > break_points['mapq']) & ((break_points['veto_mapq'].shift(-1, fill_value=256) < break_points['mapq']) | (break_points['break_id'] != break_points['break_id'].shift(-1, fill_value=-1)) | (break_points['mapq'] != break_points['mapq'].shift(-1, fill_value=-1)))# We can take the next higher veto_mapq to get the correct values for veto_mapq == mapq
@@ -646,18 +670,17 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
         # We have now one entry for every (support)mapq, veto_mapq pair. Now we need to merge the two mapq and keep the numbers correct
         break_points = break_points[ (break_points['veto_mapq'] > break_points['lower_mapq']) & (break_points['veto_mapq'] <= break_points['upper_mapq']) ].copy()
         break_points.loc[break_points['veto_mapq'] > break_points['mapq'], 'support'] = 0 # Since veto_mapq will be later the merged mapq, there is no support for this mapq
+        break_points.loc[break_points['veto_mapq'] > break_points['mapq'], 'con_supp'] = 0 
         break_points.drop(columns=['mapq','lower_mapq','upper_mapq','duplicate1','duplicate2','index'], inplace=True)
         break_points.rename(columns={'veto_mapq':'mapq'}, inplace=True)
         
         # Remove break points that are vetoed
-        break_points['vetoed'] = (break_points['vetos'] >= min_num_reads) & (break_points['vetos'] >= break_points['support']*min_factor_alternatives)
+        break_points['vetoed'] = (break_points['vetos'] >= min_num_reads) & (break_points['con_supp'] < min_num_reads) & (break_points['vetos'] >= break_points['con_supp']*min_factor_alternatives) # If we have enough support, but not enough con_supp the bridge finding step would anyways reseal the break with a unique bridge, so don't even break it
         break_points['vetoed'] = break_points.groupby(['break_id'])['vetoed'].cumsum().astype(bool) # Propagate vetos to lower mapping qualities
         break_points = break_points[break_points['vetoed'] == False].copy()
         
         # Remove breaks that do not fullfil requirements and reduce accepted ones to a single entry per break_id
         break_points = break_points[break_points['support'] >= min_num_reads].copy()
-        if "full" == org_scaffold_trust:
-            break_points = break_points[break_points['support'] >= break_points['vetos']*min_factor_alternatives].copy()
         break_points = break_points.groupby(['break_id'], sort=False).first().reset_index()
 
     if len(break_points):
@@ -672,7 +695,7 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
                                                         (break_points['dist'] < np.repeat(break_points.groupby(['contig_id','group'], sort=False)['dist'].max().values, break_groups['size'].values)), break_points['group'], break_points['break_id'])).cummax()
             break_points.loc[break_points['group'] != break_points['group'].shift(1, fill_value=-1), 'dist'] = -1
             break_groups = break_points.groupby(['contig_id','group'], sort=False)['position'].agg(['min','max','size']).reset_index()
-            
+
         break_groups.drop(columns=['group','size'], inplace=True)
         break_groups.rename(columns={'min':'start', 'max':'end'}, inplace=True)
         break_groups['end'] += 1 # Set end to one position after the last included one to be consistent with other ends (like q_end, t_end)
@@ -693,12 +716,12 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
             rbreaks = breaks.iloc[right_breaks['t_id']]
             keep_row_left = keep_row_left | ((lbreaks['start'].values <= left_breaks['t_end'].values) & (left_breaks['t_end'].values <= lbreaks['end'].values))
             keep_row_right = keep_row_right | ((rbreaks['start'].values <= right_breaks['t_start'].values) & (right_breaks['t_start'].values <= rbreaks['end'].values))
-        
+
         spurious_break_indexes = np.unique(np.concatenate([left_breaks[np.logical_not(keep_row_left)].index, right_breaks[np.logical_not(keep_row_right)].index]))
     else:
         # We don't have breaks, so all are spurious
         spurious_break_indexes = np.unique(np.concatenate([left_breaks.index, right_breaks.index]))
-        
+
     non_informative_mappings = GetNonInformativeMappings(mappings, contigs, min_extension, break_groups, left_breaks, right_breaks)
 
     return break_groups, spurious_break_indexes, non_informative_mappings
@@ -792,6 +815,22 @@ def GetContigParts(contigs, break_groups, remove_short_contigs, min_mapping_leng
 
     return contig_parts, contigs
 
+def GetBreakAndRemovalInfo(result_info, contigs, contig_parts):
+    part_count = contig_parts.groupby('contig', sort=False).size().reset_index(name='parts')
+    part_count['breaks'] = part_count['parts']-1
+    result_info['breaks'] = {}
+    result_info['breaks']['opened'] = np.sum(part_count['breaks'])
+    
+    removed_length = contigs.loc[ np.isin(contigs.reset_index()['index'], part_count['contig']) == False, 'length' ].values
+    result_info['removed'] = {}
+    result_info['removed']['num'] = len(removed_length)
+    result_info['removed']['total'] = np.sum(removed_length)
+    result_info['removed']['min'] = np.min(removed_length)
+    result_info['removed']['max'] = np.max(removed_length)
+    result_info['removed']['mean'] = np.mean(removed_length)
+    
+    return result_info
+
 def UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length):
     # Duplicate mappings for every contig part
     mappings = mappings.merge(contig_parts.reset_index()[['contig', 'index', 'part', 'start', 'end']].rename(columns={'contig':'t_id', 'index':'conpart', 'start':'part_start', 'end':'part_end'}), on=['t_id'], how='left')
@@ -851,18 +890,18 @@ def UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length):
 
 def CreateBridges(left_bridge, right_bridge):
     bridges = pd.concat([left_bridge,right_bridge], ignore_index=True, sort=False)
-
+    
     # Duplicate bridges and switch from to, so that both sortings have all relevant bridges
     bridges = pd.concat([bridges[['from','from_side','to','to_side','min_mapq']],
                          bridges.rename(columns={'from':'to', 'to':'from', 'from_side':'to_side', 'to_side':'from_side'})[['from','from_side','to','to_side','min_mapq']]], ignore_index=True, sort=False)
-
+    
     # Bundle identical bridges
     bridges = bridges.groupby(['from','from_side','to','to_side','min_mapq']).size().reset_index(name='count')
-
+    
     # Get cumulative counts (counts for this trust level and higher)
     bridges.sort_values(['from','from_side','to','to_side','min_mapq'], ascending=[True, True, True, True, False], inplace=True)
     bridges['cumcount'] = bridges.groupby(['from','from_side','to','to_side'], sort=False)['count'].cumsum().values
-
+    
     bridges.drop(columns=['count'], inplace=True)
 
     return bridges
@@ -877,111 +916,102 @@ def MarkOrgScaffoldBridges(bridges, contig_parts, requirement):
 
 def CountAlternatives(bridges):
     bridges.sort_values(['to', 'to_side','from','from_side'], inplace=True)
-    alternatives = bridges.groupby(['to','to_side'], sort=False)['high_q'].agg(['size','sum'])
-    bridges['to_alt'] = np.repeat(alternatives['sum'].values.astype(int), alternatives['size'].values)
+    alternatives = bridges.groupby(['to','to_side'], sort=False).size().values
+    bridges['to_alt'] = np.repeat(alternatives, alternatives)
     bridges.sort_values(['from','from_side','to','to_side'], inplace=True)
-    alternatives = bridges.groupby(['from','from_side'], sort=False)['high_q'].agg(['size','sum'])
-    bridges['from_alt'] = np.repeat(alternatives['sum'].values.astype(int), alternatives['size'].values)
+    alternatives = bridges.groupby(['from','from_side'], sort=False).size().values
+    bridges['from_alt'] = np.repeat(alternatives, alternatives)
 
     return bridges
 
 def FilterBridges(bridges, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, pdf=None):
-    if "blind" == org_scaffold_trust:
-        # Make sure the org scaffolds are used if any read is there and do not use any other connection there even if we don't have a read
+    if org_scaffold_trust in ["blind", "full"]:
         bridges = MarkOrgScaffoldBridges(bridges, contig_parts, -1)
+        if "blind" == org_scaffold_trust:
+            # Make sure the org scaffolds are used if any read is there and do not use any other connection there even if we don't have a read
+            bridges['org_scaf_conflict'] = False
+            bridges.loc[('r' == bridges['from_side']) & (-1 != contig_parts.iloc[bridges['from'].values, contig_parts.columns.get_loc('org_dist_right')].values), 'org_scaf_conflict'] = True
+            bridges.loc[('l' == bridges['from_side']) & (-1 != contig_parts.iloc[bridges['from'].values, contig_parts.columns.get_loc('org_dist_left')].values), 'org_scaf_conflict'] = True
+            bridges.loc[('r' == bridges['to_side']) & (-1 != contig_parts.iloc[bridges['to'].values, contig_parts.columns.get_loc('org_dist_right')].values), 'org_scaf_conflict'] = True
+            bridges.loc[('l' == bridges['to_side']) & (-1 != contig_parts.iloc[bridges['to'].values, contig_parts.columns.get_loc('org_dist_left')].values), 'org_scaf_conflict'] = True
 
-        bridges['org_scaf_conflict'] = False
-        bridges.loc[('r' == bridges['from_side']) & (-1 != contig_parts.iloc[bridges['from'].values, contig_parts.columns.get_loc('org_dist_right')].values), 'org_scaf_conflict'] = True
-        bridges.loc[('l' == bridges['from_side']) & (-1 != contig_parts.iloc[bridges['from'].values, contig_parts.columns.get_loc('org_dist_left')].values), 'org_scaf_conflict'] = True
-        bridges.loc[('r' == bridges['to_side']) & (-1 != contig_parts.iloc[bridges['to'].values, contig_parts.columns.get_loc('org_dist_right')].values), 'org_scaf_conflict'] = True
-        bridges.loc[('l' == bridges['to_side']) & (-1 != contig_parts.iloc[bridges['to'].values, contig_parts.columns.get_loc('org_dist_left')].values), 'org_scaf_conflict'] = True
+            bridges = bridges[(False == bridges['org_scaf_conflict']) | bridges['org_scaffold']]
 
-        bridges = bridges[(False == bridges['org_scaf_conflict']) | bridges['org_scaffold']]
+            bridges.drop(columns=['org_scaf_conflict'], inplace=True)
+    elif "basic" == org_scaffold_trust:
+        bridges = MarkOrgScaffoldBridges(bridges, contig_parts, 0) # Do not connect previously broken contigs through low quality reads
+    else:
+        bridges['org_scaffold'] = False # Do not use original scaffolds
 
-        bridges.drop(columns=['org_scaffold', 'org_scaf_conflict'], inplace=True)
+    # Set lowq flags for all bridges that don't fulfill min_num_reads except for the ones with additional support from original scaffolds
+    bridges['high_q'] = np.where((bridges['cumcount'] < min_num_reads) & (bridges['org_scaffold'] == False), False, True)
 
-    # Set lowq flags for all bridges that don't fulfill min_num_reads
-    bridges['high_q'] = np.where(bridges['cumcount'] < min_num_reads, False, True)
+    # Set lowq flags for all bridges that are below min_factor_alternatives compared to other lowq bridges (so that we do not have borderline decisions where +-1 count decides that one bridge is accepted and the other not)
+    iterations_from = 2
+    iterations_to = 2
+    while 1 < iterations_from and 1 < iterations_to:
+        bridges.sort_values(['from','from_side','min_mapq','cumcount'], ascending=[True, True, False, False], inplace=True)
+        bridges.reset_index(inplace=True, drop=True) # To make sure that the following merge does not destroy our sorting
+        num_lowq = np.sum(bridges['high_q'] == False)
+        old_num_lowq = 0
+        iterations_from = 0
+        while old_num_lowq != num_lowq:
+            vetos = bridges[bridges['high_q'] == False].groupby(['from','from_side','min_mapq'], sort=False)['cumcount'].max().reset_index(name="veto")
+            bridges = bridges.merge(vetos, on=['from','from_side','min_mapq'], how='left')
+            bridges.loc[bridges['cumcount'] < bridges['veto']*min_factor_alternatives, 'high_q'] = False
+            bridges.drop(columns=['veto'], inplace=True)
+            old_num_lowq = num_lowq
+            num_lowq = np.sum(bridges['high_q'] == False)
+            iterations_from += 1
+
+        bridges.sort_values(['to','to_side','min_mapq','cumcount'], ascending=[True, True, False, False], inplace=True)
+        bridges.reset_index(inplace=True, drop=True) # To make sure that the following merge does not destroy our sorting
+        num_lowq = np.sum(bridges['high_q'] == False)
+        old_num_lowq = 0
+        iterations_to = 0
+        while old_num_lowq != num_lowq:
+            vetos = bridges[bridges['high_q'] == False].groupby(['to','to_side','min_mapq'], sort=False)['cumcount'].max().reset_index(name="veto")
+            bridges = bridges.merge(vetos, on=['to','to_side','min_mapq'], how='left')
+            bridges.loc[bridges['cumcount'] < bridges['veto']*min_factor_alternatives, 'high_q'] = False
+            bridges.drop(columns=['veto'], inplace=True)
+            old_num_lowq = num_lowq
+            num_lowq = np.sum(bridges['high_q'] == False)
+            iterations_to += 1
+
+    # Remove low quality bridges
+    bridges = bridges[bridges['high_q']].copy()
+    bridges.drop(columns=['high_q'], inplace=True)
+
+    #  Remove bridges that compete with a bridge with a higher trust level
+    bridges.sort_values(['from','from_side','min_mapq'], ascending=[True, True, False], inplace=True)
+    bridges['max_highq_mapq'] = bridges.groupby(['from','from_side'], sort=False)['min_mapq'].cummax()
+    bridges.sort_values(['to','to_side','min_mapq'], ascending=[True, True, False], inplace=True)
+    bridges['max_highq_mapq2'] = bridges.groupby(['to','to_side'], sort=False)['min_mapq'].cummax()
+    bridges = bridges[np.maximum(bridges['max_highq_mapq'], bridges['max_highq_mapq2']) <= bridges['min_mapq']].copy()
+    bridges.drop(columns=['min_mapq','max_highq_mapq','max_highq_mapq2','cumcount'], inplace=True)
     
-    #  Set lowq flags for all bridges that are below min_factor_alternatives compared to other bridges
-    bridges.sort_values(['from','from_side','min_mapq','cumcount'], ascending=[True, True, False, False], inplace=True)
-    bridges['maxcount'] = np.where(bridges['from'] == bridges['to'], 0, bridges['cumcount'])
-    bridges['maxcount'] = bridges.groupby(['from','from_side'], sort=False)['maxcount'].cummax()
-    bridges.loc[bridges['maxcount'] >= bridges['cumcount']*min_factor_alternatives, 'high_q'] = False
-    bridges.sort_values(['to','to_side','min_mapq','cumcount'], ascending=[True, True, False, False], inplace=True)
-    bridges['maxcount'] = np.where(bridges['from'] == bridges['to'], 0, bridges['cumcount'])
-    bridges['maxcount'] = bridges.groupby(['to','to_side'], sort=False)['maxcount'].cummax()
-    bridges.loc[bridges['maxcount'] >= bridges['cumcount']*min_factor_alternatives, 'high_q'] = False
-    bridges.drop(columns=['maxcount','cumcount'], inplace=True)
+    # Reduce all identical bridges to one
+    bridges.drop_duplicates(inplace=True)
 
-    #  Set lowq flags for all bridges that compete with a high-quality bridge with a higher trust level
-    bridges.sort_values(['from','from_side','high_q','min_mapq'], ascending=[True, True, False,False], inplace=True)
-    bridges['max_highq_mapq'] = np.where(bridges['high_q'], bridges['min_mapq'], 0)
-    bridges['max_highq_mapq'] = bridges.groupby(['from','from_side'], sort=False)['max_highq_mapq'].cummax()
-    bridges.sort_values(['to','to_side','high_q','min_mapq'], ascending=[True, True, False,False], inplace=True)
-    bridges['max_highq_mapq2'] = np.where(bridges['high_q'], bridges['min_mapq'], 0)
-    bridges['max_highq_mapq2'] = bridges.groupby(['to','to_side'], sort=False)['max_highq_mapq2'].cummax()
-    bridges.loc[np.maximum(bridges['max_highq_mapq'], bridges['max_highq_mapq2']) > bridges['min_mapq'], 'high_q'] = False
-    bridges.drop(columns=['min_mapq','max_highq_mapq'], inplace=True)
-    
-    # Reduce all identical bridges to one and count how many high quality alternatives there are
-    bridges = bridges.groupby(['from','from_side','to','to_side']).max().reset_index()
+    if "full" == org_scaffold_trust:
+        # Remove ambiguous bridges that compeat with the original scaffold
+        bridges.sort_values(['from','from_side','to','to_side'], inplace=True)
+        org_scaffolds = bridges.groupby(['from','from_side'], sort=False)['org_scaffold'].agg(['size','sum'])
+        bridges['org_from'] = np.repeat(org_scaffolds['sum'].values, org_scaffolds['size'].values)
+        bridges.sort_values(['to','to_side','from','from_side'], inplace=True)
+        org_scaffolds = bridges.groupby(['to','to_side'], sort=False)['org_scaffold'].agg(['size','sum'])
+        bridges['org_to'] = np.repeat(org_scaffolds['sum'].values, org_scaffolds['size'].values)
+        bridges = bridges[ bridges['org_scaffold'] | ((0 == bridges['org_from']) & (0 == bridges['org_to'])) ].copy()
+
+    # Count alternatives
+    bridges.drop(columns=['org_scaffold'], inplace=True)
     bridges = CountAlternatives(bridges)
 
-    # Remnove low quality bridges, where high quality bridges exist
-    bridges = bridges[ bridges['high_q'] | ((0 == bridges['from_alt']) & (0 == bridges['to_alt'])) ]
-    
-    # Store the real quality status in low_q, because high_q is potentially overwritten by original scaffold information
-    bridges['low_q'] = (False == bridges['high_q'])
-
-    if org_scaffold_trust in ["blind", "full", "basic"]:
-        if "basic" == org_scaffold_trust:
-            bridges = MarkOrgScaffoldBridges(bridges, contig_parts, 0) # Do not connect previously broken contigs through low quality reads
-        else:
-            bridges = MarkOrgScaffoldBridges(bridges, contig_parts, -1)
-
-        # Set low quality bridges to high_q if they are an original scaffold (all low quality bridges with other confirmed options are already removed)
-        bridges.loc[bridges['org_scaffold'], 'high_q'] = True
-
-        if "full" == org_scaffold_trust:
-            # Set ambiguous bridges to low quality if they compeat with the original scaffold
-            org_scaffolds = bridges.groupby(['from','from_side'], sort=False)['org_scaffold'].agg(['size','sum'])
-            bridges.loc[np.repeat(org_scaffolds['sum'].values, org_scaffolds['size'].values) & (False == bridges['org_scaffold']), 'high_q'] = False
-            bridges.sort_values(['to', 'to_side','from','from_side'], inplace=True)
-            org_scaffolds = bridges.groupby(['to','to_side'], sort=False)['org_scaffold'].agg(['size','sum'])
-            bridges.loc[np.repeat(org_scaffolds['sum'].values, org_scaffolds['size'].values) & (False == bridges['org_scaffold']), 'high_q'] = False
-
-        # Remnove new low quality bridges after the original scaffold overwrite
-        bridges = CountAlternatives(bridges)
-        bridges = bridges[ bridges['high_q'] | ((0 == bridges['from_alt']) & (0 == bridges['to_alt'])) ]
-
-
-    #if pdf:
-    #    PlotHist(pdf, "# Supporting reads", "# Unambigouos connections", bridges.loc[ bridges['from_alt'] == 1, 'from_cumcount' ], threshold=min_num_reads, logx=True)
-    #    PlotHist(pdf, "# Supporting reads", "# Unambigouos connections", bridges.loc[ (bridges['from_alt'] == 1) & (bridges['from_cumcount'] <= 10*min_num_reads), 'from_cumcount' ], threshold=min_num_reads)
-    #    PlotHist(pdf, "# Alternative connections", "# Connections", bridges['from_alt'], logy=True)
-
-    #if pdf:
-    #    alternative_bridges = bridges[ bridges['from_maxcount'] > bridges['from_cumcount'] ]
-    #    alt_ratio = alternative_bridges['from_maxcount'] / alternative_bridges['from_cumcount']
-    #    PlotXY(pdf,  "# Reads main connection", "# Reads alternative connection", alternative_bridges['from_maxcount'], alternative_bridges['from_cumcount'], category=np.where(alt_ratio >= min_factor_alternatives, "accepted", "declined"))
-
-    # Mark low quality bridges that don't have alternatives
-    lowq_bridges = bridges.loc[bridges['low_q'], ['from', 'from_side', 'to', 'to_side']] # Low quality bridges (some of them are valid due to org_scaffold_trust level)
-    lowq_bridges['high_q'] = True # We only need this for CountAlternatives
-    lowq_bridges = CountAlternatives(lowq_bridges)
-    lowq_bridges = lowq_bridges.loc[ (1 == lowq_bridges['from_alt']) & (1 == lowq_bridges['to_alt']), ['from', 'from_side', 'to', 'to_side'] ].copy()
-    
-    # Return only valid bridges
-    bridges = bridges[bridges['high_q']].copy()
-    
-    bridges.drop(columns=['high_q','low_q','org_scaffold'], inplace=True)
-
-    return bridges, lowq_bridges
+    return bridges
 
 def GetBridges(mappings, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, pdf):
     # Get bridges
-    left_bridge = mappings.loc[mappings['left_con'] >= 0, ['conpart','left_con','left_con_side','mapq']]
+    left_bridge = mappings.loc[mappings['left_con'] >= 0, ['conpart','left_con','left_con_side','mapq']].copy()
     left_bridge.rename(columns={'conpart':'from','left_con':'to','left_con_side':'to_side','mapq':'from_mapq'}, inplace=True)
     left_bridge['from_side'] = 'l'
     left_bridge['to_mapq'] = np.where('+' == mappings['strand'], mappings['mapq'].shift(1, fill_value = -1), mappings['mapq'].shift(-1, fill_value = -1))[mappings['left_con'] >= 0]
@@ -989,8 +1019,8 @@ def GetBridges(mappings, min_factor_alternatives, min_num_reads, org_scaffold_tr
     left_bridge.drop(columns=['from_mapq','to_mapq'], inplace=True)
     left_bridge.loc[left_bridge['from'] > left_bridge['to'], ['from', 'from_side', 'to', 'to_side', 'min_mapq']] = left_bridge.loc[left_bridge['from'] > left_bridge['to'], ['to', 'to_side', 'from', 'from_side', 'min_mapq']].values
     left_bridge['min_mapq'] = left_bridge['min_mapq'].astype(int)
-
-    right_bridge = mappings.loc[mappings['right_con'] >= 0, ['conpart','right_con','right_con_side','mapq']]
+    
+    right_bridge = mappings.loc[mappings['right_con'] >= 0, ['conpart','right_con','right_con_side','mapq']].copy()
     right_bridge.rename(columns={'conpart':'from','right_con':'to','right_con_side':'to_side','mapq':'from_mapq'}, inplace=True)
     right_bridge['from_side'] = 'r'
     right_bridge['to_mapq'] = np.where('-' == mappings['strand'], mappings['mapq'].shift(1, fill_value = -1), mappings['mapq'].shift(-1, fill_value = -1))[mappings['right_con'] >= 0]
@@ -1000,9 +1030,17 @@ def GetBridges(mappings, min_factor_alternatives, min_num_reads, org_scaffold_tr
     right_bridge['min_mapq'] = right_bridge['min_mapq'].astype(int)
 
     bridges = CreateBridges(left_bridge, right_bridge)
-    bridges, lowq_bridges = FilterBridges(bridges, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts)
+    bridges = FilterBridges(bridges, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts)
 
-    return bridges, lowq_bridges
+    # Break original scaffolds for sides with alternative bridges
+    contig_parts['conpart'] = range(len(contig_parts))
+    breaks = bridges.loc[bridges['from_alt'] > 1, ['from','from_side']].rename(columns={'from':'conpart','from_side':'side'}).drop_duplicates()
+    contig_parts.loc[ np.isin(contig_parts['conpart'].values, breaks.loc[breaks['side'] == 'l', 'conpart'].values), 'org_dist_left'] = -1
+    contig_parts.loc[ np.isin(contig_parts['conpart'].values, breaks.loc[breaks['side'] == 'l', 'conpart'].values-1), 'org_dist_right'] = -1
+    contig_parts.loc[ np.isin(contig_parts['conpart'].values, breaks.loc[breaks['side'] == 'r', 'conpart'].values), 'org_dist_right'] = -1
+    contig_parts.loc[ np.isin(contig_parts['conpart'].values, breaks.loc[breaks['side'] == 'r', 'conpart'].values+1), 'org_dist_left'] = -1
+    
+    return bridges, contig_parts
 
 def ScaffoldAlongGivenConnections(scaffolds, scaffold_parts):
     # Handle right-right scaffold connections (keep scaffold with lower id and reverse+add the other one): We can only create new r-r or r-l connections
@@ -1681,7 +1719,7 @@ def ScaffoldContigs(contig_parts, bridges, mappings):
     # Each contig starts with being its own scaffold
     scaffold_parts = pd.DataFrame({'conpart': contig_parts.index.values, 'scaffold': contig_parts.index.values, 'pos': 0, 'reverse': False})
     scaffolds = pd.DataFrame({'scaffold': contig_parts.index.values, 'left': contig_parts.index.values, 'lside':'l', 'right': contig_parts.index.values, 'rside':'r', 'lextendible':True, 'rextendible':True, 'size':1})
-    
+
     # Combine contigs into scaffolds on unique bridges
     unique_bridges = bridges.loc[(bridges['to_alt'] == 1) & (bridges['from_alt'] == 1), ['from','from_side','to','to_side']]
     scaffolds = scaffolds.merge(unique_bridges[unique_bridges['from_side']=='l'].drop(columns=['from_side']).rename(columns={'from':'scaffold', 'to':'lscaf', 'to_side':'lscaf_side'}), on=['scaffold'], how='left')
@@ -1689,14 +1727,14 @@ def ScaffoldContigs(contig_parts, bridges, mappings):
     scaffolds[['lscaf','rscaf']] = scaffolds[['lscaf','rscaf']].fillna(-1).astype(int)
     scaffolds[['lscaf_side','rscaf_side']] = scaffolds[['lscaf_side','rscaf_side']].fillna('')
     scaffolds, scaffold_parts = ScaffoldAlongGivenConnections(scaffolds, scaffold_parts)
-    
+
     # Build scaffold graph to find unique bridges over scaffolds with alternative connections
     long_range_connections = GetLongRangeConnections(bridges, mappings)
     long_range_connections = TransformContigConnectionsToScaffoldConnections(long_range_connections, scaffold_parts)
     scaffold_graph = BuildScaffoldGraph(long_range_connections, scaffold_parts, bridges)
     scaffolds, scaffold_parts, scaffold_graph, duplicated_scaffolds = FindUniquePaths(scaffolds, scaffold_parts, scaffold_graph) 
     scaffolds, scaffold_parts = ScaffoldAlongGivenConnections(scaffolds, scaffold_parts) # Scaffold along the unique paths
-    
+
     # Finish Scaffolding
     scaffolds.drop(columns=['lscaf','lscaf_side','rscaf','rscaf_side'], inplace = True)
     scaffolds.drop(duplicated_scaffolds, inplace=True)
@@ -1704,21 +1742,9 @@ def ScaffoldContigs(contig_parts, bridges, mappings):
     scaffolds, scaffold_parts = OrderByUnbrokenOriginalScaffolds(scaffolds, scaffold_parts, contig_parts)
     scaffold_table, scaffolds, scaffold_parts = FillGapsWithReads(scaffolds, scaffold_parts, mappings, contig_parts) # Might break apart scaffolds again, if we cannot find a gap filling read
 
-    return scaffolds, scaffold_table
+    return scaffolds, scaffold_parts, scaffold_table
 
-def calculateN50(len_values):
-    # len_values must be sorted from lowest to highest
-    len_total = np.sum(len_values)
-    len_sum = 0
-    len_N50 = 0 # Use as index first
-    while len_sum < len_total/2:
-        len_N50 -= 1
-        len_sum += len_values[len_N50]
-    len_N50 = len_values[len_N50]
-
-    return len_N50, len_total
-
-def GetOutputInfo(result_info, scaffolds, scaffold_table):
+def GetOutputInfo(result_info, scaffolds, scaffold_parts, scaffold_table, contig_parts):
     # Calculate lengths
     con_len = scaffold_table[['scaffold', 'start', 'end']].copy()
     con_len['length'] = con_len['end'] - con_len['start']
@@ -1752,6 +1778,22 @@ def GetOutputInfo(result_info, scaffolds, scaffold_table):
     result_info['output']['scaffolds']['min'] = scaf_len[0]
     result_info['output']['scaffolds']['max'] = scaf_len[-1]
     result_info['output']['scaffolds']['N50'] = scaf_N50
+    
+    # Get resealed breaks
+    resealed_breaks = scaffold_parts[np.isin(scaffold_parts['scaffold'], scaffolds.loc[scaffolds['size'] > 1, 'scaffold'])].copy()
+    resealed_breaks['next_con'] = resealed_breaks['conpart'].shift(-1, fill_value=-1)
+    resealed_breaks = resealed_breaks[resealed_breaks['scaffold'] == resealed_breaks['scaffold'].shift(-1)].copy() # The last one of each scaffold cannot reseal a gap
+    resealed_breaks = resealed_breaks[resealed_breaks['conpart']+np.where(resealed_breaks['reverse'], -1, 1) == resealed_breaks['next_con']].copy() # Scaffold has consecutive contig parts
+    resealed_breaks = resealed_breaks[contig_parts.loc[resealed_breaks['conpart'].values, 'contig'].values == contig_parts.loc[resealed_breaks['next_con'].values, 'contig'].values].copy() # Consecutive contig parts are from the same contig
+
+    # Filter resealed breaks of the same original contig that are split over multiple scaffolds (e.g. scaf1 reseals A B and scaf2 B C)
+    resealed_breaks['from'] = np.minimum(resealed_breaks['conpart'], resealed_breaks['next_con'])
+    resealed_breaks['to'] = np.maximum(resealed_breaks['conpart'], resealed_breaks['next_con'])
+    resealed_breaks.sort_values(['from','to'], inplace=True)
+    multi_scaf_reseals = np.sum( (resealed_breaks['from'] == resealed_breaks['to'].shift(1)) & ((resealed_breaks['scaffold'] != resealed_breaks['scaffold'].shift(1)) | (resealed_breaks['pos']+np.where(resealed_breaks['reverse'], 1, -1) != resealed_breaks['pos'].shift(1))) )
+    result_info['breaks']['resealed'] = len(resealed_breaks) - multi_scaf_reseals
+
+    return result_info
 
 def GetScaffoldExtendingMappings(mappings, contig_parts, scaffolds, max_dist_contig_end, min_extension, min_num_reads, pdf):
     mappings.drop(columns=['left_con','left_con_side' ,'right_con','right_con_side','num_mappings'], inplace=True)
@@ -1820,6 +1862,10 @@ def GetScaffoldExtendingMappings(mappings, contig_parts, scaffolds, max_dist_con
     return mappings
 
 def PrintStats(result_info):
+    print("Input assembly:  {:,.0f} contigs   (Total sequence: {:,.0f} Min: {:,.0f} Max: {:,.0f} N50: {:,.0f})".format(result_info['input']['contigs']['num'], result_info['input']['contigs']['total'], result_info['input']['contigs']['min'], result_info['input']['contigs']['max'], result_info['input']['contigs']['N50']))
+    print("                 {:,.0f} scaffolds (Total sequence: {:,.0f} Min: {:,.0f} Max: {:,.0f} N50: {:,.0f})".format(result_info['input']['scaffolds']['num'], result_info['input']['scaffolds']['total'], result_info['input']['scaffolds']['min'], result_info['input']['scaffolds']['max'], result_info['input']['scaffolds']['N50']))
+    print("Removed          {:,.0f} contigs   (Total sequence: {:,.0f} Min: {:,.0f} Max: {:,.0f} Mean: {:,.0f})".format(result_info['removed']['num'], result_info['removed']['total'], result_info['removed']['min'], result_info['removed']['max'], result_info['removed']['mean']))
+    print("Introduced {:,.0f} breaks of which {:,.0f} have been resealed".format(result_info['breaks']['opened'], result_info['breaks']['resealed']))
     print("Output assembly: {:,.0f} contigs   (Total sequence: {:,.0f} Min: {:,.0f} Max: {:,.0f} N50: {:,.0f})".format(result_info['output']['contigs']['num'], result_info['output']['contigs']['total'], result_info['output']['contigs']['min'], result_info['output']['contigs']['max'], result_info['output']['contigs']['N50']))
     print("                 {:,.0f} scaffolds (Total sequence: {:,.0f} Min: {:,.0f} Max: {:,.0f} N50: {:,.0f})".format(result_info['output']['scaffolds']['num'], result_info['output']['scaffolds']['total'], result_info['output']['scaffolds']['min'], result_info['output']['scaffolds']['max'], result_info['output']['scaffolds']['N50']))
 
@@ -1867,19 +1913,20 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     print( str(timedelta(seconds=clock())), "Reading in original assembly")
     contigs, contig_ids = ReadContigs(assembly_file)
     result_info = {}
+    result_info = GetInputInfo(result_info, contigs)
     
     print( str(timedelta(seconds=clock())), "Processing repeats")
     contigs, center_repeats = MaskRepeatEnds(contigs, repeat_file, contig_ids, max_repeat_extension, min_len_repeat_connection, repeat_len_factor_unique, remove_duplicated_contigs, pdf)
     
     print( str(timedelta(seconds=clock())), "Filtering mappings")
     mappings = ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, subread_alignment_precision, pdf)
-    contigs, org_contig_info = RemoveUnmappedContigs(contigs, mappings, remove_zero_hit_contigs)
+    contigs = RemoveUnmappedContigs(contigs, mappings, remove_zero_hit_contigs)
     mappings = RemoveUnanchoredMappings(mappings, contigs, center_repeats, min_mapping_length, pdf, max_dist_contig_end)
     del center_repeats
     
     print( str(timedelta(seconds=clock())), "Account for left-over adapters")
     mappings = BreakReadsAtAdapters(mappings, subread_alignment_precision, keep_all_subreads)
-    
+
     print( str(timedelta(seconds=clock())), "Search for possible break points")
     if "blind" == org_scaffold_trust:
         # Do not break contigs
@@ -1890,15 +1937,16 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     del spurious_break_indexes, non_informative_mappings
 
     contig_parts, contigs = GetContigParts(contigs, break_groups, remove_short_contigs, min_mapping_length, pdf)
+    result_info = GetBreakAndRemovalInfo(result_info, contigs, contig_parts)
     mappings = UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length)
     del break_groups, contigs, contig_ids
     
     print( str(timedelta(seconds=clock())), "Search for possible bridges")
-    bridges, lowq_bridges = GetBridges(mappings, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, pdf)
+    bridges, contig_parts = GetBridges(mappings, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, pdf)
     
     print( str(timedelta(seconds=clock())), "Scaffold the contigs")
-    scaffolds, scaffold_table = ScaffoldContigs(contig_parts, bridges, mappings)
-    result_info = GetOutputInfo(result_info, scaffolds, scaffold_table)
+    scaffolds, scaffold_parts, scaffold_table = ScaffoldContigs(contig_parts, bridges, mappings)
+    result_info = GetOutputInfo(result_info, scaffolds, scaffold_parts, scaffold_table, contig_parts)
 
     print( str(timedelta(seconds=clock())), "Search for possible extensions")
     mappings = GetScaffoldExtendingMappings(mappings, contig_parts, scaffolds, max_dist_contig_end, min_extension, min_num_reads, pdf)
