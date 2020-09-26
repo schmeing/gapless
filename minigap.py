@@ -409,14 +409,14 @@ def MaskRepeatEnds(contigs, repeat_file, contig_ids, max_repeat_extension, min_l
 
     return contigs, repeat_table
 
-def GetBestSubreads(mappings, subread_alignment_precision):
+def GetBestSubreads(mappings, alignment_precision):
     # Return if we do not have subreads
 
     
     # Identify groups of subread mappings (of which only one is required)
     mappings['subread'] = [ re.sub(r'^(.*?/.*?)/.+', r'\1', qname) for qname in mappings['q_name'].values ]
     mappings.sort_values(['subread','t_name','t_start','t_end'], inplace=True)
-    mappings['group'] = (( (mappings['subread'] != mappings['subread'].shift(1, fill_value="")) | (mappings['t_name'] != mappings['t_name'].shift(1, fill_value="")) | ((mappings['t_start']-mappings['t_start'].shift(1, fill_value=0) > subread_alignment_precision) & (np.abs(mappings['t_end'] - mappings['t_end'].shift(1, fill_value=0)) > subread_alignment_precision)) )).cumsum()
+    mappings['group'] = (( (mappings['subread'] != mappings['subread'].shift(1, fill_value="")) | (mappings['t_name'] != mappings['t_name'].shift(1, fill_value="")) | ((mappings['t_start']-mappings['t_start'].shift(1, fill_value=0) > alignment_precision) & (np.abs(mappings['t_end'] - mappings['t_end'].shift(1, fill_value=0)) > alignment_precision)) )).cumsum()
     
     # Keep only the best subread (over all mappings)
     mappings.sort_values(['group','mapq','matches'], ascending=[True,False,False], inplace=True)
@@ -432,7 +432,7 @@ def GetBestSubreads(mappings, subread_alignment_precision):
     
     return mappings
 
-def ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, subread_alignment_precision, pdf):
+def ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, alignment_precision, pdf):
     mappings = ReadPaf(mapping_file)
 
     # Filter low mapping qualities
@@ -442,7 +442,7 @@ def ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, subread_
 
     # Remove all but the best subread
     if not keep_all_subreads:
-        mappings = GetBestSubreads(mappings, subread_alignment_precision)
+        mappings = GetBestSubreads(mappings, alignment_precision)
 
     mappings['t_id'] = itemgetter(*mappings['t_name'])(contig_ids)
 
@@ -726,7 +726,7 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
 
     return break_groups, spurious_break_indexes, non_informative_mappings
 
-def GetContigParts(contigs, break_groups, remove_short_contigs, min_mapping_length, pdf):
+def GetContigParts(contigs, break_groups, remove_short_contigs, min_mapping_length, alignment_precision, pdf):
     # Create a dataframe with the contigs being split into parts and contigs scheduled for removal not included
     if 0 == len(break_groups):
         # We do not have break points, so we don't need to split
@@ -758,9 +758,9 @@ def GetContigParts(contigs, break_groups, remove_short_contigs, min_mapping_leng
     contig_parts.loc[contig_parts['end']==0, 'end'] = contigs.iloc[contig_parts.loc[contig_parts['end']==0, 'contig'], contigs.columns.get_loc('length')].values
     contig_parts['name'] = contigs.iloc[contig_parts['contig'], contigs.columns.get_loc('name')].values
 
-    # Remove short contig_parts < min_mapping_length
+    # Remove short contig_parts < min_mapping_length + alignment_precision (adding alignment_precision gives a buffer so that a mapping to a short contig is not removed in one read and not removed in another based on a single base mapping or not)
     if remove_short_contigs:
-        contig_parts = contig_parts[contig_parts['end']-contig_parts['start'] >= min_mapping_length].copy()
+        contig_parts = contig_parts[contig_parts['end']-contig_parts['start'] >= min_mapping_length + alignment_precision].copy()
         contig_parts['part'] = contig_parts.groupby(['contig'], sort=False).cumcount()
         contig_parts.reset_index(drop=True,inplace=True)
         contigs['parts'] = 0
@@ -934,18 +934,18 @@ def FilterBridges(bridges, min_factor_alternatives, min_num_reads, org_scaffold_
             bridges.loc[('l' == bridges['from_side']) & (-1 != contig_parts.iloc[bridges['from'].values, contig_parts.columns.get_loc('org_dist_left')].values), 'org_scaf_conflict'] = True
             bridges.loc[('r' == bridges['to_side']) & (-1 != contig_parts.iloc[bridges['to'].values, contig_parts.columns.get_loc('org_dist_right')].values), 'org_scaf_conflict'] = True
             bridges.loc[('l' == bridges['to_side']) & (-1 != contig_parts.iloc[bridges['to'].values, contig_parts.columns.get_loc('org_dist_left')].values), 'org_scaf_conflict'] = True
-
+#
             bridges = bridges[(False == bridges['org_scaf_conflict']) | bridges['org_scaffold']]
-
+#
             bridges.drop(columns=['org_scaf_conflict'], inplace=True)
     elif "basic" == org_scaffold_trust:
         bridges = MarkOrgScaffoldBridges(bridges, contig_parts, 0) # Do not connect previously broken contigs through low quality reads
     else:
         bridges['org_scaffold'] = False # Do not use original scaffolds
-
+#
     # Set lowq flags for all bridges that don't fulfill min_num_reads except for the ones with additional support from original scaffolds
     bridges['high_q'] = np.where((bridges['cumcount'] < min_num_reads) & (bridges['org_scaffold'] == False), False, True)
-
+#
     # Set lowq flags for all bridges that are below min_factor_alternatives compared to other lowq bridges (so that we do not have borderline decisions where +-1 count decides that one bridge is accepted and the other not)
     iterations_from = 2
     iterations_to = 2
@@ -963,7 +963,7 @@ def FilterBridges(bridges, min_factor_alternatives, min_num_reads, org_scaffold_
             old_num_lowq = num_lowq
             num_lowq = np.sum(bridges['high_q'] == False)
             iterations_from += 1
-
+#
         bridges.sort_values(['to','to_side','min_mapq','cumcount'], ascending=[True, True, False, False], inplace=True)
         bridges.reset_index(inplace=True, drop=True) # To make sure that the following merge does not destroy our sorting
         num_lowq = np.sum(bridges['high_q'] == False)
@@ -977,22 +977,22 @@ def FilterBridges(bridges, min_factor_alternatives, min_num_reads, org_scaffold_
             old_num_lowq = num_lowq
             num_lowq = np.sum(bridges['high_q'] == False)
             iterations_to += 1
-
+#
     # Remove low quality bridges
     bridges = bridges[bridges['high_q']].copy()
     bridges.drop(columns=['high_q'], inplace=True)
-
+#
     #  Remove bridges that compete with a bridge with a higher trust level
     bridges.sort_values(['from','from_side','min_mapq'], ascending=[True, True, False], inplace=True)
     bridges['max_highq_mapq'] = bridges.groupby(['from','from_side'], sort=False)['min_mapq'].cummax()
     bridges.sort_values(['to','to_side','min_mapq'], ascending=[True, True, False], inplace=True)
     bridges['max_highq_mapq2'] = bridges.groupby(['to','to_side'], sort=False)['min_mapq'].cummax()
     bridges = bridges[np.maximum(bridges['max_highq_mapq'], bridges['max_highq_mapq2']) <= bridges['min_mapq']].copy()
-    bridges.drop(columns=['min_mapq','max_highq_mapq','max_highq_mapq2','cumcount'], inplace=True)
-    
+    bridges.drop(columns=['min_mapq','max_highq_mapq','max_highq_mapq2'], inplace=True)
+#
     # Reduce all identical bridges to one
     bridges.drop_duplicates(inplace=True)
-
+#
     if "full" == org_scaffold_trust:
         # Remove ambiguous bridges that compeat with the original scaffold
         bridges.sort_values(['from','from_side','to','to_side'], inplace=True)
@@ -1002,11 +1002,14 @@ def FilterBridges(bridges, min_factor_alternatives, min_num_reads, org_scaffold_
         org_scaffolds = bridges.groupby(['to','to_side'], sort=False)['org_scaffold'].agg(['size','sum'])
         bridges['org_to'] = np.repeat(org_scaffolds['sum'].values, org_scaffolds['size'].values)
         bridges = bridges[ bridges['org_scaffold'] | ((0 == bridges['org_from']) & (0 == bridges['org_to'])) ].copy()
-
+#
     # Count alternatives
     bridges.drop(columns=['org_scaffold'], inplace=True)
     bridges = CountAlternatives(bridges)
-
+    bridges['from'] = bridges['from'].astype(int)
+    bridges['to'] = bridges['to'].astype(int)
+    bridges.rename(columns={'cumcount':'bcount'}, inplace=True)
+#
     return bridges
 
 def GetBridges(mappings, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, pdf):
@@ -1028,7 +1031,7 @@ def GetBridges(mappings, min_factor_alternatives, min_num_reads, org_scaffold_tr
     right_bridge.drop(columns=['from_mapq','to_mapq'], inplace=True)
     right_bridge.loc[right_bridge['from'] >= right_bridge['to'], ['from', 'from_side', 'to', 'to_side', 'min_mapq']] = right_bridge.loc[right_bridge['from'] >= right_bridge['to'], ['to', 'to_side', 'from', 'from_side', 'min_mapq']].values # >= here so that contig loops are also sorted properly
     right_bridge['min_mapq'] = right_bridge['min_mapq'].astype(int)
-
+    
     bridges = CreateBridges(left_bridge, right_bridge)
     bridges = FilterBridges(bridges, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts)
 
@@ -1110,6 +1113,7 @@ def ScaffoldAlongGivenConnections(scaffolds, scaffold_parts):
 
     # Remove simple ciruclarities
     circular_scaffolds = scaffolds['scaffold'] == scaffolds['lscaf']
+    scaffolds.loc[circular_scaffolds & (scaffolds['lscaf'] == scaffolds['rscaf']), 'circular'] = True # Truely circular it is only for left-right connections
     scaffolds.loc[circular_scaffolds, 'lextendible'] = False
     scaffolds.loc[circular_scaffolds, 'lscaf'] = -1
     scaffolds.loc[circular_scaffolds, 'lscaf_side'] = ''
@@ -1120,6 +1124,7 @@ def ScaffoldAlongGivenConnections(scaffolds, scaffold_parts):
 
     # Check for two-contig circularities (right-left connections: Others don't exist anymore)
     circular_scaffolds = (scaffolds['lscaf'] == scaffolds['rscaf']) & (scaffolds['lscaf'] != -1)
+    scaffolds.loc[circular_scaffolds, 'circular'] = True
     if np.sum(circular_scaffolds):
         break_left = np.unique(np.minimum(scaffolds.loc[circular_scaffolds,'lscaf'].values.astype(int), scaffolds.loc[circular_scaffolds,'scaffold'].values)) # Choose arbitrarily the lower of the scaffold ids for left side break
         break_right = np.unique(np.maximum(scaffolds.loc[circular_scaffolds,'lscaf'].values.astype(int), scaffolds.loc[circular_scaffolds,'scaffold'].values))
@@ -1137,6 +1142,7 @@ def ScaffoldAlongGivenConnections(scaffolds, scaffold_parts):
             # All remaining right-left connections must be circular
             # Long circularities (>=3 scaffolds) cannot be solved in a single go, because we don't know which ones are connected. Thus we simply break the left connection of the first scaffold that still has a connection and run the loop until the whole circularity is scaffolded and repeat this until no more circularities are present
             circular_scaffolds = scaffolds.loc[scaffolds['rscaf_side'] == 'l', 'scaffold'].values
+            scaffolds.loc[circular_scaffolds, 'circular'] = True
             if len(circular_scaffolds):
                 break_left = circular_scaffolds[0]
                 break_right = scaffolds.loc[break_left, 'lscaf']
@@ -1175,7 +1181,25 @@ def ScaffoldAlongGivenConnections(scaffolds, scaffold_parts):
         scaffolds.index = scaffolds['scaffold'].values # Make sure we can access scaffolds with .loc[scaffold]
 
     return scaffolds, scaffold_parts
-    
+
+def LiftBridgesFromContigsToScaffolds(bridges, scaffolds):
+    # Lift from
+    scaf_bridges = bridges.merge(scaffolds[['scaffold','left','lside']].rename(columns={'scaffold':'lscaf', 'left':'from', 'lside':'from_side'}), on=['from','from_side'], how='left')
+    scaf_bridges = scaf_bridges.merge(scaffolds[['scaffold','right','rside']].rename(columns={'scaffold':'rscaf', 'right':'from', 'rside':'from_side'}), on=['from','from_side'], how='left')
+    scaf_bridges = scaf_bridges[(np.isnan(scaf_bridges['lscaf']) == False) | (np.isnan(scaf_bridges['rscaf']) == False)].copy() # Remove bridges that are now inside scaffolds
+    scaf_bridges['from'] = np.where(np.isnan(scaf_bridges['lscaf']), scaf_bridges['rscaf'], scaf_bridges['lscaf']).astype(int)
+    scaf_bridges['from_side'] = np.where(np.isnan(scaf_bridges['lscaf']), 'r', 'l')
+    scaf_bridges.drop(columns=['lscaf','rscaf'], inplace=True)
+
+    # Lift to
+    scaf_bridges = scaf_bridges.merge(scaffolds[['scaffold','left','lside']].rename(columns={'scaffold':'lscaf', 'left':'to', 'lside':'to_side'}), on=['to','to_side'], how='left')
+    scaf_bridges = scaf_bridges.merge(scaffolds[['scaffold','right','rside']].rename(columns={'scaffold':'rscaf', 'right':'to', 'rside':'to_side'}), on=['to','to_side'], how='left')
+    scaf_bridges['to'] = np.where(np.isnan(scaf_bridges['lscaf']), scaf_bridges['rscaf'], scaf_bridges['lscaf']).astype(int)
+    scaf_bridges['to_side'] = np.where(np.isnan(scaf_bridges['lscaf']), 'r', 'l')
+    scaf_bridges.drop(columns=['lscaf','rscaf'], inplace=True)
+
+    return scaf_bridges
+
 def GetSizeAndEnumeratePositionsForLongRangeConnections(long_range_connections):
     con_size = long_range_connections.groupby(['conn_id']).size().reset_index(name='size')
     long_range_connections['size'] = np.repeat(con_size['size'].values, con_size['size'].values)
@@ -1276,7 +1300,7 @@ def TransformContigConnectionsToScaffoldConnections(long_range_connections, scaf
     
     return long_range_connections
 
-def BuildScaffoldGraph(long_range_connections, scaffold_parts, bridges):
+def BuildScaffoldGraph(long_range_connections, scaf_bridges):
     # First start from every contig and extend in both directions on valid reads
     scaffold_graph = long_range_connections[['scaffold','strand','conn_code','pos','size']].copy()
     scaffold_graph = scaffold_graph[scaffold_graph['pos']+1 < scaffold_graph['size']].copy() # If we are already at the last position we cannot extend
@@ -1287,21 +1311,16 @@ def BuildScaffoldGraph(long_range_connections, scaffold_parts, bridges):
         scaffold_graph['pos'] += 1
         scaffold_graph = scaffold_graph.merge(long_range_connections[['conn_code','pos','scaffold','strand']].rename(columns={'scaffold':'scaf'+str(s), 'strand':'strand'+str(s)}), on=['conn_code','pos'], how='left')
     scaffold_graph.drop(columns=['pos'],inplace=True)
-    
-    # Then add bridges with alternatives
-    short_bridges = bridges.loc[(bridges['from_alt'] > 1) | (bridges['to_alt'] > 1), ['from','from_side','to','to_side']].copy()
-    short_bridges[['from','reverse']] = scaffold_parts.loc[short_bridges['from'].values,['scaffold','reverse']].values
-    short_bridges.loc[short_bridges['reverse'], 'from_side'] = np.where(short_bridges.loc[short_bridges['reverse'], 'from_side'] == 'r', 'l', 'r')
-    short_bridges[['to','reverse']] = scaffold_parts.loc[short_bridges['to'].values,['scaffold','reverse']].values
-    short_bridges.loc[short_bridges['reverse'], 'to_side'] = np.where(short_bridges.loc[short_bridges['reverse'], 'to_side'] == 'r', 'l', 'r')
-    short_bridges.drop(columns=['reverse'],inplace=True)
+
+    # Then add scaf_bridges with alternatives
+    short_bridges = scaf_bridges.loc[(scaf_bridges['from_alt'] > 1) | (scaf_bridges['to_alt'] > 1), ['from','from_side','to','to_side']].copy()
     short_bridges.rename(columns={'to':'scaf1','to_side':'strand1'}, inplace=True)
     short_bridges['strand1'] = np.where(short_bridges['strand1'] == 'l', '+', '-')
     short_bridges['conn_code'] = ''
     short_bridges['size'] = 2
     short_bridges['org_pos'] = 0
     scaffold_graph = pd.concat([scaffold_graph, short_bridges[['from','from_side','conn_code','size','org_pos','scaf1','strand1']]])
-    
+
     # Now remove all the paths that overlap a longer one (for equally long ones just take one of them)
     scaffold_graph['length'] = scaffold_graph['size'] - scaffold_graph['org_pos']
     scaffold_graph.sort_values(['from','from_side']+[col for sublist in [['scaf'+str(s),'strand'+str(s)] for s in range(1,scaffold_graph['size'].max())] for col in sublist], inplace=True)
@@ -1310,125 +1329,563 @@ def BuildScaffoldGraph(long_range_connections, scaffold_parts, bridges):
         scaffold_graph['redundant'] = scaffold_graph['redundant'] & ( np.isnan(scaffold_graph['scaf'+str(s)]) | ( (scaffold_graph['scaf'+str(s)] == scaffold_graph['scaf'+str(s)].shift(1, fill_value=-1)) & (scaffold_graph['strand'+str(s)] == scaffold_graph['strand'+str(s)].shift(1, fill_value='')))) 
     scaffold_graph = scaffold_graph[ scaffold_graph['redundant'] == False ].copy()
     scaffold_graph.drop(columns=['redundant','size'],inplace=True)
-    
+
+    # Remove overlapping paths with repeated starting scaffold
+    scaffold_graph.reset_index(inplace=True, drop=True)
+    scaffold_graph['rep_len'] = -1
+    reps = []
+    for s in range(1,scaffold_graph['length'].max()):
+        scaffold_graph.loc[(scaffold_graph['scaf'+str(s)] == scaffold_graph['from']) & (scaffold_graph['strand'+str(s)] == np.where(scaffold_graph['from_side'] == 'r', '+', '-')), 'rep_len'] = s
+        reps.append( scaffold_graph[(scaffold_graph['rep_len'] == s) & (scaffold_graph['rep_len']+1 < scaffold_graph['length'])].copy() )
+    reps = pd.concat(reps)
+    reps = reps.merge(scaffold_graph.reset_index()[['from','from_side','index']].rename(columns={'index':'red_ind'}), on=['from','from_side'], how='inner') # Add all possibly redundant indexes in scaffold_graph
+    reps = reps[scaffold_graph.loc[reps['red_ind'], 'length'].values == reps['length'] - reps['rep_len']].copy() # Filter out all non-redundant entries
+    for s in range(1, (reps['length']-reps['rep_len']).max()):
+        for rl in range(1, reps['rep_len'].max()):
+            if s+rl < reps['length'].max():
+                reps = reps[(reps['rep_len'] != rl) | (reps['length']-rl-1 < s) | ((scaffold_graph.loc[reps['red_ind'], 'scaf'+str(s)].values == reps['scaf'+str(s+rl)]) & (scaffold_graph.loc[reps['red_ind'], 'strand'+str(s)].values == reps['strand'+str(s+rl)]))].copy()
+    scaffold_graph.drop(index=np.unique(reps['red_ind'].values), inplace=True)
+
     return scaffold_graph
 
-def FindUniquePaths(scaffolds, scaffold_parts, scaffold_graph):
-    # Find unique paths through the scaffold graph
-    scaffold_graph['unique'] = True
-    duplicated_scaffolds = [] # Scaffolds that are duplicated because they are in a unique path but not the unique ends. They will be removed at the end after they are not needed as reference for further duplications anymore
-    for s in range(1,scaffold_graph['length'].max()):
-        # Check if path with s+1 scaffolds is unique for the given direction
-        scaffold_graph['unique'] = scaffold_graph['unique'] & (np.isnan(scaffold_graph['scaf'+str(s)]) == False) & ((scaffold_graph['from'] != scaffold_graph['from'].shift(1)) | (scaffold_graph['from_side'] != scaffold_graph['from_side'].shift(1)) |
-                                                                                                                    ((scaffold_graph['scaf'+str(s)] == scaffold_graph['scaf'+str(s)].shift(1)) & (scaffold_graph['strand'+str(s)] == scaffold_graph['strand'+str(s)].shift(1))))
-        potential_paths = scaffold_graph.groupby(['from','from_side'], sort=False)[['unique','scaf'+str(s),'strand'+str(s)]].agg({'unique':['sum','size'], ('scaf'+str(s)):['first'], ('strand'+str(s)):['first']}).reset_index()
-        potential_paths['identical'] = potential_paths[('unique','sum')]
-        potential_paths = potential_paths.drop(columns=('unique','sum')).droplevel(axis='columns',level=1).rename(columns={'unique':'size',('scaf'+str(s)):'to', ('strand'+str(s)):'to_side'})
-        potential_paths['to_side'] = np.where(potential_paths['to_side'] == '+', 'l', 'r')
-        potential_paths['unique'] = potential_paths['size'] == potential_paths['identical']
-        # Update scaffold_graph for the next s (if the path is already not unique at length s+1 it cannot be at length s+2)
-        scaffold_graph['unique'] = np.repeat(potential_paths['unique'].values, potential_paths['size'].values)
-        if s > 1:
-            # Check if we have a unique path in both directions (for s==1 we already handled unique bridges)
-            potential_paths = potential_paths[potential_paths['unique']].drop(columns=['unique','size', 'identical'])
-            potential_paths['to'] = potential_paths['to'].astype(int)
-            potential_paths = potential_paths.merge(potential_paths.rename(columns={'from':'to','from_side':'to_side','to':'from','to_side':'from_side'}), on=['from','from_side','to','to_side'], how='inner')
-            if len(potential_paths):
-                # Terminate the extention of the unique path when we already found one, so that we do not join two unique paths into one (would cause multiple false duplications)
-                scaffold_graph['unique'] = scaffold_graph['unique'].values & (scaffold_graph.merge(potential_paths[['from','from_side']], on=['from','from_side'], how='left', indicator=True)['_merge'] == 'left_only').values # 'left_only' means it does not need to be terminated and we continue unique paths
-                # Add connections between scaffolds
-                scaffolds.loc[potential_paths.loc[potential_paths['from_side'] == 'l', 'from'].values, 'lscaf'] = potential_paths.loc[potential_paths['from_side'] == 'l', 'to'].values
-                scaffolds.loc[potential_paths.loc[potential_paths['from_side'] == 'l', 'from'].values, 'lscaf_side'] = potential_paths.loc[potential_paths['from_side'] == 'l', 'to_side'].values
-                scaffolds.loc[potential_paths.loc[potential_paths['from_side'] == 'r', 'from'].values, 'rscaf'] = potential_paths.loc[potential_paths['from_side'] == 'r', 'to'].values
-                scaffolds.loc[potential_paths.loc[potential_paths['from_side'] == 'r', 'from'].values, 'rscaf_side'] = potential_paths.loc[potential_paths['from_side'] == 'r', 'to_side'].values
-                # Add the non-unique scaffolds between the two uniquely connected ones to the scaffold with the lower id (or the right side if we have a circular connection)
-                potential_paths = potential_paths[(potential_paths['from'] < potential_paths['to']) | ((potential_paths['from'] == potential_paths['to']) & (potential_paths['from_side'] == 'r'))].copy()
-                potential_paths.drop(columns=['to','to_side'], inplace=True)
-                potential_paths = potential_paths.merge(scaffold_graph.groupby(['from','from_side'], sort=False)[[col for sublist in [['scaf'+str(sc),'strand'+str(sc)] for sc in range(1,s)] for col in sublist]].first().reset_index(), on=['from','from_side'], how='left')
-                for sc in range(1,s):
-                    ## Extend on left side with reversion
-                    extended = potential_paths.loc[(potential_paths['from_side'] == 'l') & (potential_paths['strand'+str(sc)] == '+'), 'from'].values
-                    absorbed = potential_paths.loc[(potential_paths['from_side'] == 'l') & (potential_paths['strand'+str(sc)] == '+'), 'scaf'+str(sc)].values
-                    if len(extended):
-                        # Update scaffold_parts
-                        duplication = scaffold_parts[np.isin(scaffold_parts['scaffold'], absorbed)].copy()
-                        duplication['reverse'] = duplication['reverse'] == False
-                        duplication = duplication.merge(pd.DataFrame({'scaffold':absorbed, 'new_scaf':extended}), on=['scaffold'], how='left')
-                        duplication['scaffold'] = duplication['new_scaf'] # Needs to be done as a separate step, because the merge might need to duplicate scaffolds that are used in two or more unique connections
-                        duplication.drop(columns=['new_scaf'], inplace=True)
-                        duplication['pos'] = duplication['pos']*-1 - 1
-                        scaffold_parts = pd.concat([scaffold_parts, duplication])
-                        scaffold_parts.sort_values(['scaffold','pos'], inplace=True)
-                        scaffold_parts['pos'] = scaffold_parts.groupby(['scaffold'], sort=False).cumcount() # Shift positions so that we don't have negative numbers anymore
-                        # Update scaffolds (allthough everything except size will be overwritten by the scaffolding on the new connection)
-                        scaffolds.loc[extended, 'left'] = scaffolds.loc[absorbed, 'right'].values
-                        scaffolds.loc[extended, 'lside'] = scaffolds.loc[absorbed, 'rside'].values
-                        scaffolds.loc[extended, 'lextendible'] = scaffolds.loc[absorbed, 'rextendible'].values
-                        scaffolds.loc[extended, 'size'] += scaffolds.loc[absorbed, 'size'].values
-                        # Add the duplicated scaffolds to duplicated_scaffolds
-                        duplicated_scaffolds = np.unique(np.concatenate([duplicated_scaffolds, absorbed]))
+def FindUniqueExtensions(unique_extensions, potential_paths):
+    unique_path = potential_paths.copy()
+    if len(unique_path):
+        unique_path['unique_len'] = 0
+        unique_path['unique'] = True
+        unique_path.sort_values(['from','from_side']+[col for sublist in [['scaf'+str(s),'strand'+str(s)] for s in range(1,unique_path['length'].max())] for col in sublist], inplace=True)
 
-                    ## Extend on left side without reversion
-                    extended = potential_paths.loc[(potential_paths['from_side'] == 'l') & (potential_paths['strand'+str(sc)] == '-'), 'from'].values
-                    absorbed = potential_paths.loc[(potential_paths['from_side'] == 'l') & (potential_paths['strand'+str(sc)] == '-'), 'scaf'+str(sc)].values
-                    if len(extended):
-                        # Update scaffold_parts
-                        duplication = scaffold_parts[np.isin(scaffold_parts['scaffold'], absorbed)].copy()
-                        duplication['pos'] = duplication['pos'] - scaffolds.loc[duplication['scaffold'].values, 'size'].values
-                        duplication = duplication.merge(pd.DataFrame({'scaffold':absorbed, 'new_scaf':extended}), on=['scaffold'], how='left')
-                        duplication['scaffold'] = duplication['new_scaf'] # Needs to be done as a separate step, because the merge might need to duplicate scaffolds that are used in two or more unique connections
-                        duplication.drop(columns=['new_scaf'], inplace=True)
-                        scaffold_parts = pd.concat([scaffold_parts, duplication])
-                        scaffold_parts.sort_values(['scaffold','pos'], inplace=True)
-                        scaffold_parts['pos'] = scaffold_parts.groupby(['scaffold'], sort=False).cumcount() # Shift positions so that we don't have negative numbers anymore
-                        # Update scaffolds (allthough everything except size will be overwritten by the scaffolding on the new connection)
-                        scaffolds.loc[extended, 'left'] = scaffolds.loc[absorbed, 'left'].values
-                        scaffolds.loc[extended, 'lside'] = scaffolds.loc[absorbed, 'lside'].values
-                        scaffolds.loc[extended, 'lextendible'] = scaffolds.loc[absorbed, 'lextendible'].values
-                        scaffolds.loc[extended, 'size'] += scaffolds.loc[absorbed, 'size'].values
-                        # Add the duplicated scaffolds to duplicated_scaffolds
-                        duplicated_scaffolds = np.unique(np.concatenate([duplicated_scaffolds, absorbed]))
- 
-                    ## Extend on right side with reversion
-                    extended = potential_paths.loc[(potential_paths['from_side'] == 'r') & (potential_paths['strand'+str(sc)] == '-'), 'from'].values
-                    absorbed = potential_paths.loc[(potential_paths['from_side'] == 'r') & (potential_paths['strand'+str(sc)] == '-'), 'scaf'+str(sc)].values
-                    if len(extended):
-                        # Update scaffolds (allthough everything except size will be overwritten by the scaffolding on the new connection)
-                        scaffolds.loc[extended, 'right'] = scaffolds.loc[absorbed, 'left'].values
-                        scaffolds.loc[extended, 'rside'] = scaffolds.loc[absorbed, 'lside'].values
-                        scaffolds.loc[extended, 'rextendible'] = scaffolds.loc[absorbed, 'lextendible'].values
-                        scaffolds.loc[extended, 'size'] += scaffolds.loc[absorbed, 'size'].values
-                        # Update scaffold_parts
-                        duplication = scaffold_parts[np.isin(scaffold_parts['scaffold'], absorbed)].copy()
-                        duplication['reverse'] = duplication['reverse'] == False
-                        duplication = duplication.merge(pd.DataFrame({'scaffold':absorbed, 'new_scaf':extended}), on=['scaffold'], how='left')
-                        duplication['scaffold'] = duplication['new_scaf'] # Needs to be done as a separate step, because the merge might need to duplicate scaffolds that are used in two or more unique connections
-                        duplication.drop(columns=['new_scaf'], inplace=True)
-                        duplication['pos'] = scaffolds.loc[duplication['scaffold'].values, 'size'].values - duplication['pos'] - 1 # scaffolds is already updated so it is the combined size
-                        scaffold_parts = pd.concat([scaffold_parts, duplication])
-                        # Add the duplicated scaffolds to duplicated_scaffolds
-                        duplicated_scaffolds = np.unique(np.concatenate([duplicated_scaffolds, absorbed]))
+        for s in range(1,unique_path['length'].max()):
+            # Check if path with s+1 scaffolds is unique for the given direction
+            unique_path['unique'] = unique_path['unique'] & (np.isnan(unique_path['scaf'+str(s)]) == False) & ((unique_path['from'] != unique_path['from'].shift(1)) | (unique_path['from_side'] != unique_path['from_side'].shift(1)) |
+                                                                                                              ((unique_path['scaf'+str(s)] == unique_path['scaf'+str(s)].shift(1)) & (unique_path['strand'+str(s)] == unique_path['strand'+str(s)].shift(1))))
+            uniqueness = unique_path.groupby(['from','from_side'], sort=False)[['unique','scaf'+str(s),'strand'+str(s)]].agg({'unique':['sum','size'], ('scaf'+str(s)):['first'], ('strand'+str(s)):['first']}).reset_index()
+            uniqueness['identical'] = uniqueness[('unique','sum')]
+            uniqueness = uniqueness.drop(columns=('unique','sum')).droplevel(axis='columns',level=1).rename(columns={'unique':'size',('scaf'+str(s)):'to', ('strand'+str(s)):'to_side'})
+            uniqueness['to_side'] = np.where(uniqueness['to_side'] == '+', 'l', 'r')
+            uniqueness['unique'] = uniqueness['size'] == uniqueness['identical']
+            # Update unique_path for the next s (if the path is already not unique at length s+1 it cannot be at length s+2)
+            unique_path['unique'] = np.repeat(uniqueness['unique'].values, uniqueness['size'].values)
+            unique_path.loc[unique_path['unique'], 'unique_len'] += 1
+    
+        unique_path = unique_path[unique_path['unique_len'] > 0].copy()
 
-                    ## Extend on right side without reversion
-                    extended = potential_paths.loc[(potential_paths['from_side'] == 'r') & (potential_paths['strand'+str(sc)] == '+'), 'from'].values
-                    absorbed = potential_paths.loc[(potential_paths['from_side'] == 'r') & (potential_paths['strand'+str(sc)] == '+'), 'scaf'+str(sc)].values
-                    if len(extended):
-                        # Update scaffold_parts
-                        duplication = scaffold_parts[np.isin(scaffold_parts['scaffold'], absorbed)].copy()
-                        duplication = duplication.merge(pd.DataFrame({'scaffold':absorbed, 'new_scaf':extended}), on=['scaffold'], how='left')
-                        duplication['scaffold'] = duplication['new_scaf'] # Needs to be done as a separate step, because the merge might need to duplicate scaffolds that are used in two or more unique connections
-                        duplication.drop(columns=['new_scaf'], inplace=True)
-                        duplication['pos'] = scaffolds.loc[duplication['scaffold'].values, 'size'].values + duplication['pos'] # scaffolds is not yet updated so it is the old size
-                        scaffold_parts = pd.concat([scaffold_parts, duplication])
-                        # Update scaffolds (allthough everything except size will be overwritten by the scaffolding on the new connection)
-                        scaffolds.loc[extended, 'right'] = scaffolds.loc[absorbed, 'right'].values
-                        scaffolds.loc[extended, 'rside'] = scaffolds.loc[absorbed, 'rside'].values
-                        scaffolds.loc[extended, 'rextendible'] = scaffolds.loc[absorbed, 'rextendible'].values
-                        scaffolds.loc[extended, 'size'] += scaffolds.loc[absorbed, 'size'].values
-                        # Add the duplicated scaffolds to duplicated_scaffolds
-                        duplicated_scaffolds = np.unique(np.concatenate([duplicated_scaffolds, absorbed]))
-                        
-    return scaffolds, scaffold_parts, scaffold_graph, duplicated_scaffolds
+    if len(unique_path):
+        unique_path = unique_path.groupby(['from','from_side'], sort=False).first().reset_index() # All path have the same values for the unique length, so just take the first path
+        unique_path = unique_path[['from','from_side','unique_len'] + [col for sublist in [['scaf'+str(s),'strand'+str(s)] for s in range(1,unique_path['unique_len'].max()+1)] for col in sublist]].copy()
+        for s in range(1,unique_path['unique_len'].max()+1):
+            unique_path.loc[unique_path['unique_len'] < s, ['scaf'+str(s),'strand'+str(s)]] = np.nan
+        unique_path = unique_path[(unique_path['unique_len'] > 1) | (unique_path['scaf1'] != unique_path['from'])].copy() # Remove simple repeats
+        unique_extensions.append(unique_path.copy())
+
+    return unique_extensions
+
+def FindBubblesAndUniquePaths(scaffolds, scaffold_parts, scaffold_graph, ploidy):
+    all_paths = scaffold_graph.drop(columns=['conn_code', 'org_pos']) # All path that have not been handled or dismissed already
+    bubbles = []
+    loops = []
+    unique_extensions = []
+    repeated_scaffolds = []
+
+    cs = 1 # Current scaffold position for extension
+    while len(all_paths):
+        # Store and remove loops (so that we find the start and end for unique loops)
+        all_paths['loop_len'] = -1
+        for s in range(1,all_paths['length'].max()):
+            all_paths.loc[(all_paths['scaf'+str(s)] == all_paths['from']) & (all_paths['strand'+str(s)] == np.where(all_paths['from_side'] == 'r', '+', '-')), 'loop_len'] = s-1
+        loop_path = all_paths[all_paths['loop_len'] >= 0].copy()
+        if len(loop_path):
+            loop_path = loop_path[['from','from_side','loop_len']+[col for sublist in [['scaf'+str(s),'strand'+str(s)] for s in range(1,loop_path['loop_len'].max()+1)] for col in sublist]].copy()
+            for s in range(1,loop_path['loop_len'].max()+1):
+                loop_path.loc[loop_path['loop_len'] < s, ['scaf'+str(s),'strand'+str(s)]] = np.nan
+            loop_path.drop_duplicates(inplace=True)
+            loop_path = loop_path[loop_path['from_side'] == 'r'].copy()
+            loop_path.drop(columns=['from_side'], inplace=True)
+            loops.append(loop_path.copy())
+            repeated_scaffolds = np.unique(np.concatenate([repeated_scaffolds, loop_path['from'].values]).astype(int))
+            all_paths = all_paths[all_paths['loop_len'] == -1].copy()
+            all_paths.drop(columns=['loop_len'], inplace=True)
+
+        # Find scaffolds that appear in all path from a given start contig (requirement for unique path and bubble)
+        all_paths.sort_values(['from','from_side'], inplace=True)
+        all_paths['path_id'] = range(len(all_paths))
+        alternatives = all_paths.groupby(['from','from_side']).size()
+        all_paths['alts'] = np.repeat(alternatives.values, alternatives.values)
+
+        path_long_format = []
+        if len(all_paths):
+            for s in range(1,all_paths['length'].max()):
+                path_long_format.append(all_paths.loc[np.isnan(all_paths['scaf'+str(s)]) == False, ['from','from_side','path_id','alts','scaf'+str(s),'strand'+str(s)]].rename(columns={'scaf'+str(s):'to', 'strand'+str(s):'to_side'}))
+                path_long_format[-1]['pos'] = s
+            path_long_format = pd.concat(path_long_format)
+            path_long_format['to'] = path_long_format['to'].astype(int)
+            path_long_format['to_side'] = np.where(path_long_format['to_side'] == '+', 'l', 'r')
+            # In case the scaffold is circular only take the first appearance of each subscaffold (repeats will be filtered at a later stage)
+            path_long_format = path_long_format.groupby(['from','from_side','alts','to','to_side','path_id'])['pos'].min().reset_index(name='pos')
+
+        if len(path_long_format):
+            bubble_candidates = path_long_format.groupby(['from','from_side','alts','to','to_side']).size().reset_index(name='count')
+             # All paths have this scaffold in this orientation ('to', 'to_side') in it
+            bubble_candidates = bubble_candidates[(bubble_candidates['count'] == bubble_candidates['alts']) & (np.isin(bubble_candidates['from'], repeated_scaffolds) == False) & (np.isin(bubble_candidates['to'], repeated_scaffolds) == False)].copy()
+        else:
+            bubble_candidates = []
+
+        if len(bubble_candidates):
+            bubble_candidates.drop(columns=['count'], inplace=True)
+            # Check that the connection is the same in both directions
+            bubble_candidates = bubble_candidates.merge(bubble_candidates.rename(columns={'from':'to','from_side':'to_side','to':'from','to_side':'from_side'}), on=['from','from_side','to','to_side','alts'], how='inner')
+
+        if len(bubble_candidates):
+             # Add position and path information
+            bubble_candidates = bubble_candidates.merge(path_long_format, on=['from','from_side','to','to_side','alts'], how='left')
+            # Guarantee that both directions have the same amount of scaffolds included
+            bubble_candidates = bubble_candidates.merge(bubble_candidates.drop(columns=['path_id']).drop_duplicates().rename(columns={'from':'to','from_side':'to_side','to':'from','to_side':'from_side'}), on=['from','from_side','to','to_side','alts','pos'], how='inner')
+            bubble_candidates.sort_values(['from','from_side','path_id','pos'],  inplace=True)
+            # Remove conflicting bubbles (bubbles that have different orders depending on the path taken)
+            conflicts = [-1]
+            while len(conflicts):
+                tmp_candidates = bubble_candidates.groupby(['from','from_side','path_id'], sort=False).first().reset_index().drop(columns=['path_id','alts','pos']).drop_duplicates()
+                conflicts = tmp_candidates.groupby(['from','from_side'], sort=False).size()
+                tmp_candidates['conflicts'] = np.repeat(conflicts.values, conflicts.values) - 1 # Conflicts are the number of endings - 1, because a single ending is consistent with itself
+                conflicts = tmp_candidates[tmp_candidates['conflicts'] > 0].copy()
+                conflicts = pd.concat([conflicts, conflicts.rename(columns={'from':'to','from_side':'to_side','to':'from','to_side':'from_side'})]).groupby(['from','from_side','to','to_side']).first().reset_index() # Also remove the opposite direction, as we always require both directions to be valid
+                bubble_candidates = bubble_candidates[np.isnan(bubble_candidates.merge(conflicts, on=['from','from_side','to','to_side'], how='left')['conflicts']).values].copy()
+            # Remove the conflict also in the other direction
+            bubble_candidates = bubble_candidates.merge(bubble_candidates.drop(columns=['path_id']).drop_duplicates().rename(columns={'from':'to','from_side':'to_side','to':'from','to_side':'from_side'}), on=['from','from_side','to','to_side','alts','pos'], how='inner')
+
+        if len(bubble_candidates):
+            # Only take the first bubble (position wise) to have less duplicates (we can later stich them back together)
+            bubble_candidates = bubble_candidates.groupby(['from','from_side','path_id'], sort=False).first().reset_index()
+            bubble_candidates = bubble_candidates.merge(all_paths.drop(columns=['length']), on=['from','from_side','path_id','alts'], how='left')
+            for s in range(1,all_paths['length'].max()):
+                bubble_candidates.loc[bubble_candidates['pos'] <= s, ['scaf'+str(s),'strand'+str(s)]] = np.nan
+
+            # Check how many alternatives this bubble truely has (not all the alternatives the whole path has)
+            bubble_candidates['length'] = bubble_candidates['pos']-1
+            bubble_candidates.drop(columns=['path_id','pos','alts'], inplace=True)
+            bubble_candidates.drop_duplicates(inplace=True)
+            alternatives = bubble_candidates.groupby(['from','from_side'], sort=False).size()
+            bubble_candidates['alts'] = np.repeat(alternatives.values, alternatives.values)
+            bubble_candidates = bubble_candidates[bubble_candidates['alts']<=ploidy].copy() # If the bubble has more alternatives than we have haplotypes it must be a repeat and we don't straighten the bubble
+
+            # Remove the removed bubbles in the other direction as well
+            bubble_candidates = bubble_candidates.merge(bubble_candidates[['from','from_side','to','to_side','alts','length']].drop_duplicates().rename(columns={'from':'to','from_side':'to_side','to':'from','to_side':'from_side'}), on=['from','from_side','to','to_side','alts','length'], how='inner')
+
+        # Store detected bubbles
+        if len(bubble_candidates):
+            bubble_candidates = bubble_candidates[['from','from_side','to','to_side','length','alts'] + [col for sublist in [['scaf'+str(s),'strand'+str(s)] for s in range(1,bubble_candidates['length'].max()+1)] for col in sublist]].copy()
+            bubbles.append(bubble_candidates.copy())
+
+            # Remove paths where we already found a bubble
+            all_paths = all_paths[ (all_paths[['from','from_side']].merge(pd.concat([bubble_candidates[['from','from_side']], bubble_candidates[['to','to_side']].rename(columns={'to':'from','to_side':'from_side'})]).drop_duplicates(), on=['from','from_side'], how='left', indicator=True)['_merge'] == "left_only").values ].copy()
+
+        # Dismiss paths that have more alternatives than ploidy
+        if len(all_paths):
+            all_paths['remove'] = all_paths['alts'] > ploidy
+            unique_extensions = FindUniqueExtensions(unique_extensions, all_paths[all_paths['remove']])
+            all_paths = all_paths[all_paths['remove'] == False].copy()
+
+        # Only extend paths if the current scaffold (cs) hasn't been in the path before (otherwise we would run into loops)
+        if len(all_paths):
+            all_paths['mscaf'] = all_paths['scaf'+str(cs)].fillna(-1).astype(int)
+            for s in range(1, cs):
+                all_paths.loc[(all_paths['scaf'+str(cs)] == all_paths['scaf'+str(s)]) & (all_paths['strand'+str(cs)] == all_paths['strand'+str(s)]), 'mscaf'] = -2
+            all_paths['mside'] = np.where(all_paths['strand'+str(cs)] == '+', 'r', 'l')
+            all_paths = all_paths.merge(scaffold_graph[['from','from_side','length'] + [col for sublist in [['scaf'+str(s),'strand'+str(s)] for s in range(1,scaffold_graph['length'].max())] for col in sublist]].rename(columns={**{'from':'mscaf', 'from_side':'mside', 'length':'new_len'}, **{('scaf'+str(s)):('cscaf'+str(s+cs)) for s in range(scaffold_graph['length'].max())}, **{('strand'+str(s)):('cstrand'+str(s+cs)) for s in range(scaffold_graph['length'].max())}}), on=['mscaf','mside'], how='left')
+            all_paths['ext_id'] = range(len(all_paths))
+
+            # If the current scaffold is repeated later on, try the extension for all and take the first that works
+            rep_extensions = [all_paths[['ext_id']].copy()]
+            rep_extensions[0]['shift'] = 0
+            for s in range(cs+1, all_paths['length'].max()):
+                rep_extensions.append( all_paths.loc[(all_paths['mscaf'] == all_paths['scaf'+str(s)]) & (all_paths['strand'+str(cs)] == all_paths['strand'+str(s)]), ['ext_id']].copy() )
+                rep_extensions[-1]['shift'] = s-cs
+            rep_extensions = pd.concat(rep_extensions)
+            all_paths = all_paths.merge(rep_extensions, on=['ext_id'], how='left')
+
+            # Create additional columns if we need them
+            all_paths['new_len'] += cs
+            for s in range(all_paths['length'].max(), (all_paths['new_len']+all_paths['shift']).max().astype(int)):
+                all_paths['scaf'+str(s)] = np.nan 
+                all_paths['strand'+str(s)] = np.nan
+
+            all_paths.loc[np.isnan(all_paths['new_len']), 'remove'] = True # If we don't have an extension remove the path
+            for s in range(cs+1,all_paths['new_len'].max().astype(int)):
+                for shift in range(all_paths['shift'].max()+1):
+                    if s+shift < (all_paths['new_len']+all_paths['shift']).max().astype(int):
+                        # If the extension diverges from the path on the overlap remove it
+                        all_paths.loc[(all_paths['shift'] == shift) & (np.isnan(all_paths['scaf'+str(s+shift)]) == False) & (np.isnan(all_paths['cscaf'+str(s)]) == False) & ((all_paths['scaf'+str(s+shift)] != all_paths['cscaf'+str(s)]) | (all_paths['strand'+str(s+shift)] != all_paths['cstrand'+str(s)])), 'remove'] = True
+                        # Update extended values
+                        all_paths.loc[(all_paths['shift'] == shift) & (all_paths['remove'] == False) & np.isnan(all_paths['scaf'+str(s+shift)]) & (np.isnan(all_paths['cscaf'+str(s)]) == False), ['strand'+str(s+shift),'scaf'+str(s+shift)]] = all_paths.loc[(all_paths['shift'] == shift) & (all_paths['remove'] == False) & np.isnan(all_paths['scaf'+str(s+shift)]) & (np.isnan(all_paths['cscaf'+str(s)]) == False), ['cstrand'+str(s), 'cscaf'+str(s)]].values
+
+            all_paths['new_len'] += all_paths['shift'] # Add this only after the loop so that we don't increase the maximum for s in the loop, because we separately add the shift there
+            all_paths.drop(columns=[col for col in all_paths.columns if (col[:5] == 'cscaf') or (col[:7] == 'cstrand')], inplace=True)
+
+            # Take for every repeated scaffold the first that does not diverge from the path or the last if all diverge
+            all_paths['keep'] = all_paths['remove'] == False
+            all_paths['keep'] = all_paths.groupby(['ext_id'])['keep'].cumsum()-all_paths['keep']
+            all_paths = all_paths[all_paths['keep'] == 0].copy()
+            all_paths = all_paths.groupby(['ext_id']).last().reset_index(drop=True)
+            all_paths.drop(columns=['shift','keep'], inplace=True)
+
+            # Finish the removal selection
+            all_paths.loc[all_paths['new_len'] <= all_paths['length'], 'remove'] = True # If we don't gain length it is not an extension
+            all_paths['extended'] = all_paths['remove'] == False
+            all_paths.loc[(all_paths['length'] > cs+1), 'remove'] = False # If we have possibilities for extensions later on, we don't remove the path
+            all_paths.drop(columns=['mscaf','mside'], inplace=True)
+            all_paths.drop_duplicates(inplace=True)
+            removals = all_paths.groupby(['from','from_side'], sort=False)['remove'].agg(['sum','size'])
+            all_paths['remove'] = np.repeat( removals['sum'].values == removals['size'].values, removals['size'].values ) # Only remove a path if all path from this starting scaffold are removed
+            cs += 1
+
+            # Remove non-extendable paths
+            unique_extensions = FindUniqueExtensions(unique_extensions, all_paths[all_paths['remove']])
+            all_paths = all_paths[all_paths['remove'] == False].copy()
+            all_paths.loc[all_paths['extended'], 'length'] = all_paths.loc[all_paths['extended'], 'new_len'].astype(int)
+            ext_count = all_paths.groupby(['path_id'])['extended'].agg(['sum','size'])
+            all_paths = all_paths[all_paths['extended'] | np.repeat(ext_count['sum'].values == 0, ext_count['size'].values)].copy() # If we have extensions for a given path, drop the failed extension attempts 
+            all_paths.drop(columns=['path_id','alts','remove','new_len','extended'], inplace=True)
+            all_paths.drop_duplicates(inplace=True)
+
+    bubbles = pd.concat(bubbles)
+    loops = pd.concat(loops)
+    unique_extensions = pd.concat(unique_extensions)
+    unique_extensions.sort_values(['from','from_side'], inplace=True)
+    unique_paths = bubbles[bubbles['alts'] == 1].copy()
+    unique_paths.drop(columns=['alts'], inplace=True)
+    bubbles = bubbles[bubbles['alts'] > 1].copy()
+
+    unique_paths.sort_values(['from','from_side','to','to_side'], inplace=True)
+    unique_paths.drop_duplicates(inplace=True)
+
+    bubbles.sort_values(['from','from_side','to','to_side'], inplace=True)
+    bubbles.drop_duplicates(inplace=True)
+
+    # Insert reversed versions of loops
+    loops['from_side'] = 'r'
+    rev_path = loops.copy()
+    rev_path['from_side'] = 'l'
+    for l in range(1, rev_path['loop_len'].max()+1):
+        for s in range(1, l+1):
+            rev_path.loc[rev_path['loop_len'] == l, 'scaf'+str(s)] = loops.loc[loops['loop_len'] == l, 'scaf'+str(l+1-s)]
+            rev_path.loc[rev_path['loop_len'] == l, 'strand'+str(s)] = np.where(loops.loc[loops['loop_len'] == l, 'strand'+str(l+1-s)] == '+', '-', '+')
+    loops = pd.concat([loops, rev_path])
+    loops.sort_values(['from','from_side'], inplace=True)
+    loops.drop_duplicates(inplace=True)
+
+    return unique_paths, bubbles, loops, unique_extensions
+    
+def GroupConnectedScaffoldsIntoKnots(unique_paths, bubbles, loops, unique_extensions, scaffolds, scaffold_parts, contig_parts):
+    # Create copies, so that we don't modify the original
+    cbubbles = bubbles.copy()
+    cunique_paths = unique_paths.copy()
+    cloops = loops.copy()
+    cunique_extensions = unique_extensions.copy()
+
+    # Group all connected scaffolds
+    cbubbles['id'] = range(len(cbubbles))
+    conns = []
+    conns.append(cbubbles[['id', 'from']].rename(columns={'id':'conn', 'from':'scaffold'}))
+    conns.append(cbubbles[['id', 'to']].rename(columns={'id':'conn', 'to':'scaffold'}))
+    for s in range(1,cbubbles['length'].max()+1):
+        conns.append(cbubbles.loc[np.isnan(cbubbles['scaf'+str(s)]) == False, ['id', 'scaf'+str(s)]].rename(columns={'id':'conn', ('scaf'+str(s)):'scaffold'}))
+        conns[-1]['scaffold'] = conns[-1]['scaffold'].astype(int)
+
+    cunique_paths['id'] = range(len(cbubbles), len(cbubbles)+len(cunique_paths))
+    conns.append(cunique_paths[['id', 'from']].rename(columns={'id':'conn', 'from':'scaffold'}))
+    conns.append(cunique_paths[['id', 'to']].rename(columns={'id':'conn', 'to':'scaffold'}))
+    for s in range(1,cunique_paths['length'].max()+1):
+        conns.append(cunique_paths.loc[np.isnan(cunique_paths['scaf'+str(s)]) == False, ['id', 'scaf'+str(s)]].rename(columns={'id':'conn', ('scaf'+str(s)):'scaffold'}))
+        conns[-1]['scaffold'] = conns[-1]['scaffold'].astype(int)
+
+    cloops['id'] = range(len(cbubbles)+len(cunique_paths), len(cbubbles)+len(cunique_paths)+len(cloops))
+    conns.append(cloops[['id', 'from']].rename(columns={'id':'conn', 'from':'scaffold'}))
+    for s in range(1,cloops['loop_len'].max()+1):
+        conns.append(cloops.loc[np.isnan(cloops['scaf'+str(s)]) == False, ['id', 'scaf'+str(s)]].rename(columns={'id':'conn', ('scaf'+str(s)):'scaffold'}))
+        conns[-1]['scaffold'] = conns[-1]['scaffold'].astype(int)
+
+    cunique_extensions['id'] = range(len(cbubbles)+len(cunique_paths)+len(cloops), len(cbubbles)+len(cunique_paths)+len(cloops)+len(cunique_extensions))
+    conns.append(cunique_extensions[['id', 'from']].rename(columns={'id':'conn', 'from':'scaffold'}))
+    for s in range(1,cunique_extensions['unique_len'].max()+1):
+        conns.append(cunique_extensions.loc[np.isnan(cunique_extensions['scaf'+str(s)]) == False, ['id', 'scaf'+str(s)]].rename(columns={'id':'conn', ('scaf'+str(s)):'scaffold'}))
+        conns[-1]['scaffold'] = conns[-1]['scaffold'].astype(int)
+
+    conns = pd.concat(conns)
+    conns.sort_values(['conn'], inplace=True)
+    knots = scaffolds[['scaffold']].copy()
+    knots['knot'] = 0
+    knots['new_knot'] = range(len(knots))
+    while np.sum((np.isnan(knots['new_knot']) == False) & (knots['knot'] != knots['new_knot'])):
+        knots.loc[np.isnan(knots['new_knot']) == False, 'knot'] = knots.loc[np.isnan(knots['new_knot']) == False, 'new_knot'].astype(int)
+        knots.drop(columns=['new_knot'], inplace=True)
+        tmp_conns = conns.merge(knots, on=['scaffold'], how='left')
+        min_knot = tmp_conns.groupby(['conn'], sort=False)['knot'].agg(['min','size'])
+        tmp_conns['knot'] = np.repeat(min_knot['min'].values, min_knot['size'].values)
+        knots = knots.merge(tmp_conns.groupby(['scaffold'])['knot'].min().reset_index(name='new_knot'), on=['scaffold'], how='left')
+
+    # Remove all knots that only contain a single scaffold
+    knots.drop(columns=['new_knot'], inplace=True)
+    knots.sort_values(['knot'], inplace=True)
+    knot_size = knots.groupby(['knot'], sort=False).size()
+    knots = knots[np.repeat(knot_size.values > 1, knot_size.values)].copy()
+
+    # Get scaffold sizes (in nucleotides)
+    conlen = pd.DataFrame({'conpart':range(len(contig_parts)), 'length':(contig_parts['end'].values - contig_parts['start'].values)})
+    knots = knots.merge(scaffold_parts[['conpart','scaffold']].merge(conlen.rename(columns={'contig':'conpart'}), on=['conpart'], how='left').groupby(['scaffold'])['length'].sum().reset_index(name='scaf_len'), on=['scaffold'], how='left')
+    knots.sort_values(['knot','scaf_len'], ascending=[True,False], inplace=True)
+
+    return knots
+
+def ResolveLoops(loops, unique_paths, bubbles, unique_extensions):
+    ## Check if we can traverse loops and update unique_paths, bubbles and unique_extensions accordingly
+    # Group connected loops
+    conns = []
+    conns.append(loops[['id', 'from']].rename(columns={'id':'conn', 'from':'scaffold'}))
+    for s in range(1,loops['loop_len'].max()+1):
+        conns.append(loops.loc[np.isnan(loops['scaf'+str(s)]) == False, ['id', 'scaf'+str(s)]].rename(columns={'id':'conn', ('scaf'+str(s)):'scaffold'}))
+        conns[-1]['scaffold'] = conns[-1]['scaffold'].astype(int)
+    conns = pd.concat(conns).drop_duplicates()
+    conns.sort_values(['conn'], inplace=True)
+    loops['loop'] = 0
+    loops['new_loop'] = range(len(loops))
+    while np.sum(loops['loop'] != loops['new_loop']):
+        loops['loop'] = loops['new_loop']
+        loops.drop(columns=['new_loop'], inplace=True)
+        tmp_conns = conns.rename(columns={'scaffold':'from'}).merge(loops[['from','loop']], on=['from'], how='left')
+        min_loop = tmp_conns.groupby(['conn'], sort=False)['loop'].agg(['min','size'])
+        tmp_conns['loop'] = np.repeat(min_loop['min'].values.astype(int), min_loop['size'].values)
+        loops = loops.merge(tmp_conns.groupby(['from'])['loop'].min().reset_index(name='new_loop'), on=['from'], how='left')
+    
+    loops.drop(columns=['new_loop'], inplace=True)
+    loops.sort_values(['loop','from','from_side'], inplace=True)
+    loop_scaffolds = tmp_conns[['loop','from']].drop_duplicates().sort_values(['loop','from']).rename(columns={'from':'scaffold'})
+    unique_loop_exit = [ loop_scaffolds.merge(unique_paths.reset_index(), left_on=['scaffold'], right_on=['from'], how='inner') ]
+    for s in range(1,unique_paths['length'].max()+1):
+        unique_loop_exit.append( loop_scaffolds.merge(unique_paths.reset_index(), left_on=['scaffold'], right_on=['scaf'+str(s)], how='inner') )
+    unique_loop_exit = pd.concat(unique_loop_exit).drop(columns=['scaffold']).sort_values(['loop','from','from_side','to','to_side']).drop_duplicates()
+    loops_with_unique_exit = np.unique(unique_loop_exit['loop'].values)
+        
+    bubble_loop_exit = [ loop_scaffolds.merge(bubbles.reset_index(), left_on=['scaffold'], right_on=['from'], how='inner') ]
+    for s in range(1,bubbles['length'].max()+1):
+        bubble_loop_exit.append( loop_scaffolds.merge(bubbles.reset_index(), left_on=['scaffold'], right_on=['scaf'+str(s)], how='inner') )
+    bubble_loop_exit = pd.concat(bubble_loop_exit).drop(columns=['scaffold']).sort_values(['loop','from','from_side','to','to_side']).drop_duplicates()
+    loops_with_bubble_exit = np.unique(bubble_loop_exit['loop'].values)
+    
+    unique_loop_exit['has_bubble'] = np.isin(unique_loop_exit['loop'], loops_with_bubble_exit)
+    unique_loop_exit['from_in_loop']  = (unique_loop_exit[['loop','from']].merge(loop_scaffolds.rename(columns={'scaffold':'from'}), on=['loop','from'], how='left', indicator=True)['_merge'] == "both").values
+    unique_loop_exit['to_in_loop']  = (unique_loop_exit[['loop','to']].merge(loop_scaffolds.rename(columns={'scaffold':'to'}), on=['loop','to'], how='left', indicator=True)['_merge'] == "both").values
+    
+    return unique_paths, bubbles, unique_extensions
+
+def TraverseScaffoldingGraph(scaffolds, scaffold_parts, scaffold_graph, contig_parts, scaf_bridges, ploidy):
+    unique_paths, bubbles, loops, unique_extensions = FindBubblesAndUniquePaths(scaffolds, scaffold_parts, scaffold_graph, ploidy)
+    knots = GroupConnectedScaffoldsIntoKnots(unique_paths, bubbles, loops, unique_extensions, scaffolds, scaffold_parts, contig_parts)
+    #unique_paths, bubbles, unique_extensions = ResolveLoops(loops, unique_paths, bubbles, unique_extensions)
+    # Do here: Handle unique extensions
+
+    # Start from the longest scaffold in each knot and extend it to both sides as much as possible and repeat this until all scaffolds have been addressed
+    final_paths = []
+    duplicated_scaffolds = []
+    while len(knots):
+        cur_start = knots.groupby(['knot']).first().reset_index()
+        cur_paths = pd.DataFrame({'center':cur_start['scaffold'].values, 'pos':0, 'scaffold':cur_start['scaffold'].values, 'strand':'+'})
+        included_scaffolds = []
+#
+        # Extend to both sides
+        for direction in ["left","right"]:
+            ext = pd.DataFrame({'center':cur_start['scaffold'].values, 'pos':0, 'len':1})
+            while len(ext):
+                new_paths = [cur_paths.copy()]
+                if direction == "right":
+                    ext = ext.merge(cur_paths, on=['center','pos'], how='left')
+                    ext['side'] = np.where(ext['strand'] == '+', 'r', 'l')
+                else:
+                    cur_paths['rev_strand'] = np.where(cur_paths['strand'] == '+', '-', '+')
+                    cur_paths['rev_pos'] = cur_paths['pos'] * (-1)
+                    ext = ext.merge(cur_paths[['center', 'rev_pos', 'scaffold', 'strand']].rename(columns={'rev_pos':'pos'}), on=['center','pos'], how='left')
+                    ext['side'] = np.where(ext['strand'] == '+', 'l', 'r')
+#
+                ## Check if we can extend with a unique path
+                uni_ext = ext.merge(unique_paths.rename(columns={'from':'scaffold', 'from_side':'side'}), on=['scaffold','side'], how='inner')
+                uni_ext['new_len'] = uni_ext['pos'] + uni_ext['length'] + 2
+                uni_ext = uni_ext[ uni_ext['new_len'] > uni_ext['len'] ].copy() # Remove extensions that are shorter or equally long as the current path (don't extend)
+                if len(uni_ext):
+                    # Check if the extension is already included (so that we do not get stuck in a loop)
+                    if direction == "right":
+                        uni_ext['to_strand'] = np.where(uni_ext['to_side'] == 'l', '+', '-')
+                    else:
+                        uni_ext['to_strand'] = np.where(uni_ext['to_side'] == 'l', '-', '+')
+                    uni_ext['included'] = (uni_ext[['center','to','to_strand']].rename(columns={'to':'scaffold', 'to_strand':'strand'}).merge(cur_paths[['center','scaffold','strand']], on=['center','scaffold','strand'], how='left', indicator=True).drop_duplicates()['_merge'] == "both").values
+                    for s in range(1,uni_ext['length'].max()+1):
+                        uni_ext.loc[uni_ext['included'] & (uni_ext['length'] >= s), 'included'] = (uni_ext.loc[uni_ext['included'] & (uni_ext['length'] >= s), ['center','scaf'+str(s),'strand'+str(s)]].rename(columns={('scaf'+str(s)):'scaffold', ('strand'+str(s)):'strand'}).merge( (cur_paths[['center','scaffold','strand']] if direction == "right" else cur_paths[['center','scaffold','rev_strand']].rename(columns={'rev_strand':'strand'})), on=['center','scaffold','strand'], how='left', indicator=True).drop_duplicates()['_merge'] == "both").values
+                    uni_ext = uni_ext[ uni_ext['included'] == False ].copy()
+                if len(uni_ext):
+                    # Add newly included scaffolds to included_scaffolds
+                    included_scaffolds.append(uni_ext['to'].values)
+                    for s in range(1,uni_ext['length'].max()+1):
+                        included_scaffolds.append(uni_ext.loc[uni_ext['length'] >= s, 'scaf'+str(s)].values.astype(int))
+                    # Insert new scaffolds into path
+                    uni_ext['pos'] += 1
+                    for s in range(1,uni_ext['length'].max()+1):
+                        new_paths.append(uni_ext.loc[(uni_ext['length'] >= s) & (uni_ext['pos'] >= uni_ext['len']), ['center','pos','scaf'+str(s),'strand'+str(s)]].rename(columns={('scaf'+str(s)):'scaffold', ('strand'+str(s)):'strand'}))
+                        new_paths[-1]['scaffold'] = new_paths[-1]['scaffold'].astype(int)
+                        if direction == "left":
+                            new_paths[-1]['strand'] = np.where(new_paths[-1]['strand'] == '+', '-', '+')
+                            new_paths[-1]['pos'] = new_paths[-1]['pos'] * (-1)
+                        uni_ext['pos'] += 1
+                    uni_ext['pos'] = uni_ext['new_len']-1
+                    new_paths.append(uni_ext[['center','pos','to','to_strand']].rename(columns={'to':'scaffold', 'to_strand':'strand'}))
+                    if direction == "left":
+                        new_paths[-1]['pos'] = new_paths[-1]['pos'] * (-1)
+                    ext = ext.merge(uni_ext[['center','new_len']], on=['center'], how='left')
+                    ext.loc[np.isnan(ext['new_len']) == False, 'len'] = ext.loc[np.isnan(ext['new_len']) == False, 'new_len'].astype(int)
+                    ext.drop(columns=['new_len'], inplace=True)
+#
+                ## Check if we can extend with a bubble
+                bext = ext.merge(bubbles.rename(columns={'from':'scaffold', 'from_side':'side'}), on=['scaffold','side'], how='inner')
+                if len(bext):
+                    # Add all scaffolds from the bubbles to included_scaffolds (also if we don't include them, because then they are another haplotype from the bubble (or a repeat, but in that case we should include them coming from a different scaffold))
+                    included_scaffolds.append(bext['to'].values)
+                    for s in range(1,bext['length'].max()+1):
+                        included_scaffolds.append(bext.loc[bext['length'] >= s, 'scaf'+str(s)].values.astype(int))
+                    # Remove bubbles that do not fit the current path
+                    bext['new_len'] = bext['pos'] + bext['length'] + 2
+                    bext = bext[ bext['new_len'] > bext['len'] ].copy() # Remove extensions that are shorter or equally long as the current path (don't extend)
+                    if len(bext):
+                        bext['cur_pos'] = bext['pos'] + 1
+                        for s in range(1,bext['length'].max()+1):
+                            bext = bext.merge(cur_paths[['center', ('pos' if direction == "right" else 'rev_pos'), 'scaffold', ('strand' if direction == "right" else 'rev_strand')]].rename(columns={('pos' if direction == "right" else 'rev_pos'):'cur_pos', 'scaffold':'pscaf', ('strand' if direction == "right" else 'rev_strand'):'pstrand'}), on=['center','cur_pos'], how='left')
+                            bext = bext[np.isnan(bext['pscaf']) | ((bext['pscaf'] == bext['scaf'+str(s)]) & (bext['pstrand'] == bext['strand'+str(s)]))].copy()
+                            bext.drop(columns=['pscaf','pstrand'], inplace=True)
+                            bext['cur_pos'] += 1
+                        if direction == "right":
+                            bext['to_strand'] = np.where(bext['to_side'] == 'l', '+', '-')
+                        else:
+                            bext['to_strand'] = np.where(bext['to_side'] == 'l', '-', '+')
+                        bext['cur_pos'] = bext['new_len']-1
+                        bext = bext.merge(cur_paths[['center', ('pos' if direction == "right" else 'rev_pos'), 'scaffold', 'strand']].rename(columns={('pos' if direction == "right" else 'rev_pos'):'cur_pos', 'scaffold':'pscaf', 'strand':'pstrand'}), on=['center','cur_pos'], how='left')
+                        bext = bext[np.isnan(bext['pscaf']) | ((bext['pscaf'] == bext['to']) & (bext['pstrand'] == bext['to_strand']))].copy()
+                        bext.drop(columns=['pscaf','pstrand','cur_pos'], inplace=True)
+                if len(bext):
+                    # From all consistent paths through a bubble pick the one with more reads supporting the bridge
+                    bext['first'] = np.where(bext['length'] == 0, bext['to'], bext['scaf1']).astype(int)
+                    bext['first_side'] = np.where(bext['length'] == 0, bext['to_side'], np.where(bext['strand1'] == '+', 'l', 'r'))
+                    bext = bext.merge(scaf_bridges[['from','from_side','to','to_side','bcount']].rename(columns={'from':'scaffold', 'from_side':'side', 'to':'first', 'to_side':'first_side'}), on=['scaffold','side','first','first_side'], how='left')
+                    bext.sort_values(['center'], inplace=True)
+                    bcounts = bext.groupby(['center'], sort=False)['bcount'].agg(['max','size'])
+                    bext = bext[bext['bcount'] == np.repeat(bcounts['max'].values, bcounts['size'].values)].copy()
+                    bext.drop(columns=['first','first_side','bcount'], inplace=True)
+                    bext['last'] = bext['scaffold']
+                    bext['last_side'] = bext['side']
+                    for s in range(1,bext['length'].max()+1):
+                        bext.loc[bext['length'] == s, 'last'] = bext.loc[bext['length'] == s, 'scaf'+str(s)].astype(int)
+                        bext.loc[bext['length'] == s, 'last_side'] = np.where(bext.loc[bext['length'] == s, 'strand'+str(s)] == '+', 'r', 'l')
+                    bext = bext.merge(scaf_bridges[['from','from_side','to','to_side','bcount']].rename(columns={'from':'last', 'from_side':'last_side'}), on=['last','last_side','to','to_side'], how='left')
+                    bcounts = bext.groupby(['center'], sort=False)['bcount'].agg(['max','size'])
+                    bext = bext[bext['bcount'] == np.repeat(bcounts['max'].values, bcounts['size'].values)].copy()
+                    bext.drop(columns=['last','last_side','bcount'], inplace=True)
+                    # If bridges are equal take the ones including more scaffolds
+                    max_len = bext.groupby(['center'], sort=False)['length'].agg(['max','size'])
+                    bext = bext[bext['length'] == np.repeat(max_len['max'].values, max_len['size'].values)].copy()
+                    bext = bext.groupby(['center'], sort=False).first().reset_index() # If there are still multiple options just take the first
+                    # Check if the extension is already included (so that we do not get stuck in a loop)
+                    bext['included'] = (bext[['center','to','to_strand']].rename(columns={'to':'scaffold', 'to_strand':'strand'}).merge(cur_paths[['center','scaffold','strand']], on=['center','scaffold','strand'], how='left', indicator=True).drop_duplicates()['_merge'] == "both").values
+                    for s in range(1,bext['length'].max()+1):
+                        bext.loc[bext['included'] & (bext['length'] >= s), 'included'] = (bext.loc[bext['included'] & (bext['length'] >= s), ['center','scaf'+str(s),'strand'+str(s)]].rename(columns={('scaf'+str(s)):'scaffold', ('strand'+str(s)):'strand'}).merge((cur_paths[['center','scaffold','strand']] if direction == "right" else cur_paths[['center','scaffold','rev_strand']].rename(columns={'rev_strand':'strand'})), on=['center','scaffold','strand'], how='left', indicator=True).drop_duplicates()['_merge'] == "both").values
+                    bext = bext[ bext['included'] == False ].copy()
+                if len(bext):
+                    # Insert new scaffolds into path
+                    bext['pos'] += 1
+                    for s in range(1,bext['length'].max()+1):
+                        new_paths.append(bext.loc[(bext['length'] >= s) & (bext['pos'] >= bext['len']), ['center','pos','scaf'+str(s),'strand'+str(s)]].rename(columns={('scaf'+str(s)):'scaffold', ('strand'+str(s)):'strand'}))
+                        new_paths[-1]['scaffold'] = new_paths[-1]['scaffold'].astype(int)
+                        if direction == "left":
+                            new_paths[-1]['strand'] = np.where(new_paths[-1]['strand'] == '+', '-', '+')
+                            new_paths[-1]['pos'] = new_paths[-1]['pos'] * (-1)
+                        bext['pos'] += 1
+                    bext['pos'] = bext['new_len']-1
+                    new_paths.append(bext[['center','pos','to','to_strand']].rename(columns={'to':'scaffold', 'to_strand':'strand'}))
+                    if direction == "left":
+                        new_paths[-1]['pos'] = new_paths[-1]['pos'] * (-1)
+                    ext = ext.merge(bext[['center','new_len']], on=['center'], how='left')
+                    ext.loc[np.isnan(ext['new_len']) == False, 'len'] = ext.loc[np.isnan(ext['new_len']) == False, 'new_len'].astype(int)
+                    ext.drop(columns=['new_len'], inplace=True)
+#
+                ## Remove finished extensions
+                ext['pos'] += 1
+                ext = ext[ext['pos'] < ext['len']].copy()
+                ext.drop(columns=['scaffold','strand','side'], inplace=True)
+                cur_paths = pd.concat(new_paths)
+#
+        # Book keeping
+        final_paths.append(cur_paths)
+        if len(included_scaffolds):
+            included_scaffolds = np.unique(np.concatenate(included_scaffolds))
+            duplicated_scaffolds.append(included_scaffolds)
+            included_scaffolds = np.unique(np.concatenate([included_scaffolds,cur_start['scaffold'].values]))
+        else:
+            included_scaffolds = cur_start['scaffold'].values
+        knots = knots[np.isin(knots['scaffold'], included_scaffolds) == False]
+
+    duplicated_scaffolds = np.unique(np.concatenate(duplicated_scaffolds))
+    final_paths = pd.concat(final_paths)
+    
+    # Extend scaffolds according to final_paths
+    ext_scaffolds = scaffolds.drop(duplicated_scaffolds)
+    ext_scaffold_parts = [scaffold_parts[np.isin(scaffold_parts['scaffold'], duplicated_scaffolds) == False].copy()]
+    for p in range(1, final_paths['pos'].max()+1):
+        ext_scaffolds = ext_scaffolds.merge(final_paths.loc[final_paths['pos'] == p, ['center','scaffold','strand']].rename(columns={'center':'scaffold', 'scaffold':'escaf', 'strand':'estrand'}), on=['scaffold'], how='left')
+        if np.sum((np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '+')):
+            ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '+'), ['right','rside','rextendible']] = ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '+'), ['escaf']].merge(scaffolds[['scaffold','right','rside','rextendible']].rename(columns={'scaffold':'escaf'}), on=['escaf'], how='left')[['right','rside','rextendible']].values
+            # Add scaffold_parts
+            added_parts = scaffold_parts.merge(ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '+'), ['escaf','scaffold','size']].rename(columns={'escaf':'scaffold', 'scaffold':'new_scaf'}), on=['scaffold'], how='inner')
+            added_parts['pos'] += added_parts['size']
+            added_parts['scaffold'] = added_parts['new_scaf']
+            ext_scaffold_parts.append( added_parts.drop(columns=['size','new_scaf']) )
+        ext_scaffolds.loc[np.isnan(ext_scaffolds['escaf']) == False, 'size'] += ext_scaffolds.loc[np.isnan(ext_scaffolds['escaf']) == False, ['escaf']].merge(scaffolds[['scaffold','size']].rename(columns={'scaffold':'escaf'}), on=['escaf'], how='left')['size'].values
+        if np.sum((np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '-')):
+            ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '-'), ['right','rside','rextendible']] = ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '-'), ['escaf']].merge(scaffolds[['scaffold','left','lside','lextendible']].rename(columns={'scaffold':'escaf'}), on=['escaf'], how='left')[['left','lside','lextendible']].values
+            # Add scaffold_parts
+            added_parts = scaffold_parts.merge(ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '-'), ['escaf','scaffold','size']].rename(columns={'escaf':'scaffold', 'scaffold':'new_scaf'}), on=['scaffold'], how='inner')
+            added_parts['pos'] = added_parts['size'] - added_parts['pos'] - 1
+            added_parts['scaffold'] = added_parts['new_scaf']
+            added_parts['reverse'] = added_parts['reverse'] == False
+            ext_scaffold_parts.append( added_parts.drop(columns=['size','new_scaf']) )
+        ext_scaffolds.drop(columns=['escaf','estrand'], inplace=True)
+#
+    ext_scaffolds['neg_size'] = 1
+    for p in range(-1, final_paths['pos'].min()-1, -1):
+        ext_scaffolds = ext_scaffolds.merge(final_paths.loc[final_paths['pos'] == p, ['center','scaffold','strand']].rename(columns={'center':'scaffold', 'scaffold':'escaf', 'strand':'estrand'}), on=['scaffold'], how='left')
+        if np.sum((np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '-')):
+            ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '-'), ['left','lside','lextendible']] = ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '-'), ['escaf']].merge(scaffolds[['scaffold','right','rside','rextendible']].rename(columns={'scaffold':'escaf'}), on=['escaf'], how='left')[['right','rside','rextendible']].values
+            # Add scaffold_parts
+            added_parts = scaffold_parts.merge(ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '-'), ['escaf','scaffold','neg_size']].rename(columns={'escaf':'scaffold', 'scaffold':'new_scaf'}), on=['scaffold'], how='inner')
+            added_parts['pos'] = (added_parts['pos'] + added_parts['neg_size']) * (-1)
+            added_parts['scaffold'] = added_parts['new_scaf']
+            added_parts['reverse'] = added_parts['reverse'] == False
+            ext_scaffold_parts.append( added_parts.drop(columns=['neg_size','new_scaf']) )
+        ext_scaffolds.loc[np.isnan(ext_scaffolds['escaf']) == False, 'neg_size'] += ext_scaffolds.loc[np.isnan(ext_scaffolds['escaf']) == False, ['escaf']].merge(scaffolds[['scaffold','size']].rename(columns={'scaffold':'escaf'}), on=['escaf'], how='left')['size'].values
+        if np.sum((np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '+')):
+            ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '+'), ['left','lside','lextendible']] = ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '+'), ['escaf']].merge(scaffolds[['scaffold','left','lside','lextendible']].rename(columns={'scaffold':'escaf'}), on=['escaf'], how='left')[['left','lside','lextendible']].values
+            # Add scaffold_parts
+            added_parts = scaffold_parts.merge(ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '+'), ['escaf','scaffold','neg_size']].rename(columns={'escaf':'scaffold', 'scaffold':'new_scaf'}), on=['scaffold'], how='inner')
+            added_parts['pos'] = (added_parts['neg_size'] - added_parts['pos'] - 1) * (-1)
+            added_parts['scaffold'] = added_parts['new_scaf']
+            ext_scaffold_parts.append( added_parts.drop(columns=['neg_size','new_scaf']) )
+        ext_scaffolds.drop(columns=['escaf','estrand'], inplace=True)
+    ext_scaffolds['size'] += ext_scaffolds['neg_size'] - 1
+    ext_scaffolds.drop(columns=['neg_size'], inplace=True)
+
+    # Set positions starting from 0
+    ext_scaffold_parts = pd.concat(ext_scaffold_parts)
+    ext_scaffold_parts.sort_values(['scaffold','pos'], inplace=True)
+    ext_scaffold_parts['pos'] = ext_scaffold_parts.groupby(['scaffold'], sort=False).cumcount()
+
+    scaffolds = ext_scaffolds
+    scaffolds.index = scaffolds['scaffold'].values
+    scaffold_parts = ext_scaffold_parts
+
+    return scaffolds, scaffold_parts
 
 def GetOriginalConnections(scaffolds, contig_parts):
     # Find original connections in contig_parts
@@ -1476,6 +1933,7 @@ def OrderByUnbrokenOriginalScaffolds(scaffolds, scaffold_parts, contig_parts):
     meta_scaffolds['rside'] = 'r'
     meta_scaffolds['lextendible'] = True
     meta_scaffolds['rextendible'] = True
+    meta_scaffolds['circular'] = False
     meta_scaffolds.rename(columns={'meta':'scaffold','lcon':'lscaf','lcon_side':'lscaf_side','rcon':'rscaf','rcon_side':'rscaf_side'}, inplace=True)
     meta_parts.rename(columns={'scaffold':'conpart','meta':'scaffold'}, inplace=True)
     meta_scaffolds, meta_parts = ScaffoldAlongGivenConnections(meta_scaffolds, meta_parts)
@@ -1715,10 +2173,10 @@ def FillGapsWithReads(scaffolds, scaffold_parts, mappings, contig_parts):
     
     return scaffold_table, scaffolds, scaffold_parts
 
-def ScaffoldContigs(contig_parts, bridges, mappings):
+def ScaffoldContigs(contig_parts, bridges, mappings, ploidy):
     # Each contig starts with being its own scaffold
     scaffold_parts = pd.DataFrame({'conpart': contig_parts.index.values, 'scaffold': contig_parts.index.values, 'pos': 0, 'reverse': False})
-    scaffolds = pd.DataFrame({'scaffold': contig_parts.index.values, 'left': contig_parts.index.values, 'lside':'l', 'right': contig_parts.index.values, 'rside':'r', 'lextendible':True, 'rextendible':True, 'size':1})
+    scaffolds = pd.DataFrame({'scaffold': contig_parts.index.values, 'left': contig_parts.index.values, 'lside':'l', 'right': contig_parts.index.values, 'rside':'r', 'lextendible':True, 'rextendible':True, 'circular':False, 'size':1})
 
     # Combine contigs into scaffolds on unique bridges
     unique_bridges = bridges.loc[(bridges['to_alt'] == 1) & (bridges['from_alt'] == 1), ['from','from_side','to','to_side']]
@@ -1727,18 +2185,16 @@ def ScaffoldContigs(contig_parts, bridges, mappings):
     scaffolds[['lscaf','rscaf']] = scaffolds[['lscaf','rscaf']].fillna(-1).astype(int)
     scaffolds[['lscaf_side','rscaf_side']] = scaffolds[['lscaf_side','rscaf_side']].fillna('')
     scaffolds, scaffold_parts = ScaffoldAlongGivenConnections(scaffolds, scaffold_parts)
+    scaffolds.drop(columns=['lscaf','lscaf_side','rscaf','rscaf_side'], inplace = True)
+    scaf_bridges = LiftBridgesFromContigsToScaffolds(bridges, scaffolds)
 
     # Build scaffold graph to find unique bridges over scaffolds with alternative connections
     long_range_connections = GetLongRangeConnections(bridges, mappings)
     long_range_connections = TransformContigConnectionsToScaffoldConnections(long_range_connections, scaffold_parts)
-    scaffold_graph = BuildScaffoldGraph(long_range_connections, scaffold_parts, bridges)
-    scaffolds, scaffold_parts, scaffold_graph, duplicated_scaffolds = FindUniquePaths(scaffolds, scaffold_parts, scaffold_graph) 
-    scaffolds, scaffold_parts = ScaffoldAlongGivenConnections(scaffolds, scaffold_parts) # Scaffold along the unique paths
+    scaffold_graph = BuildScaffoldGraph(long_range_connections, scaf_bridges)
+    scaffolds, scaffold_parts = TraverseScaffoldingGraph(scaffolds, scaffold_parts, scaffold_graph, contig_parts, scaf_bridges, ploidy)
 
     # Finish Scaffolding
-    scaffolds.drop(columns=['lscaf','lscaf_side','rscaf','rscaf_side'], inplace = True)
-    scaffolds.drop(duplicated_scaffolds, inplace=True)
-    scaffold_parts = scaffold_parts[np.isin(scaffold_parts['scaffold'], duplicated_scaffolds) == False].copy()
     scaffolds, scaffold_parts = OrderByUnbrokenOriginalScaffolds(scaffolds, scaffold_parts, contig_parts)
     scaffold_table, scaffolds, scaffold_parts = FillGapsWithReads(scaffolds, scaffold_parts, mappings, contig_parts) # Might break apart scaffolds again, if we cannot find a gap filling read
 
@@ -1797,10 +2253,10 @@ def GetOutputInfo(result_info, scaffolds, scaffold_parts, scaffold_table, contig
 
 def GetScaffoldExtendingMappings(mappings, contig_parts, scaffolds, max_dist_contig_end, min_extension, min_num_reads, pdf):
     mappings.drop(columns=['left_con','left_con_side' ,'right_con','right_con_side','num_mappings'], inplace=True)
-    
+
     # Only reads that map to the outter contigs in a scaffold are relevant
     mappings = mappings[ np.isin(mappings['conpart'], pd.concat([scaffolds.loc[scaffolds['lextendible'], 'left'], scaffolds.loc[scaffolds['rextendible'], 'right']]).values) ].copy()
-    
+
     # Reads need to extend the contig in the right direction
     mappings['con_start'] = contig_parts.iloc[mappings['conpart'].values, contig_parts.columns.get_loc('start')].values
     mappings['con_end'] = contig_parts.iloc[mappings['conpart'].values, contig_parts.columns.get_loc('end')].values
@@ -1810,7 +2266,7 @@ def GetScaffoldExtendingMappings(mappings, contig_parts, scaffolds, max_dist_con
     # Set extensions to zero that are in the wrong direction
     mappings.loc[ np.isin(mappings['conpart'], pd.concat([scaffolds.loc[scaffolds['lextendible'] & (scaffolds['lside'] == 'l'), 'left'], scaffolds.loc[scaffolds['rextendible'] & (scaffolds['rside'] == 'l'), 'right']]).values) == False, 'left_ext'] = 0
     mappings.loc[ np.isin(mappings['conpart'], pd.concat([scaffolds.loc[scaffolds['lextendible'] & (scaffolds['lside'] == 'r'), 'left'], scaffolds.loc[scaffolds['rextendible'] & (scaffolds['rside'] == 'r'), 'right']]).values) == False, 'right_ext'] = 0
-    
+
     # Set extensions to zero that are too far away from the contig_end
     mappings.loc[mappings['con_from']-mappings['con_start'] > max_dist_contig_end, 'left_ext'] = 0
     mappings.loc[mappings['con_end']-mappings['con_to'] > max_dist_contig_end, 'right_ext'] = 0
@@ -1878,27 +2334,28 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
             prefix = assembly_file.rsplit('.',1)[0]
 
     keep_all_subreads = False
-    subread_alignment_precision = 100
-    
+    alignment_precision = 100
+
     max_repeat_extension = 1000 # Expected to be bigger than or equal to min_mapping_length
     min_len_repeat_connection = 5000
     repeat_len_factor_unique = 10
     remove_duplicated_contigs = True
-    
+
     remove_zero_hit_contigs = True
     remove_short_contigs = True
     min_extension = 500
     max_dist_contig_end = 2000
     max_break_point_distance = 200
     merge_block_length = 10000
-    
+
     min_num_reads = 3
     min_factor_alternatives = 2
+    ploidy = 2 
     org_scaffold_trust = "basic" # blind: If there is a read that supports it use the org scaffold; Do not break contigs
                                  # full: If there is no confirmed other option use the org scaffold
                                  # basic: If there is no alternative bridge use the org scaffold
                                  # no: Do not give preference to org scaffolds
-    
+
     # Guarantee that outdir exists
     outdir = os.path.dirname(prefix)
     if outdir and not os.path.exists(outdir):
@@ -1909,23 +2366,23 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     if stats:
         pdf = PdfPages(stats)
         plt.ioff()
-        
+
     print( str(timedelta(seconds=clock())), "Reading in original assembly")
     contigs, contig_ids = ReadContigs(assembly_file)
     result_info = {}
     result_info = GetInputInfo(result_info, contigs)
-    
+
     print( str(timedelta(seconds=clock())), "Processing repeats")
     contigs, center_repeats = MaskRepeatEnds(contigs, repeat_file, contig_ids, max_repeat_extension, min_len_repeat_connection, repeat_len_factor_unique, remove_duplicated_contigs, pdf)
-    
+
     print( str(timedelta(seconds=clock())), "Filtering mappings")
-    mappings = ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, subread_alignment_precision, pdf)
+    mappings = ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, alignment_precision, pdf)
     contigs = RemoveUnmappedContigs(contigs, mappings, remove_zero_hit_contigs)
     mappings = RemoveUnanchoredMappings(mappings, contigs, center_repeats, min_mapping_length, pdf, max_dist_contig_end)
     del center_repeats
-    
+
     print( str(timedelta(seconds=clock())), "Account for left-over adapters")
-    mappings = BreakReadsAtAdapters(mappings, subread_alignment_precision, keep_all_subreads)
+    mappings = BreakReadsAtAdapters(mappings, alignment_precision, keep_all_subreads)
 
     print( str(timedelta(seconds=clock())), "Search for possible break points")
     if "blind" == org_scaffold_trust:
@@ -1936,7 +2393,7 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     mappings.drop(np.concatenate([spurious_break_indexes, non_informative_mappings]), inplace=True) # Remove not-accepted breaks from mappings and mappings that do not contain any information (mappings inside of contigs that do not overlap with breaks)
     del spurious_break_indexes, non_informative_mappings
 
-    contig_parts, contigs = GetContigParts(contigs, break_groups, remove_short_contigs, min_mapping_length, pdf)
+    contig_parts, contigs = GetContigParts(contigs, break_groups, remove_short_contigs, min_mapping_length, alignment_precision, pdf)
     result_info = GetBreakAndRemovalInfo(result_info, contigs, contig_parts)
     mappings = UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length)
     del break_groups, contigs, contig_ids
@@ -1945,7 +2402,7 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     bridges, contig_parts = GetBridges(mappings, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, pdf)
     
     print( str(timedelta(seconds=clock())), "Scaffold the contigs")
-    scaffolds, scaffold_parts, scaffold_table = ScaffoldContigs(contig_parts, bridges, mappings)
+    scaffolds, scaffold_parts, scaffold_table = ScaffoldContigs(contig_parts, bridges, mappings, ploidy)
     result_info = GetOutputInfo(result_info, scaffolds, scaffold_parts, scaffold_table, contig_parts)
 
     print( str(timedelta(seconds=clock())), "Search for possible extensions")
@@ -2311,7 +2768,7 @@ def MiniGapFinish(assembly_file, read_file, read_format, scaffold_file, output_f
         
         print( str(timedelta(seconds=clock())), "Finished" )
 
-def GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length, keep_all_subreads, subread_alignment_precision, min_length_contig_break, max_dist_contig_end):
+def GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length, keep_all_subreads, alignment_precision, min_length_contig_break, max_dist_contig_end):
     mappings = ReadPaf(mapping_file)
     
     # Filter mappings
@@ -2319,7 +2776,7 @@ def GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length, kee
     
     # Remove all but the best subread
     if not keep_all_subreads:
-        mappings = GetBestSubreads(mappings, subread_alignment_precision)
+        mappings = GetBestSubreads(mappings, alignment_precision)
     
     # Find mappings inside defined regions
     mappings['in_region'] = False
@@ -2547,7 +3004,7 @@ def DrawMappings(draw, fnt, regions, mappings, region_part_height, pixel_per_rea
 
 
 def MiniGapVisualize(region_defs, mapping_file, output, min_mapq, min_mapping_length, min_length_contig_break, keep_all_subreads):
-    subread_alignment_precision = 100
+    alignment_precision = 100
     max_dist_contig_end = 2000
     
     regions = []
@@ -2572,7 +3029,7 @@ def MiniGapVisualize(region_defs, mapping_file, output, min_mapq, min_mapping_le
                 sys.exit(1)
             
     # Prepare mappings
-    mappings = GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length, keep_all_subreads, subread_alignment_precision, min_length_contig_break, max_dist_contig_end)
+    mappings = GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length, keep_all_subreads, alignment_precision, min_length_contig_break, max_dist_contig_end)
     
     # Prepare drawing
     total_x = 1000
@@ -2627,8 +3084,8 @@ def Usage(module=""):
         print("  -h, --help                Display this help and exit")
         print("  -p, --prefix FILE         Prefix for output files ({assembly})")
         print("  -s, --stats FILE.pdf      Output file for plots with statistics regarding input parameters (deactivated)")
-        print("      --minLenBreak INT     Minimum length for a read to diverge from a contig to consider a contig break (700)")
-        print("      --minMapLength INT    Minimum length of individual mappings of reads (500)")
+        print("      --minLenBreak INT     Minimum length for a read to diverge from a contig to consider a contig break (600)")
+        print("      --minMapLength INT    Minimum length of individual mappings of reads (400)")
         print("      --minMapQ INT         Minimum mapping quality of reads (20)")
     elif "extend" == module:
         print("Usage: minigap.py extend -p {prefix} {all_vs_all}.paf")
@@ -2649,8 +3106,8 @@ def Usage(module=""):
         print("  -h, --help                Display this help and exit")
         print("  -o, --output FILE.pdf     Output file for visualization (mandatory)")
         print("      --keepAllSubreads     Shows all subreads instead of only the best")
-        print("      --minLenBreak INT     Minimum length for a read to diverge from a contig to consider a contig break (700)")
-        print("      --minMapLength INT    Minimum length of individual mappings of reads (500)")
+        print("      --minLenBreak INT     Minimum length for a read to diverge from a contig to consider a contig break (600)")
+        print("      --minMapLength INT    Minimum length of individual mappings of reads (400)")
         print("      --minMapQ INT         Minimum mapping quality of reads (20)")
         
 def main(argv):
@@ -2702,8 +3159,8 @@ def main(argv):
             
         prefix = False
         stats = None
-        min_length_contig_break = 700
-        min_mapping_length = 500
+        min_length_contig_break = 600
+        min_mapping_length = 400
         min_mapq = 20
         for opt, par in optlist:
             if opt in ("-h", "--help"):
@@ -2827,8 +3284,8 @@ def main(argv):
             
         output = False
         keep_all_subreads = False
-        min_length_contig_break = 700
-        min_mapping_length = 500
+        min_length_contig_break = 600
+        min_mapping_length = 400
         min_mapq = 20
         for opt, par in optlist:
             if opt in ("-h", "--help"):
