@@ -450,6 +450,7 @@ def ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, alignmen
 
 def RemoveUnmappedContigs(contigs, mappings, remove_zero_hit_contigs):
     # Schedule contigs for removal that don't have any high quality reads mapping to it
+    contigs['remove'] = False
     mapped_reads = np.bincount(mappings['t_id'], minlength=len(contigs))
     if remove_zero_hit_contigs:
         contigs.loc[0==mapped_reads, 'remove'] = True
@@ -620,72 +621,79 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
 
     if len(break_points):
         # Check how many reads support a break_point with breaks within +- max_break_point_distance
-        break_points['break_id'] = range(len(break_points))
-        break_points['group'] = ((break_points['contig_id'] != break_points['contig_id'].shift(1, fill_value=-1)) | (break_points['position']-max_break_point_distance > break_points['position'].shift(1, fill_value=0))).cumsum() # Group reads that potentially support each other
-        break_points = break_points.merge( break_points[['contig_id','group','position','mapq', 'connected']].rename(columns={'position':'supp_pos', 'mapq':'supp_mapq', 'connected':'supp_con'}), on=['contig_id','group'], how='outer') # Create one entry for every potentially supporting read
-        break_points = break_points[ (break_points['position']+max_break_point_distance >= break_points['supp_pos']) & (break_points['position']-max_break_point_distance <= break_points['supp_pos']) ].copy() # Filter reads that do not support
-        break_points.drop(columns=['group','supp_pos','mapq'], inplace=True)
-        break_points.rename(columns={'supp_mapq':'mapq'}, inplace=True)
-        break_points.sort_values(['break_id','mapq'], ascending=[True,False], inplace=True)
-        break_points = break_points.groupby(['break_id','contig_id','position','side','mapq','connected'], sort=False)['supp_con'].agg(['sum','size']).reset_index().rename(columns={'sum':'con_supp', 'size':'support'}) # Count supporting reads by mapping quality
-        break_points['support'] = break_points.groupby(['break_id'])['support'].cumsum() # Add support from higher mapping qualities to lower mapping qualities
-        break_points['con_supp'] = break_points.groupby(['break_id'])['con_supp'].cumsum()
-        
+        break_points['support'] = 1
+        break_points['con_supp'] = break_points['connected'].astype(int)
+        break_points.drop(columns=['connected'], inplace=True)
+        break_points = break_points.groupby(['contig_id','position','mapq']).sum().reset_index()
+        break_supp = []
+        for direction in ["plus","minus"]:
+            s = (1 if direction == "plus" else -1)
+            con_loop = True
+            while con_loop:
+                tmp_breaks = break_points.copy()
+                tmp_breaks['supp_pos'] = tmp_breaks['position'].shift(s, fill_value=-1)
+                if direction == "plus":
+                    tmp_breaks.loc[(tmp_breaks['contig_id'] != tmp_breaks['contig_id'].shift(s)) | (tmp_breaks['position'] > tmp_breaks['supp_pos']+max_break_point_distance), 'supp_pos'] = -1
+                else:
+                    tmp_breaks.loc[(tmp_breaks['contig_id'] != tmp_breaks['contig_id'].shift(s)) | (tmp_breaks['position'] < tmp_breaks['supp_pos']-max_break_point_distance), 'supp_pos'] = -1
+                tmp_breaks = tmp_breaks[tmp_breaks['supp_pos'] != -1].copy()
+                if len(tmp_breaks):
+                    break_supp.append(tmp_breaks.copy())
+                    s += (1 if direction == "plus" else -1)
+                else:
+                    con_loop = False
+        break_supp = pd.concat(break_supp).drop_duplicates()
+        break_supp = break_supp[break_supp['position'] != break_supp['supp_pos']].copy() # If we are at the same position we would multicount the values, when we do a cumsum later
+        break_supp['position'] = break_supp['supp_pos']
+        break_supp.drop(columns=['supp_pos'], inplace=True)
+                
+        break_points = pd.concat([break_points, break_supp]).groupby(['contig_id','position','mapq']).sum().reset_index()
+        break_points.sort_values(['contig_id','position','mapq'], ascending=[True,True,False], inplace=True)
+        # Add support from higher mapping qualities to lower mapping qualities
+        break_points['support'] = break_points.groupby(['contig_id','position'])['support'].cumsum()
+        break_points['con_supp'] = break_points.groupby(['contig_id','position'])['con_supp'].cumsum()
         # Require a support of at least min_num_reads at some mapping quality level
-        max_support = break_points.groupby(['break_id'], sort=False)['support'].agg(['max','size'])
+        max_support = break_points.groupby(['contig_id','position'], sort=False)['support'].agg(['max','size'])
         break_points = break_points[ np.repeat(max_support['max'].values, max_support['size'].values) >= min_num_reads].copy()
-    
+
     if len(break_points):
         # Check how many reads veto a break (continously map over the break region position +- (min_mapping_length+max_break_point_distance))
-        break_points['lower_mapq'] = np.where( break_points['break_id'] == break_points['break_id'].shift(-1, fill_value=-1), break_points['mapq'].shift(-1, fill_value=-1), -1 ) # Veto mapq must be higher than this (to avoid doubles later)
-        break_points['upper_mapq'] = np.where( break_points['break_id'] == break_points['break_id'].shift(1, fill_value=-1), break_points['mapq'], 256 ) # Veto mapq must be lower than or equal to this (to avoid doubles later)
-        break_points['merge_block'] = break_points['position'] // merge_block_length
+        break_pos = break_points[['contig_id','position']].drop_duplicates()
+        break_pos['merge_block'] = break_pos['position'] // merge_block_length
+        break_pos['num'] = break_pos.groupby(['contig_id','merge_block'], sort=False).cumcount()
         tmp_mappings = mappings.loc[ mappings['t_end'] - mappings['t_start'] >= 2*min_mapping_length + 2*max_break_point_distance, ['t_id','t_start','t_end','mapq'] ].copy() # Do not consider mappings that cannot fullfil veto requirements because they are too short
         tmp_mappings = tmp_mappings.loc[ np.repeat( tmp_mappings.index.values, tmp_mappings['t_end']//merge_block_length - tmp_mappings['t_start']//merge_block_length + 1 ) ].copy()
         tmp_mappings['merge_block'] = tmp_mappings.reset_index().groupby(['index']).cumcount().values + tmp_mappings['t_start']//merge_block_length
-        break_points = break_points.merge( tmp_mappings.rename(columns={'t_id':'contig_id', 'mapq':'veto_mapq'}), on=['contig_id','merge_block'], how='left') # Create one entry for every mapping that potentially overlaps the break
-        break_points.loc[np.isnan(break_points['veto_mapq']), 't_start'] = 0
-        break_points.loc[np.isnan(break_points['veto_mapq']), 't_end'] = sys.maxsize
-        break_points.loc[np.isnan(break_points['veto_mapq']), 'veto_mapq'] = -1
-        break_points['veto_mapq'] = break_points['veto_mapq'].astype(int)
-        break_points = break_points[(break_points['t_start']+min_mapping_length+max_break_point_distance <= break_points['position']) &
-                                    (break_points['t_end']-min_mapping_length-max_break_point_distance >= break_points['position'])].copy()
-        break_points.drop(columns=['merge_block','t_start','t_end'], inplace=True)
-        break_points.sort_values(['break_id','mapq','veto_mapq'], ascending=[True,False,False], inplace=True)
-        break_points = break_points.groupby(['break_id','contig_id','position','side','mapq','veto_mapq','lower_mapq','upper_mapq','con_supp','support'], sort=False).size().reset_index(name='vetos').reset_index()
-        break_points['vetos'] = break_points.groupby(['break_id','mapq'])['vetos'].cumsum() # Add vetos from higher mapping qualities to lower mapping qualities
-        break_points.loc[break_points['veto_mapq'] == -1, 'vetos'] = 0 # Where we set veto_mapq to -1 are no vetos present
-        break_points.loc[break_points['veto_mapq'] == -1, 'veto_mapq'] = break_points.loc[break_points['veto_mapq'] == -1, 'mapq']
-        
-        # Insert duplicates so that we haven entry with veto_mapq == mapq for every mapq
-        break_points['duplicate1'] = (break_points['veto_mapq'] > break_points['mapq']) & ((break_points['veto_mapq'].shift(-1, fill_value=256) < break_points['mapq']) | (break_points['break_id'] != break_points['break_id'].shift(-1, fill_value=-1)) | (break_points['mapq'] != break_points['mapq'].shift(-1, fill_value=-1)))# We can take the next higher veto_mapq to get the correct values for veto_mapq == mapq
-        break_points['duplicate2'] = (break_points['veto_mapq'] < break_points['mapq']) & ((break_points['break_id'] != break_points['break_id'].shift(1, fill_value=-1)) | (break_points['mapq'] != break_points['mapq'].shift(1, fill_value=-1))) # There is no higher veto_mapq to take the values from (i.e. vetos = 0)
-        break_points = break_points.iloc[ np.repeat(break_points.index.values, (break_points['duplicate1'] | break_points['duplicate2']).values.astype(int)+1) ].copy()
-        dups = (break_points['index'] == break_points['index'].shift(1, fill_value=False)) & break_points['duplicate1']
-        break_points.loc[dups, 'veto_mapq'] = break_points.loc[dups, 'mapq'].values
-        dups = (break_points['index'] == break_points['index'].shift(-1, fill_value=False)) & break_points['duplicate2']
-        break_points.loc[dups, 'veto_mapq'] = break_points.loc[dups, 'mapq'].values
-        break_points.loc[dups, 'vetos'] = 0
-        
-        # We have now one entry for every (support)mapq, veto_mapq pair. Now we need to merge the two mapq and keep the numbers correct
-        break_points = break_points[ (break_points['veto_mapq'] > break_points['lower_mapq']) & (break_points['veto_mapq'] <= break_points['upper_mapq']) ].copy()
-        break_points.loc[break_points['veto_mapq'] > break_points['mapq'], 'support'] = 0 # Since veto_mapq will be later the merged mapq, there is no support for this mapq
-        break_points.loc[break_points['veto_mapq'] > break_points['mapq'], 'con_supp'] = 0 
-        break_points.drop(columns=['mapq','lower_mapq','upper_mapq','duplicate1','duplicate2','index'], inplace=True)
-        break_points.rename(columns={'veto_mapq':'mapq'}, inplace=True)
-        
+        tmp_mappings.rename(columns={'t_id':'contig_id'}, inplace=True)
+        break_list = []
+        for n in range(break_pos['num'].max()+1):
+            tmp_breaks = break_pos[break_pos['num'] == n]
+            tmp_mappings = tmp_mappings[np.isin(tmp_mappings['contig_id'],tmp_breaks['contig_id'])].copy()
+            # Create one entry for every mapping that potentially overlaps the break
+            tmp_breaks = tmp_breaks.merge( tmp_mappings, on=['contig_id','merge_block'], how='inner')
+            break_list.append( tmp_breaks[(tmp_breaks['t_start']+min_mapping_length+max_break_point_distance <= tmp_breaks['position']) &
+                                          (tmp_breaks['t_end']-min_mapping_length-max_break_point_distance >= tmp_breaks['position'])].\
+                                   groupby(['contig_id','position','mapq']).size().reset_index(name='vetos') )
+
+        break_points = break_points.merge(pd.concat(break_list), on=['contig_id','position','mapq'], how='outer').fillna(0)
+        break_points.sort_values(['contig_id','position','mapq'], ascending=[True,True,False], inplace=True)
+        break_points.reset_index(inplace=True, drop=True)
+        break_points[['support', 'con_supp']] = break_points.groupby(['contig_id','position'], sort=False)[['support', 'con_supp']].cummax().astype(int)
+        break_points['vetos'] = break_points.groupby(['contig_id','position'], sort=False)['vetos'].cumsum().astype(int)
+
         # Remove break points that are vetoed
         break_points['vetoed'] = (break_points['vetos'] >= min_num_reads) & (break_points['con_supp'] < min_num_reads) & (break_points['vetos'] >= break_points['con_supp']*min_factor_alternatives) # If we have enough support, but not enough con_supp the bridge finding step would anyways reseal the break with a unique bridge, so don't even break it
-        break_points['vetoed'] = break_points.groupby(['break_id'])['vetoed'].cumsum().astype(bool) # Propagate vetos to lower mapping qualities
+        break_points['vetoed'] = break_points.groupby(['contig_id','position'])['vetoed'].cumsum().astype(bool) # Propagate vetos to lower mapping qualities
         break_points = break_points[break_points['vetoed'] == False].copy()
-        
+
         # Remove breaks that do not fullfil requirements and reduce accepted ones to a single entry per break_id
         break_points = break_points[break_points['support'] >= min_num_reads].copy()
-        break_points = break_points.groupby(['break_id'], sort=False).first().reset_index()
+        break_points = break_points.groupby(['contig_id','position'], sort=False).first().reset_index()
 
     if len(break_points):
         # Cluster break_points into groups, so that groups have a maximum length of 2*max_break_point_distance
         break_points['dist'] = np.where( break_points['contig_id'] != break_points['contig_id'].shift(1, fill_value=-1), -1, break_points['position'] - break_points['position'].shift(1, fill_value=0) )
+        break_points['break_id'] = range(len(break_points))
         break_points['group'] = pd.Series(np.where( (break_points['dist'] > 2*max_break_point_distance) | (-1 == break_points['dist']), break_points['break_id'], 0 )).cummax()
         break_points.loc[break_points['group'] != break_points['group'].shift(1, fill_value=-1), 'dist'] = -1
         break_groups = break_points.groupby(['contig_id','group'], sort=False)['position'].agg(['min','max','size']).reset_index()
@@ -739,15 +747,15 @@ def GetContigParts(contigs, break_groups, remove_short_contigs, min_mapping_leng
 
     contigs.loc[contigs['remove'], 'parts'] = 0
     
-    if pdf:
-        category = np.array(["deleted no coverage"]*len(contigs))
-        category[:] = "used"
-        category[ contigs['parts']>1 ] = "split"
-        category[ contigs['repeat_mask_right'] == 0 ] = "masked"
-        category[ (contigs['repeat_mask_right'] == 0) & contigs['remove'] ] = "deleted duplicate"
-        category[ (contigs['repeat_mask_right'] > 0) & contigs['remove'] ] = "deleted no coverage"
+#   if pdf:
+#        category = np.array(["deleted no coverage"]*len(contigs))
+#        category[:] = "used"
+#        category[ contigs['parts']>1 ] = "split"
+#        category[ contigs['repeat_mask_right'] == 0 ] = "masked"
+#        category[ (contigs['repeat_mask_right'] == 0) & contigs['remove'] ] = "deleted duplicate"
+#        category[ (contigs['repeat_mask_right'] > 0) & contigs['remove'] ] = "deleted no coverage"
 
-        PlotHist(pdf, "Original contig length", "# Contigs", contigs['length'], category=category, catname="type", logx=True)
+#        PlotHist(pdf, "Original contig length", "# Contigs", contigs['length'], category=category, catname="type", logx=True)
         
     contig_parts = pd.DataFrame({'contig':np.repeat(np.arange(len(contigs)), contigs['parts']), 'part':1, 'start':0})
     contig_parts['part'] = contig_parts.groupby('contig').cumsum()['part']-1
@@ -789,7 +797,7 @@ def GetContigParts(contigs, break_groups, remove_short_contigs, min_mapping_leng
     tmp_contigs['len'] = tmp_contigs[('org_dist_left','first')] + tmp_contigs[('length','sum')] + tmp_contigs[('org_dist_right','sum')]
     tmp_contigs['from_part'] = contigs.iloc[tmp_contigs['from'], contigs.columns.get_loc('last_part')].values
     tmp_contigs['to_part'] = contigs.iloc[tmp_contigs['to'], contigs.columns.get_loc('first_part')].values
-    
+
     tmp_contigs = tmp_contigs[(tmp_contigs['from_part'] >= 0) & (tmp_contigs['to_part'] >= 0)].copy()
     contig_parts.iloc[tmp_contigs['from_part'], contig_parts.columns.get_loc('org_dist_right')] = tmp_contigs['len'].values
     contig_parts.iloc[tmp_contigs['to_part'], contig_parts.columns.get_loc('org_dist_left')] = tmp_contigs['len'].values
@@ -799,19 +807,19 @@ def GetContigParts(contigs, break_groups, remove_short_contigs, min_mapping_leng
     contig_parts.loc[contig_parts['part'].shift(-1, fill_value=0) > 0, 'org_dist_right'] = 0
     
     # Assign repeat connections
-    contig_parts['rep_con_left'] = -1
-    contig_parts['rep_con_side_left'] = ''
-    contig_parts['rep_con_right'] = -1
-    contig_parts['rep_con_side_right'] = ''
-    tmp_contigs = contigs[(contigs['parts']>0)]
-    contig_parts.iloc[tmp_contigs['first_part'].values, contig_parts.columns.get_loc('rep_con_left')] = np.where(tmp_contigs['rep_con_side_left'] == 'l',
-                                                          contigs.iloc[tmp_contigs['rep_con_left'].values, contigs.columns.get_loc('first_part')].values,
-                                                          contigs.iloc[tmp_contigs['rep_con_left'].values, contigs.columns.get_loc('last_part')].values)
-    contig_parts.iloc[tmp_contigs['first_part'].values, contig_parts.columns.get_loc('rep_con_side_left')] = tmp_contigs['rep_con_side_left'].values
-    contig_parts.iloc[tmp_contigs['last_part'].values, contig_parts.columns.get_loc('rep_con_right')] = np.where(tmp_contigs['rep_con_side_right'] == 'l',
-                                                          contigs.iloc[tmp_contigs['rep_con_right'].values, contigs.columns.get_loc('first_part')].values,
-                                                          contigs.iloc[tmp_contigs['rep_con_right'].values, contigs.columns.get_loc('last_part')].values)
-    contig_parts.iloc[tmp_contigs['last_part'].values, contig_parts.columns.get_loc('rep_con_side_right')] = tmp_contigs['rep_con_side_right'].values
+#    contig_parts['rep_con_left'] = -1
+#    contig_parts['rep_con_side_left'] = ''
+#    contig_parts['rep_con_right'] = -1
+#    contig_parts['rep_con_side_right'] = ''
+#    tmp_contigs = contigs[(contigs['parts']>0)]
+#    contig_parts.iloc[tmp_contigs['first_part'].values, contig_parts.columns.get_loc('rep_con_left')] = np.where(tmp_contigs['rep_con_side_left'] == 'l',
+#                                                          contigs.iloc[tmp_contigs['rep_con_left'].values, contigs.columns.get_loc('first_part')].values,
+#                                                          contigs.iloc[tmp_contigs['rep_con_left'].values, contigs.columns.get_loc('last_part')].values)
+#    contig_parts.iloc[tmp_contigs['first_part'].values, contig_parts.columns.get_loc('rep_con_side_left')] = tmp_contigs['rep_con_side_left'].values
+#    contig_parts.iloc[tmp_contigs['last_part'].values, contig_parts.columns.get_loc('rep_con_right')] = np.where(tmp_contigs['rep_con_side_right'] == 'l',
+#                                                          contigs.iloc[tmp_contigs['rep_con_right'].values, contigs.columns.get_loc('first_part')].values,
+#                                                          contigs.iloc[tmp_contigs['rep_con_right'].values, contigs.columns.get_loc('last_part')].values)
+#    contig_parts.iloc[tmp_contigs['last_part'].values, contig_parts.columns.get_loc('rep_con_side_right')] = tmp_contigs['rep_con_side_right'].values
 
     return contig_parts, contigs
 
@@ -824,10 +832,10 @@ def GetBreakAndRemovalInfo(result_info, contigs, contig_parts):
     removed_length = contigs.loc[ np.isin(contigs.reset_index()['index'], part_count['contig']) == False, 'length' ].values
     result_info['removed'] = {}
     result_info['removed']['num'] = len(removed_length)
-    result_info['removed']['total'] = np.sum(removed_length)
-    result_info['removed']['min'] = np.min(removed_length)
-    result_info['removed']['max'] = np.max(removed_length)
-    result_info['removed']['mean'] = np.mean(removed_length)
+    result_info['removed']['total'] = np.sum(removed_length) if len(removed_length) else 0
+    result_info['removed']['min'] = np.min(removed_length) if len(removed_length) else 0
+    result_info['removed']['max'] = np.max(removed_length) if len(removed_length) else 0
+    result_info['removed']['mean'] = np.mean(removed_length) if len(removed_length) else 0
     
     return result_info
 
@@ -1338,13 +1346,14 @@ def BuildScaffoldGraph(long_range_connections, scaf_bridges):
         scaffold_graph.loc[(scaffold_graph['scaf'+str(s)] == scaffold_graph['from']) & (scaffold_graph['strand'+str(s)] == np.where(scaffold_graph['from_side'] == 'r', '+', '-')), 'rep_len'] = s
         reps.append( scaffold_graph[(scaffold_graph['rep_len'] == s) & (scaffold_graph['rep_len']+1 < scaffold_graph['length'])].copy() )
     reps = pd.concat(reps)
-    reps = reps.merge(scaffold_graph.reset_index()[['from','from_side','index']].rename(columns={'index':'red_ind'}), on=['from','from_side'], how='inner') # Add all possibly redundant indexes in scaffold_graph
-    reps = reps[scaffold_graph.loc[reps['red_ind'], 'length'].values == reps['length'] - reps['rep_len']].copy() # Filter out all non-redundant entries
-    for s in range(1, (reps['length']-reps['rep_len']).max()):
-        for rl in range(1, reps['rep_len'].max()):
-            if s+rl < reps['length'].max():
-                reps = reps[(reps['rep_len'] != rl) | (reps['length']-rl-1 < s) | ((scaffold_graph.loc[reps['red_ind'], 'scaf'+str(s)].values == reps['scaf'+str(s+rl)]) & (scaffold_graph.loc[reps['red_ind'], 'strand'+str(s)].values == reps['strand'+str(s+rl)]))].copy()
-    scaffold_graph.drop(index=np.unique(reps['red_ind'].values), inplace=True)
+    if len(reps):
+        reps = reps.merge(scaffold_graph.reset_index()[['from','from_side','index']].rename(columns={'index':'red_ind'}), on=['from','from_side'], how='inner') # Add all possibly redundant indexes in scaffold_graph
+        reps = reps[scaffold_graph.loc[reps['red_ind'], 'length'].values == reps['length'] - reps['rep_len']].copy() # Filter out all non-redundant entries
+        for s in range(1, (reps['length']-reps['rep_len']).max()):
+            for rl in range(1, reps['rep_len'].max()):
+                if s+rl < reps['length'].max():
+                    reps = reps[(reps['rep_len'] != rl) | (reps['length']-rl-1 < s) | ((scaffold_graph.loc[reps['red_ind'], 'scaf'+str(s)].values == reps['scaf'+str(s+rl)]) & (scaffold_graph.loc[reps['red_ind'], 'strand'+str(s)].values == reps['strand'+str(s+rl)]))].copy()
+        scaffold_graph.drop(index=np.unique(reps['red_ind'].values), inplace=True)
 
     return scaffold_graph
 
@@ -2335,19 +2344,19 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
 
     keep_all_subreads = False
     alignment_precision = 100
-
+#
     max_repeat_extension = 1000 # Expected to be bigger than or equal to min_mapping_length
     min_len_repeat_connection = 5000
     repeat_len_factor_unique = 10
     remove_duplicated_contigs = True
-
+#
     remove_zero_hit_contigs = True
     remove_short_contigs = True
     min_extension = 500
     max_dist_contig_end = 2000
     max_break_point_distance = 200
     merge_block_length = 10000
-
+#
     min_num_reads = 3
     min_factor_alternatives = 2
     ploidy = 2 
@@ -2373,13 +2382,13 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     result_info = GetInputInfo(result_info, contigs)
 
     print( str(timedelta(seconds=clock())), "Processing repeats")
-    contigs, center_repeats = MaskRepeatEnds(contigs, repeat_file, contig_ids, max_repeat_extension, min_len_repeat_connection, repeat_len_factor_unique, remove_duplicated_contigs, pdf)
+#    contigs, center_repeats = MaskRepeatEnds(contigs, repeat_file, contig_ids, max_repeat_extension, min_len_repeat_connection, repeat_len_factor_unique, remove_duplicated_contigs, pdf)
 
     print( str(timedelta(seconds=clock())), "Filtering mappings")
     mappings = ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, alignment_precision, pdf)
     contigs = RemoveUnmappedContigs(contigs, mappings, remove_zero_hit_contigs)
-    mappings = RemoveUnanchoredMappings(mappings, contigs, center_repeats, min_mapping_length, pdf, max_dist_contig_end)
-    del center_repeats
+#    mappings = RemoveUnanchoredMappings(mappings, contigs, center_repeats, min_mapping_length, pdf, max_dist_contig_end)
+#    del center_repeats
 
     print( str(timedelta(seconds=clock())), "Account for left-over adapters")
     mappings = BreakReadsAtAdapters(mappings, alignment_precision, keep_all_subreads)
