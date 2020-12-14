@@ -409,6 +409,40 @@ def MaskRepeatEnds(contigs, repeat_file, contig_ids, max_repeat_extension, min_l
 
     return contigs, repeat_table
 
+def GetThresholdsFromReadLenDist(mappings, num_read_len_groups):
+    # Get read length distribution
+    read_len_dist = mappings[['q_name','q_len']].drop_duplicates()
+    read_len_dist = read_len_dist['q_len'].sort_values().values
+
+    return read_len_dist[[len(read_len_dist)//num_read_len_groups*i for i in range(1,num_read_len_groups)]]
+
+def GetBinnedCoverage(mappings, length_thresholds):
+    # Count coverage for bins of threshold length
+    cov_counts = []
+    for cur_cov_thres in length_thresholds:
+        cov_count = mappings.loc[mappings['t_end']-mappings['t_start'] >= cur_cov_thres, ['t_name','t_len','t_start','t_end']].copy()
+        cov_count['offset'] = cov_count['t_len']%cur_cov_thres // 2
+        cov_count['start_bin'] = (cov_count['t_start'] - cov_count['offset'] - 1) // cur_cov_thres + 1
+        cov_count['end_bin'] = (cov_count['t_end'] - cov_count['offset']) // cur_cov_thres
+        cov_count = cov_count.loc[cov_count['start_bin'] < cov_count['end_bin'], ['t_name','start_bin','end_bin']]
+        cov_count = cov_count.loc[np.repeat(cov_count.index.values, (cov_count['end_bin']-cov_count['start_bin']).values)]
+        cov_count.reset_index(inplace=True)
+        cov_count['bin'] = cov_count.groupby(['index'], sort=False).cumcount() + cov_count['start_bin']
+        cov_count = cov_count.groupby(['t_name','bin']).size().reset_index(name='count')
+        cov_count['bin_size'] = cur_cov_thres
+        cov_counts.append(cov_count)
+
+    return pd.concat(cov_counts)
+
+def GetCoverageThresholds(cov_counts, min_num_reads, cov_bin_fraction):
+    thresholds = cov_counts.groupby(['bin_size','count']).size().reset_index(name='nbins')
+    cov_bins = thresholds.groupby(['bin_size'])['nbins'].agg(['sum','size']).reset_index()
+    thresholds['threshold'] = np.repeat( (cov_bins['sum']*cov_bin_fraction).values.astype(int), cov_bins['size'].values)
+    thresholds['nbin_sum'] = thresholds.groupby(['bin_size'], sort=False)['nbins'].cumsum()
+    thresholds = thresholds[thresholds['nbin_sum'] > thresholds['threshold']].groupby(['bin_size']).first().reset_index()[['bin_size','count']].rename(columns={'bin_size':'length','count':'cov_thresh'})
+#
+    return thresholds[thresholds['cov_thresh'] > min_num_reads].copy()
+
 def GetBestSubreads(mappings, alignment_precision):
     # Return if we do not have subreads
 
@@ -432,9 +466,14 @@ def GetBestSubreads(mappings, alignment_precision):
     
     return mappings
 
-def ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, alignment_precision, pdf):
+def ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, alignment_precision, min_num_reads, cov_bin_fraction, num_read_len_groups, pdf):
     mappings = ReadPaf(mapping_file)
 
+    length_thresholds = GetThresholdsFromReadLenDist(mappings, num_read_len_groups)
+    cov_counts = GetBinnedCoverage(mappings, length_thresholds)
+    cov_thresholds = GetCoverageThresholds(cov_counts, min_num_reads, cov_bin_fraction)
+    cov_counts.rename(columns={'count':'count_all'}, inplace=True)
+        
     # Filter low mapping qualities
     if pdf:
         PlotHist(pdf, "Mapping quality", "# Mappings", mappings['mapq'], threshold=min_mapq, logy=True)
@@ -444,9 +483,13 @@ def ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, alignmen
     if not keep_all_subreads:
         mappings = GetBestSubreads(mappings, alignment_precision)
 
+    cov_counts = cov_counts.merge(GetBinnedCoverage(mappings, length_thresholds), on=['bin_size','t_name','bin'], how='outer').fillna(0)
+    cov_counts['count'] = cov_counts['count'].astype(np.int64)
+    
     mappings['t_id'] = itemgetter(*mappings['t_name'])(contig_ids)
+    cov_counts['t_id'] = itemgetter(*cov_counts['t_name'])(contig_ids)
 
-    return mappings
+    return mappings, cov_counts, cov_thresholds
 
 def RemoveUnmappedContigs(contigs, mappings, remove_zero_hit_contigs):
     # Schedule contigs for removal that don't have any high quality reads mapping to it
@@ -561,6 +604,13 @@ def GetBrokenMappings(mappings, max_dist_contig_end, min_length_contig_break, pd
 
     return left_breaks, right_breaks
 
+def GetMinNumReads(cov_thresholds, req_length):
+    if len(cov_thresholds) == 0 or cov_thresholds['length'].values[-1] < req_length:
+        return 0
+
+    return cov_thresholds.loc[cov_thresholds['length'] >= req_length, 'cov_thresh'].values[0]
+    
+
 def GetNonInformativeMappings(mappings, contigs, min_extension, break_groups, left_breaks, right_breaks):
     # All reads that are not extending contigs enough and do not have multiple mappings are non informative (except they overlap breaks)
     non_informative_mappings = mappings[(min_extension > mappings['q_start']) & (min_extension > mappings['q_len']-mappings['q_end']) & (mappings['q_name'].shift(1, fill_value='') != mappings['q_name']) & (mappings['q_name'].shift(-1, fill_value='') != mappings['q_name'])].index
@@ -585,7 +635,7 @@ def GetNonInformativeMappings(mappings, contigs, min_extension, break_groups, le
         
     return non_informative_mappings
 
-def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, min_length_contig_break, max_break_point_distance, min_num_reads, min_factor_alternatives, min_extension, merge_block_length, org_scaffold_trust, pdf):
+def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, min_length_contig_break, max_break_point_distance, min_num_reads, min_extension, merge_block_length, org_scaffold_trust, cov_thresholds, pdf):
     if pdf:
         loose_reads_ends = mappings[(mappings['t_start'] > max_dist_contig_end) & np.where('+' == mappings['strand'], -1 == mappings['prev_con'], -1 == mappings['next_con'])]
         loose_reads_ends_length = np.where('+' == loose_reads_ends['strand'], loose_reads_ends['q_start']-loose_reads_ends['read_start'], loose_reads_ends['read_end']-loose_reads_ends['q_end'])
@@ -681,9 +731,17 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
         break_points[['support', 'con_supp']] = break_points.groupby(['contig_id','position'], sort=False)[['support', 'con_supp']].cummax().astype(int)
         break_points['vetos'] = break_points.groupby(['contig_id','position'], sort=False)['vetos'].cumsum().astype(int)
 
-        # Remove break points that are vetoed
-        break_points['vetoed'] = (break_points['vetos'] >= min_num_reads) & (break_points['con_supp'] < min_num_reads) & (break_points['vetos'] >= break_points['con_supp']*min_factor_alternatives) # If we have enough support, but not enough con_supp the bridge finding step would anyways reseal the break with a unique bridge, so don't even break it
+        # Remove breaks where the vetos fullfil the length dependent coverage thresholds and the breaks do not
+        min_reads_breaks = GetMinNumReads(cov_thresholds, min_mapping_length+max_break_point_distance+min_length_contig_break)
+        min_reads_veto = GetMinNumReads(cov_thresholds, 2*(min_mapping_length+max_break_point_distance))
+        break_points['vetoed'] = (break_points['vetos'] >= min_reads_veto) & (break_points['support'] < min_reads_breaks)
         break_points['vetoed'] = break_points.groupby(['contig_id','position'])['vetoed'].cumsum().astype(bool) # Propagate vetos to lower mapping qualities
+        break_points = break_points[break_points['vetoed'] == False].copy()
+
+        # Remove break points that will reconnected anyways
+        break_points['vetoed'] = (break_points['vetos'] >= min_num_reads) & (break_points['con_supp'] < min_num_reads) # If we have enough support, but not enough con_supp the bridge finding step would anyways reseal the break with a unique bridge, so don't even break it
+        break_points['vetoed'] = break_points.groupby(['contig_id','position'])['vetoed'].cumsum().astype(bool) # Propagate vetos to lower mapping qualities
+        unconnected_break_points = break_points[break_points['vetoed'] == True].copy() # Store unconnected break points to later check if we can insert additional sequence to provide a connection in a second run
         break_points = break_points[break_points['vetoed'] == False].copy()
 
         # Remove breaks that do not fullfil requirements and reduce accepted ones to a single entry per break_id
@@ -714,7 +772,7 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
         break_groups = []
 
     if len(break_groups):
-        # Information about not-accepted breaks
+        # Find mappings belonging to accepted breaks
         keep_row_left = np.full(len(left_breaks),False)
         keep_row_right = np.full(len(right_breaks),False)
         for i in range(break_groups['num'].max()+1):
@@ -725,6 +783,17 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
             keep_row_left = keep_row_left | ((lbreaks['start'].values <= left_breaks['t_end'].values) & (left_breaks['t_end'].values <= lbreaks['end'].values))
             keep_row_right = keep_row_right | ((rbreaks['start'].values <= right_breaks['t_start'].values) & (right_breaks['t_start'].values <= rbreaks['end'].values))
 
+        # Find reads where all mappings are either connected to itself or belong to accepted breaks
+        self_con = pd.DataFrame({ 'q_name': np.concatenate([ left_breaks['q_name'], right_breaks['q_name'] ]),
+                                  'self_con': np.concatenate([ np.where('+' == left_breaks['strand'], left_breaks['t_id'] == left_breaks['next_con'], left_breaks['t_id'] == left_breaks['prev_con']) | keep_row_left,
+                                                               np.where('+' == right_breaks['strand'], right_breaks['t_id'] == right_breaks['prev_con'], right_breaks['t_id'] == right_breaks['next_con']) | keep_row_right ]) })
+        self_con = self_con.groupby(['q_name'])['self_con'].agg(['sum','size']).reset_index()
+        self_con = self_con.loc[self_con['sum'] == self_con['size'], 'q_name']
+        left_breaks.merge(self_con, on='q_name', how='left', indicator=True)
+        keep_row_left = keep_row_left | (left_breaks.merge(self_con, on='q_name', how='left', indicator=True)['_merge'] == "both").values
+        keep_row_right = keep_row_right | (right_breaks.merge(self_con, on='q_name', how='left', indicator=True)['_merge'] == "both").values
+
+        # Mappings not belonging to accepted breaks or connecting to itself are spurious
         spurious_break_indexes = np.unique(np.concatenate([left_breaks[np.logical_not(keep_row_left)].index, right_breaks[np.logical_not(keep_row_right)].index]))
     else:
         # We don't have breaks, so all are spurious
@@ -732,7 +801,29 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
 
     non_informative_mappings = GetNonInformativeMappings(mappings, contigs, min_extension, break_groups, left_breaks, right_breaks)
 
-    return break_groups, spurious_break_indexes, non_informative_mappings
+    # Handle unconnected break points
+    unconnected_break_points = unconnected_break_points.groupby(['contig_id','position']).first().reset_index()[['contig_id','position']]
+    unconnected_break_points['dist'] = np.where( unconnected_break_points['contig_id'] != unconnected_break_points['contig_id'].shift(1, fill_value=-1), -1, unconnected_break_points['position'] - unconnected_break_points['position'].shift(1, fill_value=0) )
+    unconnected_break_points['group'] = pd.Series(np.where( (unconnected_break_points['dist'] > max_break_point_distance) | (-1 == unconnected_break_points['dist']), 1, 0 )).cumsum()
+    unconnected_break_points = unconnected_break_points.groupby(['contig_id','group'])['position'].agg(['min','max']).reset_index().rename(columns={'min':'bfrom','max':'bto'}).drop(columns=['group'])
+
+    comb_breaks = pd.concat([left_breaks,right_breaks])
+    comb_breaks['bside'] = np.repeat( ['left','right'], [len(left_breaks),len(right_breaks)])
+    unconnected_break_points = unconnected_break_points.merge(comb_breaks, left_on=['contig_id'], right_on=['t_id'], how='left')
+    unconnected_break_points['bpos'] = np.where(unconnected_break_points['bside'] == 'left', unconnected_break_points['t_end'], unconnected_break_points['t_start'])
+    unconnected_break_points = unconnected_break_points[(unconnected_break_points['bpos'] >= unconnected_break_points['bfrom'] - max_break_point_distance) & (unconnected_break_points['bpos'] <= unconnected_break_points['bto'] + max_break_point_distance)].copy()
+    unconnected_break_points.sort_values(['contig_id','bfrom','bto','bside'], inplace=True)
+    count_breaks = unconnected_break_points.groupby(['contig_id','bfrom','bto','bside'], sort=False).size()
+    unconnected_break_points['bsupport'] = np.repeat(count_breaks.values, count_breaks.values)
+    unconnected_break_points = unconnected_break_points[unconnected_break_points['bsupport'] >= min_reads_breaks].copy()
+    
+    # If the unconnected break points are connected to another contig on the other side, the extension will likely take care of it and we don't need to do anything
+    unconnected_break_points['connected'] = np.where((unconnected_break_points['bside'] == 'left') != ('+' == unconnected_break_points['strand']), 0 <= unconnected_break_points['next_con'], 0 <= unconnected_break_points['prev_con'])
+    count_breaks = unconnected_break_points.groupby(['contig_id','bfrom','bto','bside'], sort=False)['connected'].agg(['sum','size'])
+    unconnected_break_points['bcon_supp'] = np.repeat(count_breaks['sum'].values, count_breaks['size'].values)
+    unconnected_break_points = unconnected_break_points[(unconnected_break_points['bcon_supp'] < min_reads_breaks) & (unconnected_break_points['bsupport'] - unconnected_break_points['bcon_supp'] >= min_reads_breaks)].copy()
+
+    return break_groups, spurious_break_indexes, non_informative_mappings, unconnected_break_points
 
 def GetContigParts(contigs, break_groups, remove_short_contigs, min_mapping_length, alignment_precision, pdf):
     # Create a dataframe with the contigs being split into parts and contigs scheduled for removal not included
@@ -840,8 +931,8 @@ def GetBreakAndRemovalInfo(result_info, contigs, contig_parts):
     return result_info
 
 def UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length):
-    # Duplicate mappings for every contig part
-    mappings = mappings.merge(contig_parts.reset_index()[['contig', 'index', 'part', 'start', 'end']].rename(columns={'contig':'t_id', 'index':'conpart', 'start':'part_start', 'end':'part_end'}), on=['t_id'], how='left')
+    # Duplicate mappings for every contig part (using inner, because some contigs have been removed (e.g. being too short)) 
+    mappings = mappings.merge(contig_parts.reset_index()[['contig', 'index', 'part', 'start', 'end']].rename(columns={'contig':'t_id', 'index':'conpart', 'start':'part_start', 'end':'part_end'}), on=['t_id'], how='inner')
     
     # Remove mappings that do not touch a contig part or only less than min_mapping_length bases
     mappings = mappings[(mappings['t_start']+min_mapping_length < mappings['part_end']) & (mappings['t_end']-min_mapping_length > mappings['part_start'])].copy()
@@ -885,9 +976,17 @@ def UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length):
     mappings['right_con_side'] = np.where('-' == mappings['strand'], mappings['prev_side'], mappings['next_side'])
     mappings.loc[-1 == mappings['right_con'], 'right_con_side'] = ''
     
+    # Get distance to connected contigparts
+    mappings['next_dist'] = mappings['q_start'].shift(-1, fill_value=0) - mappings['q_end']
+    mappings['prev_dist'] = mappings['q_start'] - mappings['q_end'].shift(1, fill_value=0)
+    mappings['left_con_dist'] = np.where('+' == mappings['strand'], mappings['prev_dist'], mappings['next_dist'])
+    mappings.loc[-1 == mappings['left_con'], 'left_con_dist'] = 0
+    mappings['right_con_dist'] = np.where('-' == mappings['strand'], mappings['prev_dist'], mappings['next_dist'])
+    mappings.loc[-1 == mappings['right_con'], 'right_con_dist'] = 0
+    
     # Select the columns we still need
     mappings.rename(columns={'q_name':'read_name'}, inplace=True)
-    mappings = mappings[['read_name', 'read_start', 'read_end', 'read_from', 'read_to', 'strand', 'conpart', 'con_from', 'con_to', 'left_con', 'left_con_side', 'right_con', 'right_con_side', 'mapq', 'matches']].copy()
+    mappings = mappings[['read_name', 'read_start', 'read_end', 'read_from', 'read_to', 'strand', 'conpart', 'con_from', 'con_to', 'left_con', 'left_con_side', 'left_con_dist', 'right_con', 'right_con_side', 'right_con_dist', 'mapq', 'matches']].copy()
     
     # Count how many mappings each read has
     mappings['num_mappings'] = 1
@@ -900,17 +999,22 @@ def CreateBridges(left_bridge, right_bridge):
     bridges = pd.concat([left_bridge,right_bridge], ignore_index=True, sort=False)
     
     # Duplicate bridges and switch from to, so that both sortings have all relevant bridges
-    bridges = pd.concat([bridges[['from','from_side','to','to_side','min_mapq']],
-                         bridges.rename(columns={'from':'to', 'to':'from', 'from_side':'to_side', 'to_side':'from_side'})[['from','from_side','to','to_side','min_mapq']]], ignore_index=True, sort=False)
+    bridges = pd.concat([bridges[['from','from_side','to','to_side','min_mapq','distance']],
+                         bridges.rename(columns={'from':'to', 'to':'from', 'from_side':'to_side', 'to_side':'from_side'})[['from','from_side','to','to_side','min_mapq','distance']]], ignore_index=True, sort=False)
     
     # Bundle identical bridges
-    bridges = bridges.groupby(['from','from_side','to','to_side','min_mapq']).size().reset_index(name='count')
+    bridged_dists = bridges.groupby(['from','from_side','to','to_side'])['distance'].agg(['mean','min','max']).reset_index().rename(columns={'mean':'mean_dist','min':'min_dist','max':'max_dist'})
+    bridged_dists['mean_dist'] = np.round(bridged_dists['mean_dist']).astype(int)
+    bridges = bridges.groupby(['from','from_side','to','to_side','min_mapq'])['distance'].size().reset_index(name='count')
     
     # Get cumulative counts (counts for this trust level and higher)
+    bridges['count'] = bridges['count'] // 2 # Not counting all reads twice (because each bridge is bridged from both sides)
     bridges.sort_values(['from','from_side','to','to_side','min_mapq'], ascending=[True, True, True, True, False], inplace=True)
     bridges['cumcount'] = bridges.groupby(['from','from_side','to','to_side'], sort=False)['count'].cumsum().values
-    
     bridges.drop(columns=['count'], inplace=True)
+    
+    # Add distances back in
+    bridges = bridges.merge(bridged_dists, on=['from','from_side','to','to_side'], how='left')
 
     return bridges
 
@@ -922,6 +1026,13 @@ def MarkOrgScaffoldBridges(bridges, contig_parts, requirement):
 
     return bridges
 
+def GetMinNumReadsVect(cov_thresholds, req_length):
+    read_threshold_vector = np.zeros(len(req_length), dtype=int)
+    for tlen, thresh in zip(reversed(cov_thresholds['length']), reversed(cov_thresholds['cov_thresh'])):
+        read_threshold_vector[tlen >= req_length] = thresh
+#
+    return read_threshold_vector
+
 def CountAlternatives(bridges):
     bridges.sort_values(['to', 'to_side','from','from_side'], inplace=True)
     alternatives = bridges.groupby(['to','to_side'], sort=False).size().values
@@ -932,7 +1043,7 @@ def CountAlternatives(bridges):
 
     return bridges
 
-def FilterBridges(bridges, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, pdf=None):
+def FilterBridges(bridges, min_factor_alternatives, min_num_reads, org_scaffold_trust, cov_thresholds, min_mapping_length, contig_parts, pdf=None):
     if org_scaffold_trust in ["blind", "full"]:
         bridges = MarkOrgScaffoldBridges(bridges, contig_parts, -1)
         if "blind" == org_scaffold_trust:
@@ -942,54 +1053,63 @@ def FilterBridges(bridges, min_factor_alternatives, min_num_reads, org_scaffold_
             bridges.loc[('l' == bridges['from_side']) & (-1 != contig_parts.iloc[bridges['from'].values, contig_parts.columns.get_loc('org_dist_left')].values), 'org_scaf_conflict'] = True
             bridges.loc[('r' == bridges['to_side']) & (-1 != contig_parts.iloc[bridges['to'].values, contig_parts.columns.get_loc('org_dist_right')].values), 'org_scaf_conflict'] = True
             bridges.loc[('l' == bridges['to_side']) & (-1 != contig_parts.iloc[bridges['to'].values, contig_parts.columns.get_loc('org_dist_left')].values), 'org_scaf_conflict'] = True
-#
+
             bridges = bridges[(False == bridges['org_scaf_conflict']) | bridges['org_scaffold']]
-#
+
             bridges.drop(columns=['org_scaf_conflict'], inplace=True)
     elif "basic" == org_scaffold_trust:
         bridges = MarkOrgScaffoldBridges(bridges, contig_parts, 0) # Do not connect previously broken contigs through low quality reads
     else:
         bridges['org_scaffold'] = False # Do not use original scaffolds
-#
+
     # Set lowq flags for all bridges that don't fulfill min_num_reads except for the ones with additional support from original scaffolds
-    bridges['high_q'] = np.where((bridges['cumcount'] < min_num_reads) & (bridges['org_scaffold'] == False), False, True)
-#
-    # Set lowq flags for all bridges that are below min_factor_alternatives compared to other lowq bridges (so that we do not have borderline decisions where +-1 count decides that one bridge is accepted and the other not)
-    iterations_from = 2
-    iterations_to = 2
-    while 1 < iterations_from and 1 < iterations_to:
-        bridges.sort_values(['from','from_side','min_mapq','cumcount'], ascending=[True, True, False, False], inplace=True)
-        bridges.reset_index(inplace=True, drop=True) # To make sure that the following merge does not destroy our sorting
-        num_lowq = np.sum(bridges['high_q'] == False)
-        old_num_lowq = 0
-        iterations_from = 0
-        while old_num_lowq != num_lowq:
-            vetos = bridges[bridges['high_q'] == False].groupby(['from','from_side','min_mapq'], sort=False)['cumcount'].max().reset_index(name="veto")
-            bridges = bridges.merge(vetos, on=['from','from_side','min_mapq'], how='left')
-            bridges.loc[bridges['cumcount'] < bridges['veto']*min_factor_alternatives, 'high_q'] = False
-            bridges.drop(columns=['veto'], inplace=True)
-            old_num_lowq = num_lowq
-            num_lowq = np.sum(bridges['high_q'] == False)
-            iterations_from += 1
-#
-        bridges.sort_values(['to','to_side','min_mapq','cumcount'], ascending=[True, True, False, False], inplace=True)
-        bridges.reset_index(inplace=True, drop=True) # To make sure that the following merge does not destroy our sorting
-        num_lowq = np.sum(bridges['high_q'] == False)
-        old_num_lowq = 0
-        iterations_to = 0
-        while old_num_lowq != num_lowq:
-            vetos = bridges[bridges['high_q'] == False].groupby(['to','to_side','min_mapq'], sort=False)['cumcount'].max().reset_index(name="veto")
-            bridges = bridges.merge(vetos, on=['to','to_side','min_mapq'], how='left')
-            bridges.loc[bridges['cumcount'] < bridges['veto']*min_factor_alternatives, 'high_q'] = False
-            bridges.drop(columns=['veto'], inplace=True)
-            old_num_lowq = num_lowq
-            num_lowq = np.sum(bridges['high_q'] == False)
-            iterations_to += 1
-#
+    bridges['low_q'] = (bridges['cumcount'] < min_num_reads) & (bridges['org_scaffold'] == False)
+    
+    # Set lowq flags for all bridges that are not above min_factor_alternatives compared to other lowq bridges (so that we do not have borderline decisions where +-1 count decides that one bridge is accepted and the other not)
+    old_num_lowq = np.sum(bridges['low_q'])
+    bridges.sort_values(['from','from_side','min_mapq','cumcount'], ascending=[True, True, False, True], inplace=True)
+    bridges['from_group'] = ( (bridges['from'] != bridges['from'].shift(1)) | (bridges['from_side'] != bridges['from_side'].shift(1)) | bridges['org_scaffold'] |
+                              (bridges['min_mapq'] != bridges['min_mapq'].shift(1)) | (bridges['cumcount'] > np.ceil(bridges['cumcount'].shift(1, fill_value = 0)*min_factor_alternatives)) ).astype(int).cumsum()
+    bridges['low_q'] = bridges.groupby(['from_group'], sort=False)['low_q'].cumsum().astype(bool)
+    
+    bridges.sort_values(['to','to_side','min_mapq','cumcount'], ascending=[True, True, False, True], inplace=True)
+    bridges['to_group'] = ( (bridges['to'] != bridges['to'].shift(1)) | (bridges['to_side'] != bridges['to_side'].shift(1)) | bridges['org_scaffold'] |
+                          (bridges['min_mapq'] != bridges['min_mapq'].shift(1)) | (bridges['cumcount'] > np.ceil(bridges['cumcount'].shift(1, fill_value = 0)*min_factor_alternatives)) ).astype(int).cumsum()
+    bridges['low_q'] = bridges.groupby(['to_group'], sort=False)['low_q'].cumsum().astype(bool)
+    
+    num_lowq = np.sum(bridges['low_q'])
+    while old_num_lowq != num_lowq:
+        bridges.sort_values(['from_group','cumcount'], ascending=[True, True], inplace=True)
+        bridges['low_q'] = bridges.groupby(['from_group'], sort=False)['low_q'].cumsum().astype(bool)
+        bridges.sort_values(['to_group','cumcount'], ascending=[True, True], inplace=True)
+        bridges['low_q'] = bridges.groupby(['to_group'], sort=False)['low_q'].cumsum().astype(bool)
+        old_num_lowq = num_lowq
+        num_lowq = np.sum(bridges['low_q'])
+
     # Remove low quality bridges
-    bridges = bridges[bridges['high_q']].copy()
-    bridges.drop(columns=['high_q'], inplace=True)
-#
+    bridges = bridges[bridges['low_q'] == False].copy()
+    bridges.drop(columns=['low_q','from_group','to_group'], inplace=True)
+    
+    # Set highq flags for all bridges that fulfill length dependent thresholds or have additional support from original scaffolds or do not have alternatives
+    alternatives = bridges.groupby(['to','to_side','min_mapq'], sort=False).size().values
+    bridges['to_alt'] = np.repeat(alternatives, alternatives)
+    bridges.sort_values(['from','from_side','min_mapq'], inplace=True)
+    alternatives = bridges.groupby(['from','from_side','min_mapq'], sort=False).size().values
+    bridges['from_alt'] = np.repeat(alternatives, alternatives)
+    bridges['highq'] = (bridges['cumcount'] >= GetMinNumReadsVect(cov_thresholds, bridges['mean_dist']+2*min_mapping_length)) | bridges['org_scaffold'] | ((bridges['to_alt'] == 1) & (bridges['from_alt'] == 1))
+    
+    # Add highq flags if all alternatives would be removed from both sides otherwise
+    alternatives = bridges.groupby(['from','from_side','min_mapq'], sort=False)['highq'].agg(['sum','size'])
+    bridges['from_highq'] = np.repeat(alternatives['sum'].values, alternatives['size'].values)
+    bridges.sort_values(['to','to_side','min_mapq'], inplace=True)
+    alternatives = bridges.groupby(['to','to_side','min_mapq'], sort=False)['highq'].agg(['sum','size'])
+    bridges['to_highq'] = np.repeat(alternatives['sum'].values, alternatives['size'].values)
+    bridges.loc[(bridges['from_highq'] == 0) & (bridges['to_highq'] == 0), 'highq'] = True
+    
+    # Only keep high quality bridges
+    bridges = bridges[bridges['highq']].copy()
+    bridges.drop(columns=['highq','from_highq','to_highq'], inplace=True)
+
     #  Remove bridges that compete with a bridge with a higher trust level
     bridges.sort_values(['from','from_side','min_mapq'], ascending=[True, True, False], inplace=True)
     bridges['max_highq_mapq'] = bridges.groupby(['from','from_side'], sort=False)['min_mapq'].cummax()
@@ -997,10 +1117,10 @@ def FilterBridges(bridges, min_factor_alternatives, min_num_reads, org_scaffold_
     bridges['max_highq_mapq2'] = bridges.groupby(['to','to_side'], sort=False)['min_mapq'].cummax()
     bridges = bridges[np.maximum(bridges['max_highq_mapq'], bridges['max_highq_mapq2']) <= bridges['min_mapq']].copy()
     bridges.drop(columns=['min_mapq','max_highq_mapq','max_highq_mapq2'], inplace=True)
-#
+    
     # Reduce all identical bridges to one
     bridges.drop_duplicates(inplace=True)
-#
+
     if "full" == org_scaffold_trust:
         # Remove ambiguous bridges that compeat with the original scaffold
         bridges.sort_values(['from','from_side','to','to_side'], inplace=True)
@@ -1010,20 +1130,20 @@ def FilterBridges(bridges, min_factor_alternatives, min_num_reads, org_scaffold_
         org_scaffolds = bridges.groupby(['to','to_side'], sort=False)['org_scaffold'].agg(['size','sum'])
         bridges['org_to'] = np.repeat(org_scaffolds['sum'].values, org_scaffolds['size'].values)
         bridges = bridges[ bridges['org_scaffold'] | ((0 == bridges['org_from']) & (0 == bridges['org_to'])) ].copy()
-#
+
     # Count alternatives
     bridges.drop(columns=['org_scaffold'], inplace=True)
     bridges = CountAlternatives(bridges)
     bridges['from'] = bridges['from'].astype(int)
     bridges['to'] = bridges['to'].astype(int)
     bridges.rename(columns={'cumcount':'bcount'}, inplace=True)
-#
+
     return bridges
 
-def GetBridges(mappings, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, pdf):
+def GetBridges(mappings, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, cov_thresholds, min_mapping_length, pdf):
     # Get bridges
-    left_bridge = mappings.loc[mappings['left_con'] >= 0, ['conpart','left_con','left_con_side','mapq']].copy()
-    left_bridge.rename(columns={'conpart':'from','left_con':'to','left_con_side':'to_side','mapq':'from_mapq'}, inplace=True)
+    left_bridge = mappings.loc[mappings['left_con'] >= 0, ['conpart','left_con','left_con_side','left_con_dist','mapq']].copy()
+    left_bridge.rename(columns={'conpart':'from','left_con':'to','left_con_side':'to_side','mapq':'from_mapq','left_con_dist':'distance'}, inplace=True)
     left_bridge['from_side'] = 'l'
     left_bridge['to_mapq'] = np.where('+' == mappings['strand'], mappings['mapq'].shift(1, fill_value = -1), mappings['mapq'].shift(-1, fill_value = -1))[mappings['left_con'] >= 0]
     left_bridge['min_mapq'] = np.where(left_bridge['to_mapq'] < left_bridge['from_mapq'], left_bridge['to_mapq'], left_bridge['from_mapq'])
@@ -1031,8 +1151,8 @@ def GetBridges(mappings, min_factor_alternatives, min_num_reads, org_scaffold_tr
     left_bridge.loc[left_bridge['from'] > left_bridge['to'], ['from', 'from_side', 'to', 'to_side', 'min_mapq']] = left_bridge.loc[left_bridge['from'] > left_bridge['to'], ['to', 'to_side', 'from', 'from_side', 'min_mapq']].values
     left_bridge['min_mapq'] = left_bridge['min_mapq'].astype(int)
     
-    right_bridge = mappings.loc[mappings['right_con'] >= 0, ['conpart','right_con','right_con_side','mapq']].copy()
-    right_bridge.rename(columns={'conpart':'from','right_con':'to','right_con_side':'to_side','mapq':'from_mapq'}, inplace=True)
+    right_bridge = mappings.loc[mappings['right_con'] >= 0, ['conpart','right_con','right_con_side','right_con_dist','mapq']].copy()
+    right_bridge.rename(columns={'conpart':'from','right_con':'to','right_con_side':'to_side','mapq':'from_mapq','right_con_dist':'distance'}, inplace=True)
     right_bridge['from_side'] = 'r'
     right_bridge['to_mapq'] = np.where('-' == mappings['strand'], mappings['mapq'].shift(1, fill_value = -1), mappings['mapq'].shift(-1, fill_value = -1))[mappings['right_con'] >= 0]
     right_bridge['min_mapq'] = np.where(right_bridge['to_mapq'] < right_bridge['from_mapq'], right_bridge['to_mapq'], right_bridge['from_mapq'])
@@ -1041,7 +1161,7 @@ def GetBridges(mappings, min_factor_alternatives, min_num_reads, org_scaffold_tr
     right_bridge['min_mapq'] = right_bridge['min_mapq'].astype(int)
     
     bridges = CreateBridges(left_bridge, right_bridge)
-    bridges = FilterBridges(bridges, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts)
+    bridges = FilterBridges(bridges, min_factor_alternatives, min_num_reads, org_scaffold_trust, cov_thresholds, min_mapping_length, contig_parts, pdf)
 
     # Break original scaffolds for sides with alternative bridges
     contig_parts['conpart'] = range(len(contig_parts))
@@ -1503,42 +1623,47 @@ def FindBubblesAndUniquePaths(scaffolds, scaffold_parts, scaffold_graph, ploidy)
             all_paths = all_paths.merge(scaffold_graph[['from','from_side','length'] + [col for sublist in [['scaf'+str(s),'strand'+str(s)] for s in range(1,scaffold_graph['length'].max())] for col in sublist]].rename(columns={**{'from':'mscaf', 'from_side':'mside', 'length':'new_len'}, **{('scaf'+str(s)):('cscaf'+str(s+cs)) for s in range(scaffold_graph['length'].max())}, **{('strand'+str(s)):('cstrand'+str(s+cs)) for s in range(scaffold_graph['length'].max())}}), on=['mscaf','mside'], how='left')
             all_paths['ext_id'] = range(len(all_paths))
 
-            # If the current scaffold is repeated later on, try the extension for all and take the first that works
-            rep_extensions = [all_paths[['ext_id']].copy()]
-            rep_extensions[0]['shift'] = 0
-            for s in range(cs+1, all_paths['length'].max()):
-                rep_extensions.append( all_paths.loc[(all_paths['mscaf'] == all_paths['scaf'+str(s)]) & (all_paths['strand'+str(cs)] == all_paths['strand'+str(s)]), ['ext_id']].copy() )
-                rep_extensions[-1]['shift'] = s-cs
-            rep_extensions = pd.concat(rep_extensions)
-            all_paths = all_paths.merge(rep_extensions, on=['ext_id'], how='left')
+            if np.isnan(all_paths['new_len'].max()):
+                all_paths['remove'] = True
+                all_paths.drop(columns=[col for col in all_paths.columns if (col[:5] == 'cscaf') or (col[:7] == 'cstrand')], inplace=True)
+                all_paths.drop(columns=['ext_id'], inplace=True)
+            else:
+                # If the current scaffold is repeated later on, try the extension for all and take the first that works
+                rep_extensions = [all_paths[['ext_id']].copy()]
+                rep_extensions[0]['shift'] = 0
+                for s in range(cs+1, all_paths['length'].max()):
+                    rep_extensions.append( all_paths.loc[(all_paths['mscaf'] == all_paths['scaf'+str(s)]) & (all_paths['strand'+str(cs)] == all_paths['strand'+str(s)]), ['ext_id']].copy() )
+                    rep_extensions[-1]['shift'] = s-cs
+                rep_extensions = pd.concat(rep_extensions)
+                all_paths = all_paths.merge(rep_extensions, on=['ext_id'], how='left')
 
-            # Create additional columns if we need them
-            all_paths['new_len'] += cs
-            for s in range(all_paths['length'].max(), (all_paths['new_len']+all_paths['shift']).max().astype(int)):
-                all_paths['scaf'+str(s)] = np.nan 
-                all_paths['strand'+str(s)] = np.nan
+                # Create additional columns if we need them
+                all_paths['new_len'] += cs
+                for s in range(all_paths['length'].max(), (all_paths['new_len']+all_paths['shift']).max().astype(int)):
+                    all_paths['scaf'+str(s)] = np.nan 
+                    all_paths['strand'+str(s)] = np.nan
 
-            all_paths.loc[np.isnan(all_paths['new_len']), 'remove'] = True # If we don't have an extension remove the path
-            for s in range(cs+1,all_paths['new_len'].max().astype(int)):
-                for shift in range(all_paths['shift'].max()+1):
-                    if s+shift < (all_paths['new_len']+all_paths['shift']).max().astype(int):
-                        # If the extension diverges from the path on the overlap remove it
-                        all_paths.loc[(all_paths['shift'] == shift) & (np.isnan(all_paths['scaf'+str(s+shift)]) == False) & (np.isnan(all_paths['cscaf'+str(s)]) == False) & ((all_paths['scaf'+str(s+shift)] != all_paths['cscaf'+str(s)]) | (all_paths['strand'+str(s+shift)] != all_paths['cstrand'+str(s)])), 'remove'] = True
-                        # Update extended values
-                        all_paths.loc[(all_paths['shift'] == shift) & (all_paths['remove'] == False) & np.isnan(all_paths['scaf'+str(s+shift)]) & (np.isnan(all_paths['cscaf'+str(s)]) == False), ['strand'+str(s+shift),'scaf'+str(s+shift)]] = all_paths.loc[(all_paths['shift'] == shift) & (all_paths['remove'] == False) & np.isnan(all_paths['scaf'+str(s+shift)]) & (np.isnan(all_paths['cscaf'+str(s)]) == False), ['cstrand'+str(s), 'cscaf'+str(s)]].values
+                all_paths.loc[np.isnan(all_paths['new_len']), 'remove'] = True # If we don't have an extension remove the path
+                for s in range(cs+1,all_paths['new_len'].max().astype(int)):
+                    for shift in range(all_paths['shift'].max()+1):
+                        if s+shift < (all_paths['new_len']+all_paths['shift']).max().astype(int):
+                            # If the extension diverges from the path on the overlap remove it
+                            all_paths.loc[(all_paths['shift'] == shift) & (np.isnan(all_paths['scaf'+str(s+shift)]) == False) & (np.isnan(all_paths['cscaf'+str(s)]) == False) & ((all_paths['scaf'+str(s+shift)] != all_paths['cscaf'+str(s)]) | (all_paths['strand'+str(s+shift)] != all_paths['cstrand'+str(s)])), 'remove'] = True
+                            # Update extended values
+                            all_paths.loc[(all_paths['shift'] == shift) & (all_paths['remove'] == False) & np.isnan(all_paths['scaf'+str(s+shift)]) & (np.isnan(all_paths['cscaf'+str(s)]) == False), ['strand'+str(s+shift),'scaf'+str(s+shift)]] = all_paths.loc[(all_paths['shift'] == shift) & (all_paths['remove'] == False) & np.isnan(all_paths['scaf'+str(s+shift)]) & (np.isnan(all_paths['cscaf'+str(s)]) == False), ['cstrand'+str(s), 'cscaf'+str(s)]].values
 
-            all_paths['new_len'] += all_paths['shift'] # Add this only after the loop so that we don't increase the maximum for s in the loop, because we separately add the shift there
-            all_paths.drop(columns=[col for col in all_paths.columns if (col[:5] == 'cscaf') or (col[:7] == 'cstrand')], inplace=True)
+                all_paths['new_len'] += all_paths['shift'] # Add this only after the loop so that we don't increase the maximum for s in the loop, because we separately add the shift there
+                all_paths.drop(columns=[col for col in all_paths.columns if (col[:5] == 'cscaf') or (col[:7] == 'cstrand')], inplace=True)
 
-            # Take for every repeated scaffold the first that does not diverge from the path or the last if all diverge
-            all_paths['keep'] = all_paths['remove'] == False
-            all_paths['keep'] = all_paths.groupby(['ext_id'])['keep'].cumsum()-all_paths['keep']
-            all_paths = all_paths[all_paths['keep'] == 0].copy()
-            all_paths = all_paths.groupby(['ext_id']).last().reset_index(drop=True)
-            all_paths.drop(columns=['shift','keep'], inplace=True)
+                # Take for every repeated scaffold the first that does not diverge from the path or the last if all diverge
+                all_paths['keep'] = all_paths['remove'] == False
+                all_paths['keep'] = all_paths.groupby(['ext_id'])['keep'].cumsum()-all_paths['keep']
+                all_paths = all_paths[all_paths['keep'] == 0].copy()
+                all_paths = all_paths.groupby(['ext_id']).last().reset_index(drop=True)
+                all_paths.drop(columns=['shift','keep'], inplace=True)
 
-            # Finish the removal selection
-            all_paths.loc[all_paths['new_len'] <= all_paths['length'], 'remove'] = True # If we don't gain length it is not an extension
+                # Finish the removal selection
+                all_paths.loc[all_paths['new_len'] <= all_paths['length'], 'remove'] = True # If we don't gain length it is not an extension
             all_paths['extended'] = all_paths['remove'] == False
             all_paths.loc[(all_paths['length'] > cs+1), 'remove'] = False # If we have possibilities for extensions later on, we don't remove the path
             all_paths.drop(columns=['mscaf','mside'], inplace=True)
@@ -1563,10 +1688,10 @@ def FindBubblesAndUniquePaths(scaffolds, scaffold_parts, scaffold_graph, ploidy)
     unique_paths = bubbles[bubbles['alts'] == 1].copy()
     unique_paths.drop(columns=['alts'], inplace=True)
     bubbles = bubbles[bubbles['alts'] > 1].copy()
-
+    
     unique_paths.sort_values(['from','from_side','to','to_side'], inplace=True)
     unique_paths.drop_duplicates(inplace=True)
-
+    
     bubbles.sort_values(['from','from_side','to','to_side'], inplace=True)
     bubbles.drop_duplicates(inplace=True)
 
@@ -1592,56 +1717,64 @@ def GroupConnectedScaffoldsIntoKnots(unique_paths, bubbles, loops, unique_extens
     cunique_extensions = unique_extensions.copy()
 
     # Group all connected scaffolds
-    cbubbles['id'] = range(len(cbubbles))
     conns = []
-    conns.append(cbubbles[['id', 'from']].rename(columns={'id':'conn', 'from':'scaffold'}))
-    conns.append(cbubbles[['id', 'to']].rename(columns={'id':'conn', 'to':'scaffold'}))
-    for s in range(1,cbubbles['length'].max()+1):
-        conns.append(cbubbles.loc[np.isnan(cbubbles['scaf'+str(s)]) == False, ['id', 'scaf'+str(s)]].rename(columns={'id':'conn', ('scaf'+str(s)):'scaffold'}))
-        conns[-1]['scaffold'] = conns[-1]['scaffold'].astype(int)
+    if len(cbubbles):
+        cbubbles['id'] = range(len(cbubbles))
+        conns.append(cbubbles[['id', 'from']].rename(columns={'id':'conn', 'from':'scaffold'}))
+        conns.append(cbubbles[['id', 'to']].rename(columns={'id':'conn', 'to':'scaffold'}))
+        for s in range(1,cbubbles['length'].max()+1):
+            conns.append(cbubbles.loc[np.isnan(cbubbles['scaf'+str(s)]) == False, ['id', 'scaf'+str(s)]].rename(columns={'id':'conn', ('scaf'+str(s)):'scaffold'}))
+            conns[-1]['scaffold'] = conns[-1]['scaffold'].astype(int)
 
-    cunique_paths['id'] = range(len(cbubbles), len(cbubbles)+len(cunique_paths))
-    conns.append(cunique_paths[['id', 'from']].rename(columns={'id':'conn', 'from':'scaffold'}))
-    conns.append(cunique_paths[['id', 'to']].rename(columns={'id':'conn', 'to':'scaffold'}))
-    for s in range(1,cunique_paths['length'].max()+1):
-        conns.append(cunique_paths.loc[np.isnan(cunique_paths['scaf'+str(s)]) == False, ['id', 'scaf'+str(s)]].rename(columns={'id':'conn', ('scaf'+str(s)):'scaffold'}))
-        conns[-1]['scaffold'] = conns[-1]['scaffold'].astype(int)
+    if len(cunique_paths):
+        cunique_paths['id'] = range(len(cbubbles), len(cbubbles)+len(cunique_paths))
+        conns.append(cunique_paths[['id', 'from']].rename(columns={'id':'conn', 'from':'scaffold'}))
+        conns.append(cunique_paths[['id', 'to']].rename(columns={'id':'conn', 'to':'scaffold'}))
+        for s in range(1,cunique_paths['length'].max()+1):
+            conns.append(cunique_paths.loc[np.isnan(cunique_paths['scaf'+str(s)]) == False, ['id', 'scaf'+str(s)]].rename(columns={'id':'conn', ('scaf'+str(s)):'scaffold'}))
+            conns[-1]['scaffold'] = conns[-1]['scaffold'].astype(int)
 
-    cloops['id'] = range(len(cbubbles)+len(cunique_paths), len(cbubbles)+len(cunique_paths)+len(cloops))
-    conns.append(cloops[['id', 'from']].rename(columns={'id':'conn', 'from':'scaffold'}))
-    for s in range(1,cloops['loop_len'].max()+1):
-        conns.append(cloops.loc[np.isnan(cloops['scaf'+str(s)]) == False, ['id', 'scaf'+str(s)]].rename(columns={'id':'conn', ('scaf'+str(s)):'scaffold'}))
-        conns[-1]['scaffold'] = conns[-1]['scaffold'].astype(int)
+    if len(cloops):
+        cloops['id'] = range(len(cbubbles)+len(cunique_paths), len(cbubbles)+len(cunique_paths)+len(cloops))
+        conns.append(cloops[['id', 'from']].rename(columns={'id':'conn', 'from':'scaffold'}))
+        for s in range(1,cloops['loop_len'].max()+1):
+            conns.append(cloops.loc[np.isnan(cloops['scaf'+str(s)]) == False, ['id', 'scaf'+str(s)]].rename(columns={'id':'conn', ('scaf'+str(s)):'scaffold'}))
+            conns[-1]['scaffold'] = conns[-1]['scaffold'].astype(int)
 
-    cunique_extensions['id'] = range(len(cbubbles)+len(cunique_paths)+len(cloops), len(cbubbles)+len(cunique_paths)+len(cloops)+len(cunique_extensions))
-    conns.append(cunique_extensions[['id', 'from']].rename(columns={'id':'conn', 'from':'scaffold'}))
-    for s in range(1,cunique_extensions['unique_len'].max()+1):
-        conns.append(cunique_extensions.loc[np.isnan(cunique_extensions['scaf'+str(s)]) == False, ['id', 'scaf'+str(s)]].rename(columns={'id':'conn', ('scaf'+str(s)):'scaffold'}))
-        conns[-1]['scaffold'] = conns[-1]['scaffold'].astype(int)
+    if len(cunique_extensions):
+        cunique_extensions['id'] = range(len(cbubbles)+len(cunique_paths)+len(cloops), len(cbubbles)+len(cunique_paths)+len(cloops)+len(cunique_extensions))
+        conns.append(cunique_extensions[['id', 'from']].rename(columns={'id':'conn', 'from':'scaffold'}))
+        for s in range(1,cunique_extensions['unique_len'].max()+1):
+            conns.append(cunique_extensions.loc[np.isnan(cunique_extensions['scaf'+str(s)]) == False, ['id', 'scaf'+str(s)]].rename(columns={'id':'conn', ('scaf'+str(s)):'scaffold'}))
+            conns[-1]['scaffold'] = conns[-1]['scaffold'].astype(int)
 
-    conns = pd.concat(conns)
-    conns.sort_values(['conn'], inplace=True)
-    knots = scaffolds[['scaffold']].copy()
-    knots['knot'] = 0
-    knots['new_knot'] = range(len(knots))
-    while np.sum((np.isnan(knots['new_knot']) == False) & (knots['knot'] != knots['new_knot'])):
-        knots.loc[np.isnan(knots['new_knot']) == False, 'knot'] = knots.loc[np.isnan(knots['new_knot']) == False, 'new_knot'].astype(int)
+
+    if len(conns) == 0:
+        knots = []
+    else:
+        conns = pd.concat(conns)
+        conns.sort_values(['conn'], inplace=True)
+        knots = scaffolds[['scaffold']].copy()
+        knots['knot'] = 0
+        knots['new_knot'] = range(len(knots))
+        while np.sum((np.isnan(knots['new_knot']) == False) & (knots['knot'] != knots['new_knot'])):
+            knots.loc[np.isnan(knots['new_knot']) == False, 'knot'] = knots.loc[np.isnan(knots['new_knot']) == False, 'new_knot'].astype(int)
+            knots.drop(columns=['new_knot'], inplace=True)
+            tmp_conns = conns.merge(knots, on=['scaffold'], how='left')
+            min_knot = tmp_conns.groupby(['conn'], sort=False)['knot'].agg(['min','size'])
+            tmp_conns['knot'] = np.repeat(min_knot['min'].values, min_knot['size'].values)
+            knots = knots.merge(tmp_conns.groupby(['scaffold'])['knot'].min().reset_index(name='new_knot'), on=['scaffold'], how='left')
+
+        # Remove all knots that only contain a single scaffold
         knots.drop(columns=['new_knot'], inplace=True)
-        tmp_conns = conns.merge(knots, on=['scaffold'], how='left')
-        min_knot = tmp_conns.groupby(['conn'], sort=False)['knot'].agg(['min','size'])
-        tmp_conns['knot'] = np.repeat(min_knot['min'].values, min_knot['size'].values)
-        knots = knots.merge(tmp_conns.groupby(['scaffold'])['knot'].min().reset_index(name='new_knot'), on=['scaffold'], how='left')
+        knots.sort_values(['knot'], inplace=True)
+        knot_size = knots.groupby(['knot'], sort=False).size()
+        knots = knots[np.repeat(knot_size.values > 1, knot_size.values)].copy()
 
-    # Remove all knots that only contain a single scaffold
-    knots.drop(columns=['new_knot'], inplace=True)
-    knots.sort_values(['knot'], inplace=True)
-    knot_size = knots.groupby(['knot'], sort=False).size()
-    knots = knots[np.repeat(knot_size.values > 1, knot_size.values)].copy()
-
-    # Get scaffold sizes (in nucleotides)
-    conlen = pd.DataFrame({'conpart':range(len(contig_parts)), 'length':(contig_parts['end'].values - contig_parts['start'].values)})
-    knots = knots.merge(scaffold_parts[['conpart','scaffold']].merge(conlen.rename(columns={'contig':'conpart'}), on=['conpart'], how='left').groupby(['scaffold'])['length'].sum().reset_index(name='scaf_len'), on=['scaffold'], how='left')
-    knots.sort_values(['knot','scaf_len'], ascending=[True,False], inplace=True)
+        # Get scaffold sizes (in nucleotides)
+        conlen = pd.DataFrame({'conpart':range(len(contig_parts)), 'length':(contig_parts['end'].values - contig_parts['start'].values)})
+        knots = knots.merge(scaffold_parts[['conpart','scaffold']].merge(conlen.rename(columns={'contig':'conpart'}), on=['conpart'], how='left').groupby(['scaffold'])['length'].sum().reset_index(name='scaf_len'), on=['scaffold'], how='left')
+        knots.sort_values(['knot','scaf_len'], ascending=[True,False], inplace=True)
 
     return knots
 
@@ -1836,63 +1969,65 @@ def TraverseScaffoldingGraph(scaffolds, scaffold_parts, scaffold_graph, contig_p
             included_scaffolds = cur_start['scaffold'].values
         knots = knots[np.isin(knots['scaffold'], included_scaffolds) == False]
 
-    duplicated_scaffolds = np.unique(np.concatenate(duplicated_scaffolds))
-    final_paths = pd.concat(final_paths)
-    
-    # Extend scaffolds according to final_paths
-    ext_scaffolds = scaffolds.drop(duplicated_scaffolds)
-    ext_scaffold_parts = [scaffold_parts[np.isin(scaffold_parts['scaffold'], duplicated_scaffolds) == False].copy()]
-    for p in range(1, final_paths['pos'].max()+1):
-        ext_scaffolds = ext_scaffolds.merge(final_paths.loc[final_paths['pos'] == p, ['center','scaffold','strand']].rename(columns={'center':'scaffold', 'scaffold':'escaf', 'strand':'estrand'}), on=['scaffold'], how='left')
-        if np.sum((np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '+')):
-            ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '+'), ['right','rside','rextendible']] = ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '+'), ['escaf']].merge(scaffolds[['scaffold','right','rside','rextendible']].rename(columns={'scaffold':'escaf'}), on=['escaf'], how='left')[['right','rside','rextendible']].values
-            # Add scaffold_parts
-            added_parts = scaffold_parts.merge(ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '+'), ['escaf','scaffold','size']].rename(columns={'escaf':'scaffold', 'scaffold':'new_scaf'}), on=['scaffold'], how='inner')
-            added_parts['pos'] += added_parts['size']
-            added_parts['scaffold'] = added_parts['new_scaf']
-            ext_scaffold_parts.append( added_parts.drop(columns=['size','new_scaf']) )
-        ext_scaffolds.loc[np.isnan(ext_scaffolds['escaf']) == False, 'size'] += ext_scaffolds.loc[np.isnan(ext_scaffolds['escaf']) == False, ['escaf']].merge(scaffolds[['scaffold','size']].rename(columns={'scaffold':'escaf'}), on=['escaf'], how='left')['size'].values
-        if np.sum((np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '-')):
-            ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '-'), ['right','rside','rextendible']] = ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '-'), ['escaf']].merge(scaffolds[['scaffold','left','lside','lextendible']].rename(columns={'scaffold':'escaf'}), on=['escaf'], how='left')[['left','lside','lextendible']].values
-            # Add scaffold_parts
-            added_parts = scaffold_parts.merge(ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '-'), ['escaf','scaffold','size']].rename(columns={'escaf':'scaffold', 'scaffold':'new_scaf'}), on=['scaffold'], how='inner')
-            added_parts['pos'] = added_parts['size'] - added_parts['pos'] - 1
-            added_parts['scaffold'] = added_parts['new_scaf']
-            added_parts['reverse'] = added_parts['reverse'] == False
-            ext_scaffold_parts.append( added_parts.drop(columns=['size','new_scaf']) )
-        ext_scaffolds.drop(columns=['escaf','estrand'], inplace=True)
+    if len(duplicated_scaffolds):
+        duplicated_scaffolds = np.unique(np.concatenate(duplicated_scaffolds))
+    if len(final_paths):
+        final_paths = pd.concat(final_paths)
 #
-    ext_scaffolds['neg_size'] = 1
-    for p in range(-1, final_paths['pos'].min()-1, -1):
-        ext_scaffolds = ext_scaffolds.merge(final_paths.loc[final_paths['pos'] == p, ['center','scaffold','strand']].rename(columns={'center':'scaffold', 'scaffold':'escaf', 'strand':'estrand'}), on=['scaffold'], how='left')
-        if np.sum((np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '-')):
-            ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '-'), ['left','lside','lextendible']] = ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '-'), ['escaf']].merge(scaffolds[['scaffold','right','rside','rextendible']].rename(columns={'scaffold':'escaf'}), on=['escaf'], how='left')[['right','rside','rextendible']].values
-            # Add scaffold_parts
-            added_parts = scaffold_parts.merge(ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '-'), ['escaf','scaffold','neg_size']].rename(columns={'escaf':'scaffold', 'scaffold':'new_scaf'}), on=['scaffold'], how='inner')
-            added_parts['pos'] = (added_parts['pos'] + added_parts['neg_size']) * (-1)
-            added_parts['scaffold'] = added_parts['new_scaf']
-            added_parts['reverse'] = added_parts['reverse'] == False
-            ext_scaffold_parts.append( added_parts.drop(columns=['neg_size','new_scaf']) )
-        ext_scaffolds.loc[np.isnan(ext_scaffolds['escaf']) == False, 'neg_size'] += ext_scaffolds.loc[np.isnan(ext_scaffolds['escaf']) == False, ['escaf']].merge(scaffolds[['scaffold','size']].rename(columns={'scaffold':'escaf'}), on=['escaf'], how='left')['size'].values
-        if np.sum((np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '+')):
-            ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '+'), ['left','lside','lextendible']] = ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '+'), ['escaf']].merge(scaffolds[['scaffold','left','lside','lextendible']].rename(columns={'scaffold':'escaf'}), on=['escaf'], how='left')[['left','lside','lextendible']].values
-            # Add scaffold_parts
-            added_parts = scaffold_parts.merge(ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '+'), ['escaf','scaffold','neg_size']].rename(columns={'escaf':'scaffold', 'scaffold':'new_scaf'}), on=['scaffold'], how='inner')
-            added_parts['pos'] = (added_parts['neg_size'] - added_parts['pos'] - 1) * (-1)
-            added_parts['scaffold'] = added_parts['new_scaf']
-            ext_scaffold_parts.append( added_parts.drop(columns=['neg_size','new_scaf']) )
-        ext_scaffolds.drop(columns=['escaf','estrand'], inplace=True)
-    ext_scaffolds['size'] += ext_scaffolds['neg_size'] - 1
-    ext_scaffolds.drop(columns=['neg_size'], inplace=True)
-
-    # Set positions starting from 0
-    ext_scaffold_parts = pd.concat(ext_scaffold_parts)
-    ext_scaffold_parts.sort_values(['scaffold','pos'], inplace=True)
-    ext_scaffold_parts['pos'] = ext_scaffold_parts.groupby(['scaffold'], sort=False).cumcount()
-
-    scaffolds = ext_scaffolds
-    scaffolds.index = scaffolds['scaffold'].values
-    scaffold_parts = ext_scaffold_parts
+        # Extend scaffolds according to final_paths
+        ext_scaffolds = scaffolds.drop(duplicated_scaffolds)
+        ext_scaffold_parts = [scaffold_parts[np.isin(scaffold_parts['scaffold'], duplicated_scaffolds) == False].copy()]
+        for p in range(1, final_paths['pos'].max()+1):
+            ext_scaffolds = ext_scaffolds.merge(final_paths.loc[final_paths['pos'] == p, ['center','scaffold','strand']].rename(columns={'center':'scaffold', 'scaffold':'escaf', 'strand':'estrand'}), on=['scaffold'], how='left')
+            if np.sum((np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '+')):
+                ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '+'), ['right','rside','rextendible']] = ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '+'), ['escaf']].merge(scaffolds[['scaffold','right','rside','rextendible']].rename(columns={'scaffold':'escaf'}), on=['escaf'], how='left')[['right','rside','rextendible']].values
+                # Add scaffold_parts
+                added_parts = scaffold_parts.merge(ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '+'), ['escaf','scaffold','size']].rename(columns={'escaf':'scaffold', 'scaffold':'new_scaf'}), on=['scaffold'], how='inner')
+                added_parts['pos'] += added_parts['size']
+                added_parts['scaffold'] = added_parts['new_scaf']
+                ext_scaffold_parts.append( added_parts.drop(columns=['size','new_scaf']) )
+            ext_scaffolds.loc[np.isnan(ext_scaffolds['escaf']) == False, 'size'] += ext_scaffolds.loc[np.isnan(ext_scaffolds['escaf']) == False, ['escaf']].merge(scaffolds[['scaffold','size']].rename(columns={'scaffold':'escaf'}), on=['escaf'], how='left')['size'].values
+            if np.sum((np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '-')):
+                ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '-'), ['right','rside','rextendible']] = ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '-'), ['escaf']].merge(scaffolds[['scaffold','left','lside','lextendible']].rename(columns={'scaffold':'escaf'}), on=['escaf'], how='left')[['left','lside','lextendible']].values
+                # Add scaffold_parts
+                added_parts = scaffold_parts.merge(ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '-'), ['escaf','scaffold','size']].rename(columns={'escaf':'scaffold', 'scaffold':'new_scaf'}), on=['scaffold'], how='inner')
+                added_parts['pos'] = added_parts['size'] - added_parts['pos'] - 1
+                added_parts['scaffold'] = added_parts['new_scaf']
+                added_parts['reverse'] = added_parts['reverse'] == False
+                ext_scaffold_parts.append( added_parts.drop(columns=['size','new_scaf']) )
+            ext_scaffolds.drop(columns=['escaf','estrand'], inplace=True)
+#
+        ext_scaffolds['neg_size'] = 1
+        for p in range(-1, final_paths['pos'].min()-1, -1):
+            ext_scaffolds = ext_scaffolds.merge(final_paths.loc[final_paths['pos'] == p, ['center','scaffold','strand']].rename(columns={'center':'scaffold', 'scaffold':'escaf', 'strand':'estrand'}), on=['scaffold'], how='left')
+            if np.sum((np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '-')):
+                ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '-'), ['left','lside','lextendible']] = ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '-'), ['escaf']].merge(scaffolds[['scaffold','right','rside','rextendible']].rename(columns={'scaffold':'escaf'}), on=['escaf'], how='left')[['right','rside','rextendible']].values
+                # Add scaffold_parts
+                added_parts = scaffold_parts.merge(ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '-'), ['escaf','scaffold','neg_size']].rename(columns={'escaf':'scaffold', 'scaffold':'new_scaf'}), on=['scaffold'], how='inner')
+                added_parts['pos'] = (added_parts['pos'] + added_parts['neg_size']) * (-1)
+                added_parts['scaffold'] = added_parts['new_scaf']
+                added_parts['reverse'] = added_parts['reverse'] == False
+                ext_scaffold_parts.append( added_parts.drop(columns=['neg_size','new_scaf']) )
+            ext_scaffolds.loc[np.isnan(ext_scaffolds['escaf']) == False, 'neg_size'] += ext_scaffolds.loc[np.isnan(ext_scaffolds['escaf']) == False, ['escaf']].merge(scaffolds[['scaffold','size']].rename(columns={'scaffold':'escaf'}), on=['escaf'], how='left')['size'].values
+            if np.sum((np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '+')):
+                ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '+'), ['left','lside','lextendible']] = ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '+'), ['escaf']].merge(scaffolds[['scaffold','left','lside','lextendible']].rename(columns={'scaffold':'escaf'}), on=['escaf'], how='left')[['left','lside','lextendible']].values
+                # Add scaffold_parts
+                added_parts = scaffold_parts.merge(ext_scaffolds.loc[(np.isnan(ext_scaffolds['escaf']) == False) & (ext_scaffolds['estrand'] == '+'), ['escaf','scaffold','neg_size']].rename(columns={'escaf':'scaffold', 'scaffold':'new_scaf'}), on=['scaffold'], how='inner')
+                added_parts['pos'] = (added_parts['neg_size'] - added_parts['pos'] - 1) * (-1)
+                added_parts['scaffold'] = added_parts['new_scaf']
+                ext_scaffold_parts.append( added_parts.drop(columns=['neg_size','new_scaf']) )
+            ext_scaffolds.drop(columns=['escaf','estrand'], inplace=True)
+        ext_scaffolds['size'] += ext_scaffolds['neg_size'] - 1
+        ext_scaffolds.drop(columns=['neg_size'], inplace=True)
+#
+        # Set positions starting from 0
+        ext_scaffold_parts = pd.concat(ext_scaffold_parts)
+        ext_scaffold_parts.sort_values(['scaffold','pos'], inplace=True)
+        ext_scaffold_parts['pos'] = ext_scaffold_parts.groupby(['scaffold'], sort=False).cumcount()
+#
+        scaffolds = ext_scaffolds
+        scaffolds.index = scaffolds['scaffold'].values
+        scaffold_parts = ext_scaffold_parts
 
     return scaffolds, scaffold_parts
 
@@ -2186,7 +2321,7 @@ def ScaffoldContigs(contig_parts, bridges, mappings, ploidy):
     # Each contig starts with being its own scaffold
     scaffold_parts = pd.DataFrame({'conpart': contig_parts.index.values, 'scaffold': contig_parts.index.values, 'pos': 0, 'reverse': False})
     scaffolds = pd.DataFrame({'scaffold': contig_parts.index.values, 'left': contig_parts.index.values, 'lside':'l', 'right': contig_parts.index.values, 'rside':'r', 'lextendible':True, 'rextendible':True, 'circular':False, 'size':1})
-
+    
     # Combine contigs into scaffolds on unique bridges
     unique_bridges = bridges.loc[(bridges['to_alt'] == 1) & (bridges['from_alt'] == 1), ['from','from_side','to','to_side']]
     scaffolds = scaffolds.merge(unique_bridges[unique_bridges['from_side']=='l'].drop(columns=['from_side']).rename(columns={'from':'scaffold', 'to':'lscaf', 'to_side':'lscaf_side'}), on=['scaffold'], how='left')
@@ -2357,7 +2492,9 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     max_break_point_distance = 200
     merge_block_length = 10000
 #
-    min_num_reads = 3
+    min_num_reads = 2
+    cov_bin_fraction = 0.01
+    num_read_len_groups = 10
     min_factor_alternatives = 2
     ploidy = 2 
     org_scaffold_trust = "basic" # blind: If there is a read that supports it use the org scaffold; Do not break contigs
@@ -2385,7 +2522,7 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
 #    contigs, center_repeats = MaskRepeatEnds(contigs, repeat_file, contig_ids, max_repeat_extension, min_len_repeat_connection, repeat_len_factor_unique, remove_duplicated_contigs, pdf)
 
     print( str(timedelta(seconds=clock())), "Filtering mappings")
-    mappings = ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, alignment_precision, pdf)
+    mappings, cov_counts, cov_thresholds = ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, alignment_precision, min_num_reads, cov_bin_fraction, num_read_len_groups, pdf)
     contigs = RemoveUnmappedContigs(contigs, mappings, remove_zero_hit_contigs)
 #    mappings = RemoveUnanchoredMappings(mappings, contigs, center_repeats, min_mapping_length, pdf, max_dist_contig_end)
 #    del center_repeats
@@ -2398,7 +2535,7 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
         # Do not break contigs
         break_groups, spurious_break_indexes, non_informative_mappings = CallAllBreaksSpurious(mappings, contigs, max_dist_contig_end, min_length_contig_break, min_extension, pdf)
     else:
-        break_groups, spurious_break_indexes, non_informative_mappings = FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, min_length_contig_break, max_break_point_distance, min_num_reads, min_factor_alternatives, min_extension, merge_block_length, org_scaffold_trust, pdf)
+        break_groups, spurious_break_indexes, non_informative_mappings, unconnected_breaks = FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, min_length_contig_break, max_break_point_distance, min_num_reads, min_extension, merge_block_length, org_scaffold_trust, cov_thresholds, pdf)
     mappings.drop(np.concatenate([spurious_break_indexes, non_informative_mappings]), inplace=True) # Remove not-accepted breaks from mappings and mappings that do not contain any information (mappings inside of contigs that do not overlap with breaks)
     del spurious_break_indexes, non_informative_mappings
 
@@ -2408,7 +2545,7 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     del break_groups, contigs, contig_ids
     
     print( str(timedelta(seconds=clock())), "Search for possible bridges")
-    bridges, contig_parts = GetBridges(mappings, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, pdf)
+    bridges, contig_parts = GetBridges(mappings, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, cov_thresholds, min_mapping_length, pdf)
     
     print( str(timedelta(seconds=clock())), "Scaffold the contigs")
     scaffolds, scaffold_parts, scaffold_table = ScaffoldContigs(contig_parts, bridges, mappings, ploidy)
