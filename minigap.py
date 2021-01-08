@@ -560,9 +560,9 @@ def RemoveUnanchoredMappings(mappings, contigs, center_repeats, min_mapping_leng
             PlotHist(pdf, "Distance to contig end", "# Reads reaching over contig ends", dists_contig_ends, threshold=max_dist_contig_end, logx=True)
 
     # Find and remove reads only mapping to center repeats (Distance to merge repeats should be larger than min_mapping_length, so we can consider here one repeat at a time)
-    repeats = center_repeats.merge(mappings, left_on=['con_id'], right_on=['t_id'], how='left', indicator=True)
-    repeats = repeats[repeats['_merge'] == "both"].copy()
+    repeats = center_repeats.merge(mappings, left_on=['con_id'], right_on=['t_id'], how='inner')
     repeats = repeats[ (repeats['start']-min_mapping_length < repeats['t_start']) & (repeats['end']+min_mapping_length > repeats['t_end']) ].copy()
+    mappings.sort_values(['q_name','q_start'], inplace=True)
     mappings = mappings[(mappings.merge(repeats[['q_name','q_start']].drop_duplicates(), on=['q_name','q_start'], how='left', indicator=True)['_merge'] == "left_only").values].copy()
 
     return mappings
@@ -1014,17 +1014,17 @@ def GetBreakAndRemovalInfo(result_info, contigs, contig_parts):
 def UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length):
     # Duplicate mappings for every contig part (using inner, because some contigs have been removed (e.g. being too short)) 
     mappings = mappings.merge(contig_parts.reset_index()[['contig', 'index', 'part', 'start', 'end']].rename(columns={'contig':'t_id', 'index':'conpart', 'start':'part_start', 'end':'part_end'}), on=['t_id'], how='inner')
-    
+
     # Remove mappings that do not touch a contig part or only less than min_mapping_length bases
     mappings = mappings[(mappings['t_start']+min_mapping_length < mappings['part_end']) & (mappings['t_end']-min_mapping_length > mappings['part_start'])].copy()
-    
+
     # Update mapping information with limits from contig part
     mappings['con_from'] = np.maximum(mappings['t_start'], mappings['part_start'])  # We cannot work with 0 < mappings['num_part'], because of reads that start before mappings['con_start'] but do not cross the break region and therefore don't have a mapping before
     mappings['con_to'] = np.minimum(mappings['t_end'], mappings['part_end'])
-    
+
     mappings['read_from'] = mappings['q_start']
     mappings['read_to'] = mappings['q_end']
-    
+
     # Rough estimate of the split for the reads, better not use the new information, but not always avoidable
     # Forward strand
     multi_maps = mappings[(mappings['con_from'] > mappings['t_start']) & (mappings['strand'] == '+')]
@@ -1036,39 +1036,39 @@ def UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length):
     mappings.loc[(mappings['con_from'] > mappings['t_start']) & (mappings['strand'] == '-'), 'read_to'] = np.round(multi_maps['q_end'] - (multi_maps['q_end']-multi_maps['q_start'])/(multi_maps['t_end']-multi_maps['t_start'])*(multi_maps['con_from']-multi_maps['t_start'])).astype(int)
     multi_maps = mappings[(mappings['con_to'] < mappings['t_end']) & (mappings['strand'] == '-')]
     mappings.loc[(mappings['con_to'] < mappings['t_end']) & (mappings['strand'] == '-'), 'read_from'] = np.round(multi_maps['q_start'] + (multi_maps['q_end']-multi_maps['q_start'])/(multi_maps['t_end']-multi_maps['t_start'])*(multi_maps['t_end']-multi_maps['con_to'])).astype(int)
-    
+
     mappings['matches'] = np.round(mappings['matches']/(mappings['t_end']-mappings['t_start'])*(mappings['con_to']-mappings['con_from'])).astype(int) # Rough estimate use with care!
     mappings.sort_values(['q_name','read_start','read_from','read_to'], inplace=True)
     mappings.reset_index(inplace=True, drop=True)
-    
+
     # Update connections
     mappings['next_con'] = np.where((mappings['q_name'].shift(-1, fill_value='') != mappings['q_name']) | (mappings['read_start'].shift(-1, fill_value=-1) != mappings['read_start']), -1, mappings['conpart'].shift(-1, fill_value=-1))
     mappings['next_strand'] = np.where(-1 == mappings['next_con'], '', mappings['strand'].shift(-1, fill_value=''))
     mappings['prev_con'] = np.where((mappings['q_name'].shift(1, fill_value='') != mappings['q_name']) | (mappings['read_start'].shift(1, fill_value=-1) != mappings['read_start']), -1, mappings['conpart'].shift(1, fill_value=-1))
     mappings['prev_strand'] = np.where(-1 == mappings['prev_con'], '', mappings['strand'].shift(1, fill_value=''))
-    
+
     mappings['left_con'] = np.where('+' == mappings['strand'], mappings['prev_con'], mappings['next_con'])
     mappings['right_con'] = np.where('-' == mappings['strand'], mappings['prev_con'], mappings['next_con'])
-    
+
     mappings['next_side'] = np.where('+' == mappings['next_strand'], 'l', 'r')
     mappings['prev_side'] = np.where('-' == mappings['prev_strand'], 'l', 'r')
     mappings['left_con_side'] = np.where('+' == mappings['strand'], mappings['prev_side'], mappings['next_side'])
     mappings.loc[-1 == mappings['left_con'], 'left_con_side'] = ''
     mappings['right_con_side'] = np.where('-' == mappings['strand'], mappings['prev_side'], mappings['next_side'])
     mappings.loc[-1 == mappings['right_con'], 'right_con_side'] = ''
-    
+
     # Get distance to connected contigparts
-    mappings['next_dist'] = mappings['q_start'].shift(-1, fill_value=0) - mappings['q_end']
-    mappings['prev_dist'] = mappings['q_start'] - mappings['q_end'].shift(1, fill_value=0)
+    mappings['next_dist'] = mappings['read_from'].shift(-1, fill_value=0) - mappings['read_to']
+    mappings['prev_dist'] = mappings['read_from'] - mappings['read_to'].shift(1, fill_value=0)
     mappings['left_con_dist'] = np.where('+' == mappings['strand'], mappings['prev_dist'], mappings['next_dist'])
     mappings.loc[-1 == mappings['left_con'], 'left_con_dist'] = 0
     mappings['right_con_dist'] = np.where('-' == mappings['strand'], mappings['prev_dist'], mappings['next_dist'])
     mappings.loc[-1 == mappings['right_con'], 'right_con_dist'] = 0
-    
+
     # Select the columns we still need
     mappings.rename(columns={'q_name':'read_name'}, inplace=True)
     mappings = mappings[['read_name', 'read_start', 'read_end', 'read_from', 'read_to', 'strand', 'conpart', 'con_from', 'con_to', 'left_con', 'left_con_side', 'left_con_dist', 'right_con', 'right_con_side', 'right_con_dist', 'mapq', 'matches']].copy()
-    
+
     # Count how many mappings each read has
     mappings['num_mappings'] = 1
     num_mappings = mappings.groupby(['read_name','read_start'], sort=False)['num_mappings'].size().values
@@ -1076,26 +1076,33 @@ def UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length):
 
     return mappings
 
-def CreateBridges(left_bridge, right_bridge):
+def CreateBridges(left_bridge, right_bridge, min_distance_tolerance, rel_distance_tolerance):
     bridges = pd.concat([left_bridge,right_bridge], ignore_index=True, sort=False)
-    
+
     # Duplicate bridges and switch from to, so that both sortings have all relevant bridges
-    bridges = pd.concat([bridges[['from','from_side','to','to_side','min_mapq','distance']],
-                         bridges.rename(columns={'from':'to', 'to':'from', 'from_side':'to_side', 'to_side':'from_side'})[['from','from_side','to','to_side','min_mapq','distance']]], ignore_index=True, sort=False)
-    
+    bridges = pd.concat([bridges[['from','from_side','to','to_side','mapq','distance']],
+                         bridges.rename(columns={'from':'to', 'to':'from', 'from_side':'to_side', 'to_side':'from_side'})[['from','from_side','to','to_side','mapq','distance']]], ignore_index=True, sort=False)
+
+    # Separate bridges if distances are far apart
+    bridges.sort_values(['from','from_side','to','to_side','distance'], inplace=True)
+    bridges['group'] = ( (bridges['from'] != bridges['from'].shift(1)) | (bridges['from_side'] != bridges['from_side'].shift(1)) |
+                         (bridges['to'] != bridges['to'].shift(1)) | (bridges['to_side'] != bridges['to_side'].shift(1)) |
+                         (bridges['distance'] > bridges['distance'].shift(1)+min_distance_tolerance+rel_distance_tolerance*np.maximum(np.abs(bridges['distance']),np.abs(bridges['distance'].shift(1)))) ).cumsum()
+
     # Bundle identical bridges
-    bridged_dists = bridges.groupby(['from','from_side','to','to_side'])['distance'].agg(['mean','min','max']).reset_index().rename(columns={'mean':'mean_dist','min':'min_dist','max':'max_dist'})
+    bridged_dists = bridges.groupby(['from','from_side','to','to_side','group'], sort=False)['distance'].agg(['mean','min','max']).reset_index().rename(columns={'mean':'mean_dist','min':'min_dist','max':'max_dist'})
     bridged_dists['mean_dist'] = np.round(bridged_dists['mean_dist']).astype(int)
-    bridges = bridges.groupby(['from','from_side','to','to_side','min_mapq'])['distance'].size().reset_index(name='count')
-    
+    bridges = bridges.groupby(['from','from_side','to','to_side','group','mapq']).size().reset_index(name='count')
+
     # Get cumulative counts (counts for this trust level and higher)
     bridges['count'] = bridges['count'] // 2 # Not counting all reads twice (because each bridge is bridged from both sides)
-    bridges.sort_values(['from','from_side','to','to_side','min_mapq'], ascending=[True, True, True, True, False], inplace=True)
-    bridges['cumcount'] = bridges.groupby(['from','from_side','to','to_side'], sort=False)['count'].cumsum().values
+    bridges.sort_values(['from','from_side','to','to_side','group','mapq'], ascending=[True, True, True, True, True, False], inplace=True)
+    bridges['cumcount'] = bridges.groupby(['from','from_side','to','to_side','group'], sort=False)['count'].cumsum().values
     bridges.drop(columns=['count'], inplace=True)
-    
+
     # Add distances back in
-    bridges = bridges.merge(bridged_dists, on=['from','from_side','to','to_side'], how='left')
+    bridges = bridges.merge(bridged_dists, on=['from','from_side','to','to_side','group'], how='left')
+    bridges.drop(columns=['group'], inplace=True) # We don't need the group anymore because it is encoded in ['from','from_side','to','to_side','mean_dist'] now
 
     return bridges
 
@@ -1137,19 +1144,25 @@ def FilterBridges(bridges, borderline_removal, min_factor_alternatives, min_num_
         bridges['org_scaffold'] = False # Do not use original scaffolds
 
     # Set lowq flags for all bridges that don't fulfill min_num_reads except for the ones with additional support from original scaffolds
-    bridges['low_q'] = (bridges['cumcount'] < min_num_reads) & (bridges['org_scaffold'] == False)
-    
+    bridges['low_q'] = (bridges['cumcount'] < min_num_reads)
+
+    # Remove lowq for the distance with the highest counts of each original scaffolds
+    bridges.sort_values(['from','from_side','to','to_side','mapq','cumcount'], ascending=[True, True, True, True,False, False], inplace=True)
+    bridges['max_count'] = bridges.groupby(['from','from_side','to','to_side','mapq'], sort=False)['cumcount'].cummax()
+    bridges.loc[ bridges['org_scaffold'] & (bridges['max_count'] == bridges['cumcount']), 'low_q'] = False
+    bridges.drop(columns=['max_count'], inplace=True)
+
     if borderline_removal:
         # Set lowq flags for all bridges that are not above min_factor_alternatives compared to other lowq bridges (so that we do not have borderline decisions where +-1 count decides that one bridge is accepted and the other not)
         old_num_lowq = np.sum(bridges['low_q'])
-        bridges.sort_values(['from','from_side','min_mapq','cumcount'], ascending=[True, True, False, True], inplace=True)
+        bridges.sort_values(['from','from_side','mapq','cumcount'], ascending=[True, True, False, True], inplace=True)
         bridges['from_group'] = ( (bridges['from'] != bridges['from'].shift(1)) | (bridges['from_side'] != bridges['from_side'].shift(1)) | bridges['org_scaffold'] |
-                                  (bridges['min_mapq'] != bridges['min_mapq'].shift(1)) | (bridges['cumcount'] > np.ceil(bridges['cumcount'].shift(1, fill_value = 0)*min_factor_alternatives)) ).astype(int).cumsum()
+                                  (bridges['mapq'] != bridges['mapq'].shift(1)) | (bridges['cumcount'] > np.ceil(bridges['cumcount'].shift(1, fill_value = 0)*min_factor_alternatives)) ).astype(int).cumsum()
         bridges['low_q'] = bridges.groupby(['from_group'], sort=False)['low_q'].cumsum().astype(bool)
 
-        bridges.sort_values(['to','to_side','min_mapq','cumcount'], ascending=[True, True, False, True], inplace=True)
+        bridges.sort_values(['to','to_side','mapq','cumcount'], ascending=[True, True, False, True], inplace=True)
         bridges['to_group'] = ( (bridges['to'] != bridges['to'].shift(1)) | (bridges['to_side'] != bridges['to_side'].shift(1)) | bridges['org_scaffold'] |
-                              (bridges['min_mapq'] != bridges['min_mapq'].shift(1)) | (bridges['cumcount'] > np.ceil(bridges['cumcount'].shift(1, fill_value = 0)*min_factor_alternatives)) ).astype(int).cumsum()
+                              (bridges['mapq'] != bridges['mapq'].shift(1)) | (bridges['cumcount'] > np.ceil(bridges['cumcount'].shift(1, fill_value = 0)*min_factor_alternatives)) ).astype(int).cumsum()
         bridges['low_q'] = bridges.groupby(['to_group'], sort=False)['low_q'].cumsum().astype(bool)
 
         num_lowq = np.sum(bridges['low_q'])
@@ -1166,31 +1179,28 @@ def FilterBridges(bridges, borderline_removal, min_factor_alternatives, min_num_
     # Remove low quality bridges
     bridges = bridges[bridges['low_q'] == False].copy()
     bridges.drop(columns=['low_q'], inplace=True)
-    
-    # Set highq flags for the most likely bridges, the ones within prob_factor of the most likely and the ones that have additional support from original scaffolds
+
+    # Set highq flags for the most likely bridges and the ones within prob_factor of the most likely
     bridges['probability'] = GetConProb(cov_probs, np.where(0 <= bridges['mean_dist'], bridges['mean_dist']+2*min_mapping_length, min_mapping_length-bridges['mean_dist']), bridges['cumcount'])
-    bridges.sort_values(['to','to_side','min_mapq'], inplace=True)
-    alternatives = bridges.groupby(['to','to_side','min_mapq'], sort=False)['probability'].agg(['max','size'])
+    bridges.sort_values(['to','to_side','mapq'], inplace=True)
+    alternatives = bridges.groupby(['to','to_side','mapq'], sort=False)['probability'].agg(['max','size'])
     bridges['to_max_prob'] = np.repeat(alternatives['max'].values, alternatives['size'].values)
-    bridges.sort_values(['from','from_side','min_mapq'], inplace=True)
-    alternatives = bridges.groupby(['from','from_side','min_mapq'], sort=False)['probability'].agg(['max','size'])
+    bridges.sort_values(['from','from_side','mapq'], inplace=True)
+    alternatives = bridges.groupby(['from','from_side','mapq'], sort=False)['probability'].agg(['max','size'])
     bridges['from_max_prob'] = np.repeat(alternatives['max'].values, alternatives['size'].values)
-    bridges['highq'] = ((bridges['probability']*prob_factor >= bridges['from_max_prob']) & (bridges['probability']*prob_factor >= bridges['to_max_prob'])) | bridges['org_scaffold']
-    
+    bridges['highq'] = ((bridges['probability']*prob_factor >= bridges['from_max_prob']) & (bridges['probability']*prob_factor >= bridges['to_max_prob']))
+
     # Only keep high quality bridges
     bridges = bridges[bridges['highq']].copy()
     bridges.drop(columns=['highq','from_max_prob','to_max_prob'], inplace=True)
 
     #  Remove bridges that compete with a bridge with a higher trust level
-    bridges.sort_values(['from','from_side','min_mapq'], ascending=[True, True, False], inplace=True)
-    bridges['max_highq_mapq'] = bridges.groupby(['from','from_side'], sort=False)['min_mapq'].cummax()
-    bridges.sort_values(['to','to_side','min_mapq'], ascending=[True, True, False], inplace=True)
-    bridges['max_highq_mapq2'] = bridges.groupby(['to','to_side'], sort=False)['min_mapq'].cummax()
-    bridges = bridges[np.maximum(bridges['max_highq_mapq'], bridges['max_highq_mapq2']) <= bridges['min_mapq']].copy()
-    bridges.drop(columns=['min_mapq','max_highq_mapq','max_highq_mapq2'], inplace=True)
-    
-    # Reduce all identical bridges to one
-    bridges.drop_duplicates(inplace=True)
+    bridges.sort_values(['from','from_side','mapq'], ascending=[True, True, False], inplace=True)
+    bridges['max_mapq'] = bridges.groupby(['from','from_side'], sort=False)['mapq'].cummax()
+    bridges.sort_values(['to','to_side','mapq'], ascending=[True, True, False], inplace=True)
+    bridges['max_mapq2'] = bridges.groupby(['to','to_side'], sort=False)['mapq'].cummax()
+    bridges = bridges[np.maximum(bridges['max_mapq'], bridges['max_mapq2']) <= bridges['mapq']].copy()
+    bridges.drop(columns=['max_mapq','max_mapq2'], inplace=True)
 
     if "full" == org_scaffold_trust:
         # Remove ambiguous bridges that compeat with the original scaffold
@@ -1211,38 +1221,28 @@ def FilterBridges(bridges, borderline_removal, min_factor_alternatives, min_num_
 
     return bridges
 
-def GetBridges(mappings, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, cov_probs, prob_factor, min_mapping_length, pdf):
+def GetBridges(mappings, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, cov_probs, prob_factor, min_mapping_length, min_distance_tolerance, rel_distance_tolerance, pdf):
     # Get bridges
     left_bridge = mappings.loc[mappings['left_con'] >= 0, ['conpart','left_con','left_con_side','left_con_dist','mapq']].copy()
     left_bridge.rename(columns={'conpart':'from','left_con':'to','left_con_side':'to_side','mapq':'from_mapq','left_con_dist':'distance'}, inplace=True)
     left_bridge['from_side'] = 'l'
     left_bridge['to_mapq'] = np.where('+' == mappings['strand'], mappings['mapq'].shift(1, fill_value = -1), mappings['mapq'].shift(-1, fill_value = -1))[mappings['left_con'] >= 0]
-    left_bridge['min_mapq'] = np.where(left_bridge['to_mapq'] < left_bridge['from_mapq'], left_bridge['to_mapq'], left_bridge['from_mapq'])
+    left_bridge['mapq'] = np.where(left_bridge['to_mapq'] < left_bridge['from_mapq'], left_bridge['to_mapq'].astype(int)*1000+left_bridge['from_mapq'], left_bridge['from_mapq'].astype(int)*1000+left_bridge['to_mapq'])
     left_bridge.drop(columns=['from_mapq','to_mapq'], inplace=True)
-    left_bridge.loc[left_bridge['from'] > left_bridge['to'], ['from', 'from_side', 'to', 'to_side', 'min_mapq']] = left_bridge.loc[left_bridge['from'] > left_bridge['to'], ['to', 'to_side', 'from', 'from_side', 'min_mapq']].values
-    left_bridge['min_mapq'] = left_bridge['min_mapq'].astype(int)
-    
+    left_bridge.loc[left_bridge['from'] > left_bridge['to'], ['from', 'from_side', 'to', 'to_side']] = left_bridge.loc[left_bridge['from'] > left_bridge['to'], ['to', 'to_side', 'from', 'from_side']].values
+
     right_bridge = mappings.loc[mappings['right_con'] >= 0, ['conpart','right_con','right_con_side','right_con_dist','mapq']].copy()
     right_bridge.rename(columns={'conpart':'from','right_con':'to','right_con_side':'to_side','mapq':'from_mapq','right_con_dist':'distance'}, inplace=True)
     right_bridge['from_side'] = 'r'
     right_bridge['to_mapq'] = np.where('-' == mappings['strand'], mappings['mapq'].shift(1, fill_value = -1), mappings['mapq'].shift(-1, fill_value = -1))[mappings['right_con'] >= 0]
-    right_bridge['min_mapq'] = np.where(right_bridge['to_mapq'] < right_bridge['from_mapq'], right_bridge['to_mapq'], right_bridge['from_mapq'])
+    right_bridge['mapq'] = np.where(right_bridge['to_mapq'] < right_bridge['from_mapq'], right_bridge['to_mapq'].astype(int)*1000+right_bridge['from_mapq'], right_bridge['from_mapq'].astype(int)*1000+right_bridge['to_mapq'])
     right_bridge.drop(columns=['from_mapq','to_mapq'], inplace=True)
-    right_bridge.loc[right_bridge['from'] >= right_bridge['to'], ['from', 'from_side', 'to', 'to_side', 'min_mapq']] = right_bridge.loc[right_bridge['from'] >= right_bridge['to'], ['to', 'to_side', 'from', 'from_side', 'min_mapq']].values # >= here so that contig loops are also sorted properly
-    right_bridge['min_mapq'] = right_bridge['min_mapq'].astype(int)
-    
-    bridges = CreateBridges(left_bridge, right_bridge)
+    right_bridge.loc[right_bridge['from'] >= right_bridge['to'], ['from', 'from_side', 'to', 'to_side']] = right_bridge.loc[right_bridge['from'] >= right_bridge['to'], ['to', 'to_side', 'from', 'from_side']].values # >= here so that contig loops are also sorted properly
+
+    bridges = CreateBridges(left_bridge, right_bridge, min_distance_tolerance, rel_distance_tolerance)
     bridges = FilterBridges(bridges, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, cov_probs, prob_factor, min_mapping_length, contig_parts, pdf)
 
-    # Break original scaffolds for sides with alternative bridges
-    contig_parts['conpart'] = range(len(contig_parts))
-    breaks = bridges.loc[bridges['from_alt'] > 1, ['from','from_side']].rename(columns={'from':'conpart','from_side':'side'}).drop_duplicates()
-    contig_parts.loc[ np.isin(contig_parts['conpart'].values, breaks.loc[breaks['side'] == 'l', 'conpart'].values), 'org_dist_left'] = -1
-    contig_parts.loc[ np.isin(contig_parts['conpart'].values, breaks.loc[breaks['side'] == 'l', 'conpart'].values-1), 'org_dist_right'] = -1
-    contig_parts.loc[ np.isin(contig_parts['conpart'].values, breaks.loc[breaks['side'] == 'r', 'conpart'].values), 'org_dist_right'] = -1
-    contig_parts.loc[ np.isin(contig_parts['conpart'].values, breaks.loc[breaks['side'] == 'r', 'conpart'].values+1), 'org_dist_left'] = -1
-    
-    return bridges, contig_parts
+    return bridges
 
 def ScaffoldAlongGivenConnections(scaffolds, scaffold_parts):
     # Handle right-right scaffold connections (keep scaffold with lower id and reverse+add the other one): We can only create new r-r or r-l connections
@@ -1381,6 +1381,20 @@ def ScaffoldAlongGivenConnections(scaffolds, scaffold_parts):
 
     return scaffolds, scaffold_parts
 
+def AddDistaneInformation(scaffold_parts, unique_bridges):
+    scaffold_parts.sort_values(['scaffold','pos'], inplace=True)
+    scaffold_parts['from'] = scaffold_parts['conpart']
+    scaffold_parts['from_side'] = np.where(scaffold_parts['reverse'], 'l', 'r')
+    scaffold_parts['to'] = np.where(scaffold_parts['scaffold'].shift(-1) == scaffold_parts['scaffold'], scaffold_parts['conpart'].shift(-1, fill_value=-1), -1)
+    scaffold_parts['to_side'] = np.where(scaffold_parts['reverse'].shift(-1), 'r', 'l') # This is bogus if scaffolds do not match, but 'to' is correct and prevents the merge anyways
+    scaffold_parts = scaffold_parts.merge(unique_bridges[['from','from_side','to','to_side','mean_dist']].rename(columns={'mean_dist':'next_dist'}), on=['from','from_side','to','to_side'], how='left')
+    scaffold_parts['next_dist'] = scaffold_parts['next_dist'].fillna(0).astype(int)
+    scaffold_parts.index = scaffold_parts['conpart'].values # Set the index again, after the merge reset it
+    scaffold_parts.drop(columns=['from','from_side','to','to_side'], inplace=True)
+    scaffold_parts['prev_dist'] = np.where(scaffold_parts['scaffold'].shift(1) == scaffold_parts['scaffold'], scaffold_parts['next_dist'].shift(1, fill_value=0), 0)
+
+    return scaffold_parts
+
 def LiftBridgesFromContigsToScaffolds(bridges, scaffolds):
     # Lift from
     scaf_bridges = bridges.merge(scaffolds[['scaffold','left','lside']].rename(columns={'scaffold':'lscaf', 'left':'from', 'lside':'from_side'}), on=['from','from_side'], how='left')
@@ -1400,7 +1414,7 @@ def LiftBridgesFromContigsToScaffolds(bridges, scaffolds):
     return scaf_bridges
 
 def GetSizeAndEnumeratePositionsForLongRangeConnections(long_range_connections):
-    con_size = long_range_connections.groupby(['conn_id']).size().reset_index(name='size')
+    con_size = long_range_connections.groupby(['conn_id'], sort=False).size().reset_index(name='size')
     long_range_connections['size'] = np.repeat(con_size['size'].values, con_size['size'].values)
     long_range_connections['pos'] = long_range_connections.groupby(['conn_id']).cumcount()
 
@@ -1414,40 +1428,49 @@ def GetLongRangeConnections(bridges, mappings):
         interesting_reads = long_range_mappings[['read_name','read_start','conpart','right_con','left_con']].merge(alternative_connections, on=['conpart'], how='inner')
         interesting_reads = interesting_reads[ ((interesting_reads['side'] == 'r') & (interesting_reads['right_con'] >= 0)) | ((interesting_reads['side'] == 'l') & (interesting_reads['left_con'] >= 0)) ].copy() # Only keep reads that have a connection in the interesting direction
         long_range_mappings = long_range_mappings.merge(interesting_reads[['read_name','read_start']].drop_duplicates(), on=['read_name','read_start'], how='inner')
-        
+
     if len(long_range_mappings):
         # Get long_range_connections that are supported by reads
-        long_range_connections = long_range_mappings[['conpart','strand']].copy()
+        long_range_connections = long_range_mappings[['conpart','strand','left_con_dist','right_con_dist']].copy()
         long_range_connections['conn_id'] = ((long_range_mappings['read_name'] != long_range_mappings['read_name'].shift(1, fill_value='')) | (long_range_mappings['read_start'] != long_range_mappings['read_start'].shift(1, fill_value=-1))).cumsum()
     else:
         long_range_connections = []
-        
+
     if len(long_range_connections):
         # Break long_range_mappings when they go through invalid bridges and get number of prev alternatives (how many alternative to the connection of a mapping with its previous mapping exist)
         long_range_connections['from'] = np.where(long_range_connections['conn_id'] != long_range_connections['conn_id'].shift(1, fill_value=-1), -1, long_range_connections['conpart'].shift(1, fill_value=-1))
         long_range_connections['from_side'] = np.where(long_range_connections['strand'].shift(1, fill_value='') == '+', 'r', 'l') # When the previous entry does not belong to same conn_id this is garbage, but 'from' is already preventing the merge happening next, so it does not matter
         long_range_connections['to'] = long_range_connections['conpart']
         long_range_connections['to_side'] = np.where(long_range_connections['strand'] == '+', 'l', 'r')
-        long_range_connections = long_range_connections.merge(bridges[['from','from_side','to','to_side','to_alt']], on=['from','from_side','to','to_side'], how='left').fillna(0)
-        long_range_connections.rename(columns={'to_alt':'prev_alt'}, inplace=True)
+        long_range_connections['dist'] = np.where(long_range_connections['strand'] == '+', long_range_connections['left_con_dist'], long_range_connections['right_con_dist'])
+        long_range_connections = long_range_connections.reset_index().merge(bridges[['from','from_side','to','to_side','to_alt','min_dist','max_dist','mean_dist']], on=['from','from_side','to','to_side'], how='left').fillna(0) # Keep index, so we know where we introduced duplicates with multiple possible distances for the bridges
+        long_range_connections.rename(columns={'to_alt':'prev_alt', 'mean_dist':'prev_dist'}, inplace=True)
         long_range_connections['prev_alt'] = long_range_connections['prev_alt'].astype(int)
+        long_range_connections['prev_dist'] = long_range_connections['prev_dist'].astype(int) # We store only the mean_dist of the distance category for later, since the exact distances are irrelevant and varying when we group connections
+        long_range_connections.loc[(long_range_connections['min_dist'] > long_range_connections['dist']) | (long_range_connections['dist'] > long_range_connections['max_dist']),'prev_alt'] = 0 # Break connections that do not fit the distance
+        long_range_connections = long_range_connections.sort_values(['index','prev_alt'], ascending=[True,False]).groupby(['index'], sort=False).first().reset_index() # Remove duplications from multiple possible bridge distances
+        long_range_connections.drop(columns=['min_dist','max_dist'], inplace=True)
         long_range_connections['conn_id'] = (long_range_connections['prev_alt'] == 0).cumsum()
-        
+
         # Remove connections that do not include at least 3 mappings anymore
         long_range_connections = GetSizeAndEnumeratePositionsForLongRangeConnections(long_range_connections)
         long_range_connections = long_range_connections[ long_range_connections['size'] >= 3 ].copy()
-    
+
     if len(long_range_connections):
         # Get number of next alternatives
         long_range_connections['from'] = long_range_connections['conpart']
         long_range_connections['from_side'] = np.where(long_range_connections['strand'] == '+', 'r', 'l')
+        long_range_connections['dist'] = np.where(long_range_connections['strand'] == '+', long_range_connections['right_con_dist'], long_range_connections['left_con_dist'])
         long_range_connections['to'] = np.where(long_range_connections['conn_id'] != long_range_connections['conn_id'].shift(-1, fill_value=-1), -1, long_range_connections['conpart'].shift(-1, fill_value=-1))
         long_range_connections['to_side'] = np.where(long_range_connections['strand'].shift(-1, fill_value='') == '+', 'l', 'r') # When the next entry does not belong to same conn_id this is garbage, but 'to' is already preventing the merge happening next, so it does not matter
-        long_range_connections = long_range_connections.merge(bridges[['from','from_side','to','to_side','from_alt']], on=['from','from_side','to','to_side'], how='left').fillna(0)
-        long_range_connections.rename(columns={'from_alt':'next_alt'}, inplace=True)
+        long_range_connections = long_range_connections.merge(bridges[['from','from_side','to','to_side','from_alt','min_dist','max_dist','mean_dist']], on=['from','from_side','to','to_side'], how='left').fillna(0)
+        long_range_connections.rename(columns={'from_alt':'next_alt', 'mean_dist':'next_dist'}, inplace=True)
         long_range_connections['next_alt'] = long_range_connections['next_alt'].astype(int)
-        long_range_connections.drop(columns=['from','from_side','to','to_side'], inplace=True)
-        
+        long_range_connections['next_dist'] = long_range_connections['next_dist'].astype(int) # We store only the mean_dist of the distance category for later, since the exact distances are irrelevant and varying when we group connections
+        long_range_connections.loc[(long_range_connections['min_dist'] > long_range_connections['dist']) | (long_range_connections['dist'] > long_range_connections['max_dist']),'next_alt'] = 0 # Mark wrong distances, so we can remove them and only keep the correct ones
+        long_range_connections = long_range_connections.sort_values(['index','next_alt'], ascending=[True,False]).groupby(['index'], sort=False).first().reset_index(drop=True) # Remove duplications from multiple possible bridge distances
+        long_range_connections.drop(columns=['from','from_side','to','to_side','dist','min_dist','max_dist','left_con_dist','right_con_dist'], inplace=True)
+
         # Trim parts at the beginning or end that do not include alternative connections
         long_range_connections['trim'] = ( ((long_range_connections['pos'] == 0) & (long_range_connections['next_alt'] == 1) & (long_range_connections['prev_alt'].shift(-1, fill_value=-1) == 1)) |
                                            ((long_range_connections['pos'] == long_range_connections['size']-1) & (long_range_connections['prev_alt'] == 1) & (long_range_connections['next_alt'].shift(1, fill_value=-1) == 1)) )
@@ -1460,9 +1483,9 @@ def GetLongRangeConnections(bridges, mappings):
 
     if len(long_range_connections):
         long_range_connections.drop(columns=['trim'], inplace=True)
-        long_range_connections.loc[long_range_connections['pos'] == 0, 'prev_alt'] = 0 # Make sure that reads look similar independent if they were trimmed or not
-        long_range_connections.loc[long_range_connections['pos'] == long_range_connections['size']-1, 'next_alt'] = 0
-        
+        long_range_connections.loc[long_range_connections['pos'] == 0, ['prev_alt','prev_dist']] = 0 # Make sure that reads look similar independent if they were trimmed or not
+        long_range_connections.loc[long_range_connections['pos'] == long_range_connections['size']-1, ['next_alt','next_dist']] = 0
+
         # Add all connections also in the reverse direction
         long_range_connections = long_range_connections.loc[np.repeat(long_range_connections.index.values, 2)].copy()
         long_range_connections['reverse'] = [False,True] * (len(long_range_connections)//2)
@@ -1471,16 +1494,21 @@ def GetLongRangeConnections(bridges, mappings):
         tmp_alt = long_range_connections.loc[long_range_connections['reverse'], 'prev_alt']
         long_range_connections.loc[long_range_connections['reverse'], 'prev_alt'] = long_range_connections.loc[long_range_connections['reverse'], 'next_alt']
         long_range_connections.loc[long_range_connections['reverse'], 'next_alt'] = tmp_alt
+        tmp_dist = long_range_connections.loc[long_range_connections['reverse'], 'prev_dist']
+        long_range_connections.loc[long_range_connections['reverse'], 'prev_dist'] = long_range_connections.loc[long_range_connections['reverse'], 'next_dist']
+        long_range_connections.loc[long_range_connections['reverse'], 'next_dist'] = tmp_dist
         long_range_connections.loc[long_range_connections['reverse'], 'pos'] = long_range_connections.loc[long_range_connections['reverse'], 'size'] - long_range_connections.loc[long_range_connections['reverse'], 'pos'] - 1
         long_range_connections.drop(columns=['reverse'], inplace=True)
         long_range_connections.sort_values(['conn_id', 'pos'], inplace=True)
-        
+
         # Summarize identical long_range_connections
-        long_range_connections['conn_code'] = long_range_connections['conpart'].astype(str) + long_range_connections['strand']
+        long_range_connections['conn_code'] = long_range_connections['conpart'].astype(str) + long_range_connections['strand'] + '(' + long_range_connections['next_dist'].astype(str) + ')'
         codes = long_range_connections.groupby(['conn_id'], sort=False)['conn_code'].apply(''.join)
         long_range_connections['conn_code'] = codes.loc[long_range_connections['conn_id'].values].values
-        long_range_connections = long_range_connections.groupby(['conn_code','pos','size','conpart','strand','prev_alt','next_alt']).size().reset_index(name='count')
-    
+        long_range_connections = long_range_connections.groupby(['conn_code','pos','size','conpart','strand','prev_alt','next_alt','prev_dist','next_dist']).size().reset_index(name='count')
+        long_range_connections['conn_code'] = (long_range_connections['conn_code'] != long_range_connections['conn_code'].shift(1)).cumsum()
+        long_range_connections.rename(columns={'conn_code':'conn_id'}, inplace=True)
+
     return long_range_connections
 
 def TransformContigConnectionsToScaffoldConnections(long_range_connections, scaffold_parts):
@@ -1488,46 +1516,45 @@ def TransformContigConnectionsToScaffoldConnections(long_range_connections, scaf
     # Reverse strand of contigs that are reversed in the scaffold to get the scaffold strand
     long_range_connections.loc[long_range_connections['reverse'], 'strand'] = np.where(long_range_connections.loc[long_range_connections['reverse'], 'strand'] == '+', '-', '+')
     # Group and combine contigs which are all part of the same scaffold (and are following it's order, so are not a repeat)
-    long_range_connections['group'] = ( (long_range_connections['conn_code'] != long_range_connections['conn_code'].shift(1)) | (long_range_connections['scaffold'] != long_range_connections['scaffold'].shift(1)) | 
+    long_range_connections['group'] = ( (long_range_connections['conn_id'] != long_range_connections['conn_id'].shift(1)) | (long_range_connections['scaffold'] != long_range_connections['scaffold'].shift(1)) | 
                                         ((long_range_connections['scaf_pos']+1 != long_range_connections['scaf_pos'].shift(1)) & (long_range_connections['scaf_pos']-1 != long_range_connections['scaf_pos'].shift(1))) ).cumsum()
-    long_range_connections = long_range_connections.groupby(['group', 'conn_code', 'scaffold', 'strand', 'count'], sort=False)[['prev_alt','next_alt']].agg({'prev_alt':['first'],'next_alt':['last']}).droplevel(axis='columns',level=1).reset_index().drop(columns=['group'])
-    
+    long_range_connections = long_range_connections.groupby(['group', 'conn_id', 'scaffold', 'strand', 'count'], sort=False)[['prev_alt','next_alt','prev_dist','next_dist']].agg({'prev_alt':['first'],'next_alt':['last'],'prev_dist':['first'],'next_dist':['last']}).droplevel(axis='columns',level=1).reset_index().drop(columns=['group'])
+
     # Get size and pos again
-    con_size = long_range_connections.groupby(['conn_code']).size().reset_index(name='size')
+    con_size = long_range_connections.groupby(['conn_id']).size().reset_index(name='size')
     long_range_connections['size'] = np.repeat(con_size['size'].values, con_size['size'].values)
-    long_range_connections['pos'] = long_range_connections.groupby(['conn_code']).cumcount()
-    
+    long_range_connections['pos'] = long_range_connections.groupby(['conn_id'], sort=False).cumcount()
+
     return long_range_connections
 
 def BuildScaffoldGraph(long_range_connections, scaf_bridges):
     # First start from every contig and extend in both directions on valid reads
-    scaffold_graph = long_range_connections[['scaffold','strand','conn_code','pos','size']].copy()
+    scaffold_graph = long_range_connections[['scaffold','strand','conn_id','pos','size']].copy()
     scaffold_graph = scaffold_graph[scaffold_graph['pos']+1 < scaffold_graph['size']].copy() # If we are already at the last position we cannot extend
     scaffold_graph['org_pos'] = scaffold_graph['pos']
     scaffold_graph.rename(columns={'scaffold':'from', 'strand':'from_side'}, inplace=True)
     scaffold_graph['from_side'] = np.where(scaffold_graph['from_side'] == '+','r','l')
     for s in range(1,scaffold_graph['size'].max()):
         scaffold_graph['pos'] += 1
-        scaffold_graph = scaffold_graph.merge(long_range_connections[['conn_code','pos','scaffold','strand']].rename(columns={'scaffold':'scaf'+str(s), 'strand':'strand'+str(s)}), on=['conn_code','pos'], how='left')
-    scaffold_graph.drop(columns=['pos'],inplace=True)
+        scaffold_graph = scaffold_graph.merge(long_range_connections[['conn_id','pos','scaffold','strand','prev_dist']].rename(columns={'scaffold':'scaf'+str(s), 'strand':'strand'+str(s), 'prev_dist':'dist'+str(s)}), on=['conn_id','pos'], how='left')
+    scaffold_graph.drop(columns=['pos','conn_id'],inplace=True)
 
     # Then add scaf_bridges with alternatives
-    short_bridges = scaf_bridges.loc[(scaf_bridges['from_alt'] > 1) | (scaf_bridges['to_alt'] > 1), ['from','from_side','to','to_side']].copy()
-    short_bridges.rename(columns={'to':'scaf1','to_side':'strand1'}, inplace=True)
+    short_bridges = scaf_bridges.loc[(scaf_bridges['from_alt'] > 1) | (scaf_bridges['to_alt'] > 1), ['from','from_side','to','to_side','mean_dist']].copy()
+    short_bridges.rename(columns={'to':'scaf1','to_side':'strand1','mean_dist':'dist1'}, inplace=True)
     short_bridges['strand1'] = np.where(short_bridges['strand1'] == 'l', '+', '-')
-    short_bridges['conn_code'] = ''
     short_bridges['size'] = 2
     short_bridges['org_pos'] = 0
-    scaffold_graph = pd.concat([scaffold_graph, short_bridges[['from','from_side','conn_code','size','org_pos','scaf1','strand1']]])
+    scaffold_graph = pd.concat([scaffold_graph, short_bridges[['from','from_side','size','org_pos','scaf1','strand1','dist1']]])
 
     # Now remove all the paths that overlap a longer one (for equally long ones just take one of them)
     scaffold_graph['length'] = scaffold_graph['size'] - scaffold_graph['org_pos']
-    scaffold_graph.sort_values(['from','from_side']+[col for sublist in [['scaf'+str(s),'strand'+str(s)] for s in range(1,scaffold_graph['size'].max())] for col in sublist], inplace=True)
+    scaffold_graph.sort_values(['from','from_side']+[col for sublist in [['scaf'+str(s),'strand'+str(s),'dist'+str(s)] for s in range(1,scaffold_graph['size'].max())] for col in sublist], inplace=True)
     scaffold_graph['redundant'] = (scaffold_graph['from'] == scaffold_graph['from'].shift(1, fill_value=-1)) & (scaffold_graph['from_side'] == scaffold_graph['from_side'].shift(1, fill_value=''))
     for s in range(1,scaffold_graph['size'].max()):
-        scaffold_graph['redundant'] = scaffold_graph['redundant'] & ( np.isnan(scaffold_graph['scaf'+str(s)]) | ( (scaffold_graph['scaf'+str(s)] == scaffold_graph['scaf'+str(s)].shift(1, fill_value=-1)) & (scaffold_graph['strand'+str(s)] == scaffold_graph['strand'+str(s)].shift(1, fill_value='')))) 
+        scaffold_graph['redundant'] = scaffold_graph['redundant'] & ( np.isnan(scaffold_graph['scaf'+str(s)]) | ( (scaffold_graph['scaf'+str(s)] == scaffold_graph['scaf'+str(s)].shift(1, fill_value=-1)) & (scaffold_graph['strand'+str(s)] == scaffold_graph['strand'+str(s)].shift(1, fill_value='')) & (scaffold_graph['dist'+str(s)] == scaffold_graph['dist'+str(s)].shift(1, fill_value='')))) 
     scaffold_graph = scaffold_graph[ scaffold_graph['redundant'] == False ].copy()
-    scaffold_graph.drop(columns=['redundant','size'],inplace=True)
+    scaffold_graph.drop(columns=['redundant','size','org_pos'],inplace=True)
 
     # Remove overlapping paths with repeated starting scaffold
     scaffold_graph.reset_index(inplace=True, drop=True)
@@ -1543,8 +1570,9 @@ def BuildScaffoldGraph(long_range_connections, scaf_bridges):
         for s in range(1, (reps['length']-reps['rep_len']).max()):
             for rl in range(1, reps['rep_len'].max()):
                 if s+rl < reps['length'].max():
-                    reps = reps[(reps['rep_len'] != rl) | (reps['length']-rl-1 < s) | ((scaffold_graph.loc[reps['red_ind'], 'scaf'+str(s)].values == reps['scaf'+str(s+rl)]) & (scaffold_graph.loc[reps['red_ind'], 'strand'+str(s)].values == reps['strand'+str(s+rl)]))].copy()
+                    reps = reps[(reps['rep_len'] != rl) | (reps['length']-rl-1 < s) | ((scaffold_graph.loc[reps['red_ind'], 'scaf'+str(s)].values == reps['scaf'+str(s+rl)]) & (scaffold_graph.loc[reps['red_ind'], 'strand'+str(s)].values == reps['strand'+str(s+rl)]) & (scaffold_graph.loc[reps['red_ind'], 'dist'+str(s)].values == reps['dist'+str(s+rl)]))].copy()
         scaffold_graph.drop(index=np.unique(reps['red_ind'].values), inplace=True)
+        scaffold_graph.drop(columns=['rep_len'], inplace=True)
 
     return scaffold_graph
 
@@ -1553,40 +1581,40 @@ def FindUniqueExtensions(unique_extensions, potential_paths):
     if len(unique_path):
         unique_path['unique_len'] = 0
         unique_path['unique'] = True
-        unique_path.sort_values(['from','from_side']+[col for sublist in [['scaf'+str(s),'strand'+str(s)] for s in range(1,unique_path['length'].max())] for col in sublist], inplace=True)
+        unique_path.sort_values(['from','from_side']+[col for sublist in [['scaf'+str(s),'strand'+str(s),'dist'+str(s)] for s in range(1,unique_path['length'].max())] for col in sublist], inplace=True)
 
         for s in range(1,unique_path['length'].max()):
             # Check if path with s+1 scaffolds is unique for the given direction
             unique_path['unique'] = unique_path['unique'] & (np.isnan(unique_path['scaf'+str(s)]) == False) & ((unique_path['from'] != unique_path['from'].shift(1)) | (unique_path['from_side'] != unique_path['from_side'].shift(1)) |
-                                                                                                              ((unique_path['scaf'+str(s)] == unique_path['scaf'+str(s)].shift(1)) & (unique_path['strand'+str(s)] == unique_path['strand'+str(s)].shift(1))))
-            uniqueness = unique_path.groupby(['from','from_side'], sort=False)[['unique','scaf'+str(s),'strand'+str(s)]].agg({'unique':['sum','size'], ('scaf'+str(s)):['first'], ('strand'+str(s)):['first']}).reset_index()
+                                                                                                              ((unique_path['scaf'+str(s)] == unique_path['scaf'+str(s)].shift(1)) & (unique_path['strand'+str(s)] == unique_path['strand'+str(s)].shift(1)) & (unique_path['dist'+str(s)] == unique_path['dist'+str(s)].shift(1))))
+            uniqueness = unique_path.groupby(['from','from_side'], sort=False)[['unique','scaf'+str(s),'strand'+str(s),'dist'+str(s)]].agg({'unique':['sum','size'], ('scaf'+str(s)):['first'], ('strand'+str(s)):['first'], ('dist'+str(s)):['first']}).reset_index()
             uniqueness['identical'] = uniqueness[('unique','sum')]
-            uniqueness = uniqueness.drop(columns=('unique','sum')).droplevel(axis='columns',level=1).rename(columns={'unique':'size',('scaf'+str(s)):'to', ('strand'+str(s)):'to_side'})
+            uniqueness = uniqueness.drop(columns=('unique','sum')).droplevel(axis='columns',level=1).rename(columns={'unique':'size',('scaf'+str(s)):'to', ('strand'+str(s)):'to_side', ('strand'+str(s)):'to_side', ('dist'+str(s)):'dist'})
             uniqueness['to_side'] = np.where(uniqueness['to_side'] == '+', 'l', 'r')
             uniqueness['unique'] = uniqueness['size'] == uniqueness['identical']
             # Update unique_path for the next s (if the path is already not unique at length s+1 it cannot be at length s+2)
             unique_path['unique'] = np.repeat(uniqueness['unique'].values, uniqueness['size'].values)
             unique_path.loc[unique_path['unique'], 'unique_len'] += 1
-    
+
         unique_path = unique_path[unique_path['unique_len'] > 0].copy()
 
     if len(unique_path):
         unique_path = unique_path.groupby(['from','from_side'], sort=False).first().reset_index() # All path have the same values for the unique length, so just take the first path
-        unique_path = unique_path[['from','from_side','unique_len'] + [col for sublist in [['scaf'+str(s),'strand'+str(s)] for s in range(1,unique_path['unique_len'].max()+1)] for col in sublist]].copy()
+        unique_path = unique_path[['from','from_side','unique_len'] + [col for sublist in [['scaf'+str(s),'strand'+str(s),'dist'+str(s)] for s in range(1,unique_path['unique_len'].max()+1)] for col in sublist]].copy()
         for s in range(1,unique_path['unique_len'].max()+1):
-            unique_path.loc[unique_path['unique_len'] < s, ['scaf'+str(s),'strand'+str(s)]] = np.nan
+            unique_path.loc[unique_path['unique_len'] < s, ['scaf'+str(s),'strand'+str(s),'dist'+str(s)]] = np.nan
         unique_path = unique_path[(unique_path['unique_len'] > 1) | (unique_path['scaf1'] != unique_path['from'])].copy() # Remove simple repeats
         unique_extensions.append(unique_path.copy())
 
     return unique_extensions
 
 def FindBubblesAndUniquePaths(scaffolds, scaffold_parts, scaffold_graph, ploidy):
-    all_paths = scaffold_graph.drop(columns=['conn_code', 'org_pos']) # All path that have not been handled or dismissed already
+    all_paths = scaffold_graph.copy() # All path that have not been handled or dismissed already
     bubbles = []
     loops = []
     unique_extensions = []
     repeated_scaffolds = []
-
+#
     cs = 1 # Current scaffold position for extension
     while len(all_paths):
         # Store and remove loops (so that we find the start and end for unique loops)
@@ -1595,23 +1623,22 @@ def FindBubblesAndUniquePaths(scaffolds, scaffold_parts, scaffold_graph, ploidy)
             all_paths.loc[(all_paths['scaf'+str(s)] == all_paths['from']) & (all_paths['strand'+str(s)] == np.where(all_paths['from_side'] == 'r', '+', '-')), 'loop_len'] = s-1
         loop_path = all_paths[all_paths['loop_len'] >= 0].copy()
         if len(loop_path):
-            loop_path = loop_path[['from','from_side','loop_len']+[col for sublist in [['scaf'+str(s),'strand'+str(s)] for s in range(1,loop_path['loop_len'].max()+1)] for col in sublist]].copy()
-            for s in range(1,loop_path['loop_len'].max()+1):
-                loop_path.loc[loop_path['loop_len'] < s, ['scaf'+str(s),'strand'+str(s)]] = np.nan
+            loop_path = loop_path[['from','from_side','loop_len']+[col for sublist in [['scaf'+str(s),'strand'+str(s),'dist'+str(s)] for s in range(1,loop_path['loop_len'].max()+2)] for col in sublist]].copy()
+            for s in range(1,loop_path['loop_len'].max()+2):
+                loop_path.loc[loop_path['loop_len']+1 < s, ['scaf'+str(s),'strand'+str(s),'dist'+str(s)]] = np.nan # Keep the repeated scaffold on both sides to have the full distance information
             loop_path.drop_duplicates(inplace=True)
             loop_path = loop_path[loop_path['from_side'] == 'r'].copy()
-            loop_path.drop(columns=['from_side'], inplace=True)
             loops.append(loop_path.copy())
             repeated_scaffolds = np.unique(np.concatenate([repeated_scaffolds, loop_path['from'].values]).astype(int))
             all_paths = all_paths[all_paths['loop_len'] == -1].copy()
             all_paths.drop(columns=['loop_len'], inplace=True)
-
+#
         # Find scaffolds that appear in all path from a given start contig (requirement for unique path and bubble)
         all_paths.sort_values(['from','from_side'], inplace=True)
         all_paths['path_id'] = range(len(all_paths))
         alternatives = all_paths.groupby(['from','from_side']).size()
         all_paths['alts'] = np.repeat(alternatives.values, alternatives.values)
-
+#
         path_long_format = []
         if len(all_paths):
             for s in range(1,all_paths['length'].max()):
@@ -1622,81 +1649,107 @@ def FindBubblesAndUniquePaths(scaffolds, scaffold_parts, scaffold_graph, ploidy)
             path_long_format['to_side'] = np.where(path_long_format['to_side'] == '+', 'l', 'r')
             # In case the scaffold is circular only take the first appearance of each subscaffold (repeats will be filtered at a later stage)
             path_long_format = path_long_format.groupby(['from','from_side','alts','to','to_side','path_id'])['pos'].min().reset_index(name='pos')
-
+#
         if len(path_long_format):
             bubble_candidates = path_long_format.groupby(['from','from_side','alts','to','to_side']).size().reset_index(name='count')
              # All paths have this scaffold in this orientation ('to', 'to_side') in it
             bubble_candidates = bubble_candidates[(bubble_candidates['count'] == bubble_candidates['alts']) & (np.isin(bubble_candidates['from'], repeated_scaffolds) == False) & (np.isin(bubble_candidates['to'], repeated_scaffolds) == False)].copy()
         else:
             bubble_candidates = []
-
+#
         if len(bubble_candidates):
-            bubble_candidates.drop(columns=['count'], inplace=True)
-            # Check that the connection is the same in both directions
-            bubble_candidates = bubble_candidates.merge(bubble_candidates.rename(columns={'from':'to','from_side':'to_side','to':'from','to_side':'from_side'}), on=['from','from_side','to','to_side','alts'], how='inner')
-
+            bubble_candidates.drop(columns=['count','alts'], inplace=True)
+            # Check that the connection exists in both directions
+            bubble_candidates = bubble_candidates.merge(bubble_candidates.rename(columns={'from':'to','from_side':'to_side','to':'from','to_side':'from_side'}), on=['from','from_side','to','to_side'], how='inner')
+#
         if len(bubble_candidates):
-             # Add position and path information
-            bubble_candidates = bubble_candidates.merge(path_long_format, on=['from','from_side','to','to_side','alts'], how='left')
-            # Guarantee that both directions have the same amount of scaffolds included
-            bubble_candidates = bubble_candidates.merge(bubble_candidates.drop(columns=['path_id']).drop_duplicates().rename(columns={'from':'to','from_side':'to_side','to':'from','to_side':'from_side'}), on=['from','from_side','to','to_side','alts','pos'], how='inner')
-            bubble_candidates.sort_values(['from','from_side','path_id','pos'],  inplace=True)
+            # Add path information
+            bubble_candidates = bubble_candidates.merge(path_long_format.drop(columns=['alts']), on=['from','from_side','to','to_side'], how='left')
+            bubble_candidates = bubble_candidates.merge(all_paths.drop(columns=['length','alts']), on=['from','from_side','path_id'], how='left')
+            bubble_candidates['last_dist'] = 0
+            for s in range(1,all_paths['length'].max()):
+                bubble_candidates.loc[s == bubble_candidates['pos'],'last_dist'] = bubble_candidates['dist'+str(s)]
+                bubble_candidates.loc[bubble_candidates['pos'] <= s, ['scaf'+str(s),'strand'+str(s),'dist'+str(s)]] = np.nan
+                if len(bubble_candidates) == np.sum(np.isnan(bubble_candidates['scaf'+str(s)])):
+                    bubble_candidates.drop(columns=[col for sublist in [['scaf'+str(s),'strand'+str(s),'dist'+str(s)] for s in range(s,all_paths['length'].max())] for col in sublist], inplace=True)
+                    break
+            bubble_candidates['last_dist'] = bubble_candidates['last_dist'].astype(int)
             # Remove conflicting bubbles (bubbles that have different orders depending on the path taken)
+            bpaths = path_long_format[np.isin(path_long_format['path_id'], bubble_candidates['path_id'])].drop(columns=['alts']) # Get full path for all bubbles
+            bpaths = bpaths.merge(bubble_candidates[['from','from_side','to','to_side']].drop_duplicates(), on=['from','from_side','to','to_side'], how='inner').sort_values(['from','from_side','path_id','pos']) # Only take the bubble ends (but also in the other paths, where they aren't the end)
             conflicts = [-1]
             while len(conflicts):
-                tmp_candidates = bubble_candidates.groupby(['from','from_side','path_id'], sort=False).first().reset_index().drop(columns=['path_id','alts','pos']).drop_duplicates()
-                conflicts = tmp_candidates.groupby(['from','from_side'], sort=False).size()
-                tmp_candidates['conflicts'] = np.repeat(conflicts.values, conflicts.values) - 1 # Conflicts are the number of endings - 1, because a single ending is consistent with itself
+                tmp_candidates = bpaths.groupby(['from','from_side','path_id'], sort=False).first().reset_index().drop(columns=['path_id','pos']).drop_duplicates() # Get first bubble in every path
+                conflicts = tmp_candidates.groupby(['from','from_side'], sort=False).size().values
+                tmp_candidates['conflicts'] = np.repeat(conflicts, conflicts) - 1 # Conflicts are the number of endings - 1, because a single ending is consistent with itself
                 conflicts = tmp_candidates[tmp_candidates['conflicts'] > 0].copy()
-                conflicts = pd.concat([conflicts, conflicts.rename(columns={'from':'to','from_side':'to_side','to':'from','to_side':'from_side'})]).groupby(['from','from_side','to','to_side']).first().reset_index() # Also remove the opposite direction, as we always require both directions to be valid
-                bubble_candidates = bubble_candidates[np.isnan(bubble_candidates.merge(conflicts, on=['from','from_side','to','to_side'], how='left')['conflicts']).values].copy()
-            # Remove the conflict also in the other direction
-            bubble_candidates = bubble_candidates.merge(bubble_candidates.drop(columns=['path_id']).drop_duplicates().rename(columns={'from':'to','from_side':'to_side','to':'from','to_side':'from_side'}), on=['from','from_side','to','to_side','alts','pos'], how='inner')
-
+                bpaths = bpaths[bpaths.merge(conflicts[['from','from_side','to','to_side']].drop_duplicates(), on=['from','from_side','to','to_side'], how='left', indicator=True)['_merge'].values == 'left_only'] # Remove conflicts
+                bpaths = bpaths[bpaths.merge(conflicts[['from','from_side','to','to_side']].drop_duplicates().rename(columns={'from':'to','from_side':'to_side','to':'from','to_side':'from_side'}), on=['from','from_side','to','to_side'], how='left', indicator=True)['_merge'].values == 'left_only'] # Remove conflicts
+            # Remove the conflicts from bubble_candidates
+            bubble_candidates = bubble_candidates.merge(bpaths[['from','from_side','to','to_side']].drop_duplicates(), on=['from','from_side','to','to_side'], how='inner')
+#
+        if len(bubble_candidates):
+            # Remove duplicates
+            bubble_candidates.drop(columns=['path_id'], inplace=True)
+            bubble_candidates.drop_duplicates(inplace=True)
+            # Remove candidates that are only present in one direction (Should not happen, but if it happens we don't introduce missassemblies, because it still is a bubble)
+            bubble_candidates = bubble_candidates.merge(bubble_candidates[['from','from_side','to','to_side','pos']].drop_duplicates().rename(columns={'from':'to','from_side':'to_side','to':'from','to_side':'from_side'}), on=['from','from_side','to','to_side','pos'], how='inner')
+            if len(bubble_candidates):
+                bubble_candidates['bid'] = np.arange(len(bubble_candidates)) # Assign an id to identical connections independent of the direction
+                rev_bubbles = bubble_candidates.rename(columns={'bid':'bid2'})
+                rev_bubbles[['from','from_side','to','to_side']] = bubble_candidates[['to','to_side','from','from_side']]
+                rev_bubbles.loc[1<rev_bubbles['pos'],'last_dist'] = bubble_candidates.loc[1<bubble_candidates['pos'],'dist1'].astype(int)
+                for cpos in range(2,rev_bubbles['pos'].max()+1):
+                    for s in range(1,cpos):
+                        rev_bubbles.loc[rev_bubbles['pos'] == cpos, ['scaf'+str(s),'strand'+str(s),'dist'+str(s)]] = bubble_candidates.drop(columns=['dist'+str(cpos)], errors='ignore').rename(columns={'last_dist':('dist'+str(cpos))}).loc[bubble_candidates['pos'] == cpos, ['scaf'+str(cpos-s),'strand'+str(cpos-s),'dist'+str(cpos-s+1)]].values
+                        rev_bubbles.loc[rev_bubbles['pos'] == cpos, 'strand'+str(s)] = np.where(rev_bubbles.loc[rev_bubbles['pos'] == cpos, 'strand'+str(s)] == '+', '-', '+')
+                bubble_candidates = bubble_candidates.merge(rev_bubbles, on=bubble_candidates.columns.tolist()[:-1], how='inner')
+                bubble_candidates['bid'] = np.minimum(bubble_candidates['bid'],bubble_candidates['bid2'])
+                bubble_candidates.drop(columns=['bid2'], inplace=True)
+#
         if len(bubble_candidates):
             # Only take the first bubble (position wise) to have less duplicates (we can later stich them back together)
-            bubble_candidates = bubble_candidates.groupby(['from','from_side','path_id'], sort=False).first().reset_index()
-            bubble_candidates = bubble_candidates.merge(all_paths.drop(columns=['length']), on=['from','from_side','path_id','alts'], how='left')
-            for s in range(1,all_paths['length'].max()):
-                bubble_candidates.loc[bubble_candidates['pos'] <= s, ['scaf'+str(s),'strand'+str(s)]] = np.nan
-
-            # Check how many alternatives this bubble truely has (not all the alternatives the whole path has)
-            bubble_candidates['length'] = bubble_candidates['pos']-1
-            bubble_candidates.drop(columns=['path_id','pos','alts'], inplace=True)
-            bubble_candidates.drop_duplicates(inplace=True)
-            alternatives = bubble_candidates.groupby(['from','from_side'], sort=False).size()
-            bubble_candidates['alts'] = np.repeat(alternatives.values, alternatives.values)
-            bubble_candidates = bubble_candidates[bubble_candidates['alts']<=ploidy].copy() # If the bubble has more alternatives than we have haplotypes it must be a repeat and we don't straighten the bubble
-
-            # Remove the removed bubbles in the other direction as well
-            bubble_candidates = bubble_candidates.merge(bubble_candidates[['from','from_side','to','to_side','alts','length']].drop_duplicates().rename(columns={'from':'to','from_side':'to_side','to':'from','to_side':'from_side'}), on=['from','from_side','to','to_side','alts','length'], how='inner')
-
+            bubble_candidates.sort_values(['from','from_side','to','to_side'], inplace=True)
+            min_pos = bubble_candidates.groupby(['from','from_side'], sort=False)['pos'].agg(['min','size'])
+            bubble_candidates['min_pos_group'] = np.repeat(min_pos['min'].values, min_pos['size'].values)
+            min_pos = bubble_candidates.groupby(['from','from_side','to','to_side'], sort=False)['pos'].agg(['min','size'])
+            bubble_candidates['min_pos_bubble'] = np.repeat(min_pos['min'].values, min_pos['size'].values)
+            bubble_candidates = bubble_candidates[bubble_candidates['min_pos_group'] == bubble_candidates['min_pos_bubble']].drop(columns=['min_pos_group','min_pos_bubble'])
+            # Remove bubbles which lost their counterpart (Can happen when long reads form a bubble simply by being longer than other reads and therefore no alternative path starting at the same scaffold exists)
+            remove_bubbles = bubble_candidates.groupby(['bid']).size()
+            remove_bubbles = bubble_candidates.merge(remove_bubbles[remove_bubbles != 2].reset_index()[['bid']], on=['bid'], how='inner')
+            bubble_candidates = bubble_candidates[np.isin(bubble_candidates['bid'],remove_bubbles.loc[remove_bubbles['from'] != remove_bubbles['to'],'bid'].values) == False].copy()
+            # Get true amount of alternatives in bubble (not overall amount of alternatives for that start scaffold)
+            alternatives = bubble_candidates.groupby(['from','from_side','to','to_side'], sort=False).size().values
+            bubble_candidates['alts'] = np.repeat(alternatives, alternatives)
+#
         # Store detected bubbles
         if len(bubble_candidates):
-            bubble_candidates = bubble_candidates[['from','from_side','to','to_side','length','alts'] + [col for sublist in [['scaf'+str(s),'strand'+str(s)] for s in range(1,bubble_candidates['length'].max()+1)] for col in sublist]].copy()
+            bubble_candidates = bubble_candidates[['from','from_side','to','to_side','last_dist','pos','alts'] + [col for sublist in [['scaf'+str(s),'strand'+str(s),'dist'+str(s)] for s in range(1,bubble_candidates['pos'].max())] for col in sublist]].rename(columns={'pos':'length'})
+            bubble_candidates['length'] -= 1
             bubbles.append(bubble_candidates.copy())
-
+#
             # Remove paths where we already found a bubble
             all_paths = all_paths[ (all_paths[['from','from_side']].merge(pd.concat([bubble_candidates[['from','from_side']], bubble_candidates[['to','to_side']].rename(columns={'to':'from','to_side':'from_side'})]).drop_duplicates(), on=['from','from_side'], how='left', indicator=True)['_merge'] == "left_only").values ].copy()
-
+#
         # Dismiss paths that have more alternatives than ploidy
         if len(all_paths):
             all_paths['remove'] = all_paths['alts'] > ploidy
             unique_extensions = FindUniqueExtensions(unique_extensions, all_paths[all_paths['remove']])
             all_paths = all_paths[all_paths['remove'] == False].copy()
-
+#
         # Only extend paths if the current scaffold (cs) hasn't been in the path before (otherwise we would run into loops)
         if len(all_paths):
             all_paths['mscaf'] = all_paths['scaf'+str(cs)].fillna(-1).astype(int)
             for s in range(1, cs):
                 all_paths.loc[(all_paths['scaf'+str(cs)] == all_paths['scaf'+str(s)]) & (all_paths['strand'+str(cs)] == all_paths['strand'+str(s)]), 'mscaf'] = -2
             all_paths['mside'] = np.where(all_paths['strand'+str(cs)] == '+', 'r', 'l')
-            all_paths = all_paths.merge(scaffold_graph[['from','from_side','length'] + [col for sublist in [['scaf'+str(s),'strand'+str(s)] for s in range(1,scaffold_graph['length'].max())] for col in sublist]].rename(columns={**{'from':'mscaf', 'from_side':'mside', 'length':'new_len'}, **{('scaf'+str(s)):('cscaf'+str(s+cs)) for s in range(scaffold_graph['length'].max())}, **{('strand'+str(s)):('cstrand'+str(s+cs)) for s in range(scaffold_graph['length'].max())}}), on=['mscaf','mside'], how='left')
+            all_paths = all_paths.merge(scaffold_graph[['from','from_side','length'] + [col for sublist in [['scaf'+str(s),'strand'+str(s),'dist'+str(s)] for s in range(1,scaffold_graph['length'].max())] for col in sublist]].rename(columns={**{'from':'mscaf', 'from_side':'mside', 'length':'new_len'}, **{('scaf'+str(s)):('cscaf'+str(s+cs)) for s in range(scaffold_graph['length'].max())}, **{('strand'+str(s)):('cstrand'+str(s+cs)) for s in range(scaffold_graph['length'].max())}, **{('dist'+str(s)):('cdist'+str(s+cs)) for s in range(scaffold_graph['length'].max())}}), on=['mscaf','mside'], how='left')
             all_paths['ext_id'] = range(len(all_paths))
-
+#
             if np.isnan(all_paths['new_len'].max()):
                 all_paths['remove'] = True
-                all_paths.drop(columns=[col for col in all_paths.columns if (col[:5] == 'cscaf') or (col[:7] == 'cstrand')], inplace=True)
+                all_paths.drop(columns=[col for col in all_paths.columns if (col[:5] == 'cscaf') or (col[:7] == 'cstrand') or (col[:5] == 'cdist')], inplace=True)
                 all_paths.drop(columns=['ext_id'], inplace=True)
             else:
                 # If the current scaffold is repeated later on, try the extension for all and take the first that works
@@ -1707,32 +1760,33 @@ def FindBubblesAndUniquePaths(scaffolds, scaffold_parts, scaffold_graph, ploidy)
                     rep_extensions[-1]['shift'] = s-cs
                 rep_extensions = pd.concat(rep_extensions)
                 all_paths = all_paths.merge(rep_extensions, on=['ext_id'], how='left')
-
+#
                 # Create additional columns if we need them
                 all_paths['new_len'] += cs
                 for s in range(all_paths['length'].max(), (all_paths['new_len']+all_paths['shift']).max().astype(int)):
                     all_paths['scaf'+str(s)] = np.nan 
                     all_paths['strand'+str(s)] = np.nan
-
+                    all_paths['dist'+str(s)] = np.nan
+#
                 all_paths.loc[np.isnan(all_paths['new_len']), 'remove'] = True # If we don't have an extension remove the path
                 for s in range(cs+1,all_paths['new_len'].max().astype(int)):
                     for shift in range(all_paths['shift'].max()+1):
                         if s+shift < (all_paths['new_len']+all_paths['shift']).max().astype(int):
                             # If the extension diverges from the path on the overlap remove it
-                            all_paths.loc[(all_paths['shift'] == shift) & (np.isnan(all_paths['scaf'+str(s+shift)]) == False) & (np.isnan(all_paths['cscaf'+str(s)]) == False) & ((all_paths['scaf'+str(s+shift)] != all_paths['cscaf'+str(s)]) | (all_paths['strand'+str(s+shift)] != all_paths['cstrand'+str(s)])), 'remove'] = True
+                            all_paths.loc[(all_paths['shift'] == shift) & (np.isnan(all_paths['scaf'+str(s+shift)]) == False) & (np.isnan(all_paths['cscaf'+str(s)]) == False) & ((all_paths['scaf'+str(s+shift)] != all_paths['cscaf'+str(s)]) | (all_paths['strand'+str(s+shift)] != all_paths['cstrand'+str(s)]) | (all_paths['dist'+str(s+shift)] != all_paths['cdist'+str(s)])), 'remove'] = True
                             # Update extended values
-                            all_paths.loc[(all_paths['shift'] == shift) & (all_paths['remove'] == False) & np.isnan(all_paths['scaf'+str(s+shift)]) & (np.isnan(all_paths['cscaf'+str(s)]) == False), ['strand'+str(s+shift),'scaf'+str(s+shift)]] = all_paths.loc[(all_paths['shift'] == shift) & (all_paths['remove'] == False) & np.isnan(all_paths['scaf'+str(s+shift)]) & (np.isnan(all_paths['cscaf'+str(s)]) == False), ['cstrand'+str(s), 'cscaf'+str(s)]].values
-
+                            all_paths.loc[(all_paths['shift'] == shift) & (all_paths['remove'] == False) & np.isnan(all_paths['scaf'+str(s+shift)]) & (np.isnan(all_paths['cscaf'+str(s)]) == False), ['strand'+str(s+shift),'scaf'+str(s+shift),'dist'+str(s+shift)]] = all_paths.loc[(all_paths['shift'] == shift) & (all_paths['remove'] == False) & np.isnan(all_paths['scaf'+str(s+shift)]) & (np.isnan(all_paths['cscaf'+str(s)]) == False), ['cstrand'+str(s), 'cscaf'+str(s), 'cdist'+str(s)]].values
+#
                 all_paths['new_len'] += all_paths['shift'] # Add this only after the loop so that we don't increase the maximum for s in the loop, because we separately add the shift there
-                all_paths.drop(columns=[col for col in all_paths.columns if (col[:5] == 'cscaf') or (col[:7] == 'cstrand')], inplace=True)
-
+                all_paths.drop(columns=[col for col in all_paths.columns if (col[:5] == 'cscaf') or (col[:7] == 'cstrand') or (col[:5] == 'cdist')], inplace=True)
+#
                 # Take for every repeated scaffold the first that does not diverge from the path or the last if all diverge
                 all_paths['keep'] = all_paths['remove'] == False
                 all_paths['keep'] = all_paths.groupby(['ext_id'])['keep'].cumsum()-all_paths['keep']
                 all_paths = all_paths[all_paths['keep'] == 0].copy()
                 all_paths = all_paths.groupby(['ext_id']).last().reset_index(drop=True)
                 all_paths.drop(columns=['shift','keep'], inplace=True)
-
+#
                 # Finish the removal selection
                 all_paths.loc[all_paths['new_len'] <= all_paths['length'], 'remove'] = True # If we don't gain length it is not an extension
             all_paths['extended'] = all_paths['remove'] == False
@@ -1742,7 +1796,7 @@ def FindBubblesAndUniquePaths(scaffolds, scaffold_parts, scaffold_graph, ploidy)
             removals = all_paths.groupby(['from','from_side'], sort=False)['remove'].agg(['sum','size'])
             all_paths['remove'] = np.repeat( removals['sum'].values == removals['size'].values, removals['size'].values ) # Only remove a path if all path from this starting scaffold are removed
             cs += 1
-
+#
             # Remove non-extendable paths
             unique_extensions = FindUniqueExtensions(unique_extensions, all_paths[all_paths['remove']])
             all_paths = all_paths[all_paths['remove'] == False].copy()
@@ -1751,39 +1805,34 @@ def FindBubblesAndUniquePaths(scaffolds, scaffold_parts, scaffold_graph, ploidy)
             all_paths = all_paths[all_paths['extended'] | np.repeat(ext_count['sum'].values == 0, ext_count['size'].values)].copy() # If we have extensions for a given path, drop the failed extension attempts 
             all_paths.drop(columns=['path_id','alts','remove','new_len','extended'], inplace=True)
             all_paths.drop_duplicates(inplace=True)
-
+#
     bubbles = pd.concat(bubbles)
-    loops = pd.concat(loops)
-    unique_extensions = pd.concat(unique_extensions)
-    unique_extensions.sort_values(['from','from_side'], inplace=True)
-    unique_paths = bubbles[bubbles['alts'] == 1].copy()
-    unique_paths.drop(columns=['alts'], inplace=True)
-    bubbles = bubbles[bubbles['alts'] > 1].copy()
-    
-    unique_paths.sort_values(['from','from_side','to','to_side'], inplace=True)
-    unique_paths.drop_duplicates(inplace=True)
-    
     bubbles.sort_values(['from','from_side','to','to_side'], inplace=True)
     bubbles.drop_duplicates(inplace=True)
-
+#
+    unique_extensions = pd.concat(unique_extensions)
+    unique_extensions.sort_values(['from','from_side'], inplace=True)
+#
     # Insert reversed versions of loops
+    loops = pd.concat(loops)
     loops['from_side'] = 'r'
     rev_path = loops.copy()
     rev_path['from_side'] = 'l'
     for l in range(1, rev_path['loop_len'].max()+1):
+        rev_path.loc[rev_path['loop_len'] == l, 'dist'+str(l+1)] = loops.loc[loops['loop_len'] == l, 'dist1']
         for s in range(1, l+1):
             rev_path.loc[rev_path['loop_len'] == l, 'scaf'+str(s)] = loops.loc[loops['loop_len'] == l, 'scaf'+str(l+1-s)]
             rev_path.loc[rev_path['loop_len'] == l, 'strand'+str(s)] = np.where(loops.loc[loops['loop_len'] == l, 'strand'+str(l+1-s)] == '+', '-', '+')
+            rev_path.loc[rev_path['loop_len'] == l, 'dist'+str(s)] = loops.loc[loops['loop_len'] == l, 'dist'+str(l+2-s)]
     loops = pd.concat([loops, rev_path])
     loops.sort_values(['from','from_side'], inplace=True)
     loops.drop_duplicates(inplace=True)
-
-    return unique_paths, bubbles, loops, unique_extensions
+#
+    return bubbles, loops, unique_extensions
     
-def GroupConnectedScaffoldsIntoKnots(unique_paths, bubbles, loops, unique_extensions, scaffolds, scaffold_parts, contig_parts):
+def GroupConnectedScaffoldsIntoKnots(bubbles, loops, unique_extensions, scaffolds, scaffold_parts, contig_parts):
     # Create copies, so that we don't modify the original
     cbubbles = bubbles.copy()
-    cunique_paths = unique_paths.copy()
     cloops = loops.copy()
     cunique_extensions = unique_extensions.copy()
 
@@ -1797,28 +1846,19 @@ def GroupConnectedScaffoldsIntoKnots(unique_paths, bubbles, loops, unique_extens
             conns.append(cbubbles.loc[np.isnan(cbubbles['scaf'+str(s)]) == False, ['id', 'scaf'+str(s)]].rename(columns={'id':'conn', ('scaf'+str(s)):'scaffold'}))
             conns[-1]['scaffold'] = conns[-1]['scaffold'].astype(int)
 
-    if len(cunique_paths):
-        cunique_paths['id'] = range(len(cbubbles), len(cbubbles)+len(cunique_paths))
-        conns.append(cunique_paths[['id', 'from']].rename(columns={'id':'conn', 'from':'scaffold'}))
-        conns.append(cunique_paths[['id', 'to']].rename(columns={'id':'conn', 'to':'scaffold'}))
-        for s in range(1,cunique_paths['length'].max()+1):
-            conns.append(cunique_paths.loc[np.isnan(cunique_paths['scaf'+str(s)]) == False, ['id', 'scaf'+str(s)]].rename(columns={'id':'conn', ('scaf'+str(s)):'scaffold'}))
-            conns[-1]['scaffold'] = conns[-1]['scaffold'].astype(int)
-
     if len(cloops):
-        cloops['id'] = range(len(cbubbles)+len(cunique_paths), len(cbubbles)+len(cunique_paths)+len(cloops))
+        cloops['id'] = range(len(cbubbles), len(cbubbles)+len(cloops))
         conns.append(cloops[['id', 'from']].rename(columns={'id':'conn', 'from':'scaffold'}))
         for s in range(1,cloops['loop_len'].max()+1):
             conns.append(cloops.loc[np.isnan(cloops['scaf'+str(s)]) == False, ['id', 'scaf'+str(s)]].rename(columns={'id':'conn', ('scaf'+str(s)):'scaffold'}))
             conns[-1]['scaffold'] = conns[-1]['scaffold'].astype(int)
 
     if len(cunique_extensions):
-        cunique_extensions['id'] = range(len(cbubbles)+len(cunique_paths)+len(cloops), len(cbubbles)+len(cunique_paths)+len(cloops)+len(cunique_extensions))
+        cunique_extensions['id'] = range(len(cbubbles)+len(cloops), len(cbubbles)+len(cloops)+len(cunique_extensions))
         conns.append(cunique_extensions[['id', 'from']].rename(columns={'id':'conn', 'from':'scaffold'}))
         for s in range(1,cunique_extensions['unique_len'].max()+1):
             conns.append(cunique_extensions.loc[np.isnan(cunique_extensions['scaf'+str(s)]) == False, ['id', 'scaf'+str(s)]].rename(columns={'id':'conn', ('scaf'+str(s)):'scaffold'}))
             conns[-1]['scaffold'] = conns[-1]['scaffold'].astype(int)
-
 
     if len(conns) == 0:
         knots = []
@@ -1891,17 +1931,27 @@ def ResolveLoops(loops, unique_paths, bubbles, unique_extensions):
     return unique_paths, bubbles, unique_extensions
 
 def TraverseScaffoldingGraph(scaffolds, scaffold_parts, scaffold_graph, contig_parts, scaf_bridges, ploidy):
-    unique_paths, bubbles, loops, unique_extensions = FindBubblesAndUniquePaths(scaffolds, scaffold_parts, scaffold_graph, ploidy)
-    knots = GroupConnectedScaffoldsIntoKnots(unique_paths, bubbles, loops, unique_extensions, scaffolds, scaffold_parts, contig_parts)
+    bubbles, loops, unique_extensions = FindBubblesAndUniquePaths(scaffolds, scaffold_parts, scaffold_graph, ploidy)
+    knots = GroupConnectedScaffoldsIntoKnots(bubbles, loops, unique_extensions, scaffolds, scaffold_parts, contig_parts)
+#
+    # Separate some stuff from bubbles
+    inversions = bubbles[bubbles['from'] == bubbles['to']].copy()
+    bubbles = bubbles[bubbles['from'] != bubbles['to']].copy()
+    unique_paths = bubbles[1 == bubbles['alts']].drop(columns=['alts'])
+    repeat_bubbles = bubbles[bubbles['alts'] > ploidy].copy()
+    bubbles = bubbles[(1 < bubbles['alts']) & (bubbles['alts'] <= ploidy)].copy()
+#
     #unique_paths, bubbles, unique_extensions = ResolveLoops(loops, unique_paths, bubbles, unique_extensions)
     # Do here: Handle unique extensions
-
+#
     # Start from the longest scaffold in each knot and extend it to both sides as much as possible and repeat this until all scaffolds have been addressed
     final_paths = []
+    final_alternatives = []
     duplicated_scaffolds = []
     while len(knots):
         cur_start = knots.groupby(['knot']).first().reset_index()
-        cur_paths = pd.DataFrame({'center':cur_start['scaffold'].values, 'pos':0, 'scaffold':cur_start['scaffold'].values, 'strand':'+'})
+        cur_paths = pd.DataFrame({'center':cur_start['scaffold'].values, 'pos':0, 'scaffold':cur_start['scaffold'].values, 'strand':'+', 'distance':0})
+        cur_alters = []
         included_scaffolds = []
 #
         # Extend to both sides
@@ -1909,13 +1959,17 @@ def TraverseScaffoldingGraph(scaffolds, scaffold_parts, scaffold_graph, contig_p
             ext = pd.DataFrame({'center':cur_start['scaffold'].values, 'pos':0, 'len':1})
             while len(ext):
                 new_paths = [cur_paths.copy()]
+                if len(cur_alters):
+                    new_alters = [cur_alters]
+                else:
+                    new_alters = []
                 if direction == "right":
                     ext = ext.merge(cur_paths, on=['center','pos'], how='left')
                     ext['side'] = np.where(ext['strand'] == '+', 'r', 'l')
                 else:
                     cur_paths['rev_strand'] = np.where(cur_paths['strand'] == '+', '-', '+')
                     cur_paths['rev_pos'] = cur_paths['pos'] * (-1)
-                    ext = ext.merge(cur_paths[['center', 'rev_pos', 'scaffold', 'strand']].rename(columns={'rev_pos':'pos'}), on=['center','pos'], how='left')
+                    ext = ext.merge(cur_paths[['center', 'rev_pos', 'scaffold', 'strand', 'distance']].rename(columns={'rev_pos':'pos'}), on=['center','pos'], how='left')
                     ext['side'] = np.where(ext['strand'] == '+', 'l', 'r')
 #
                 ## Check if we can extend with a unique path
@@ -1940,14 +1994,15 @@ def TraverseScaffoldingGraph(scaffolds, scaffold_parts, scaffold_graph, contig_p
                     # Insert new scaffolds into path
                     uni_ext['pos'] += 1
                     for s in range(1,uni_ext['length'].max()+1):
-                        new_paths.append(uni_ext.loc[(uni_ext['length'] >= s) & (uni_ext['pos'] >= uni_ext['len']), ['center','pos','scaf'+str(s),'strand'+str(s)]].rename(columns={('scaf'+str(s)):'scaffold', ('strand'+str(s)):'strand'}))
+                        new_paths.append(uni_ext.loc[(uni_ext['length'] >= s) & (uni_ext['pos'] >= uni_ext['len']), ['center','pos','scaf'+str(s),'strand'+str(s),'dist'+str(s)]].rename(columns={('scaf'+str(s)):'scaffold', ('strand'+str(s)):'strand', ('dist'+str(s)):'distance'}))
                         new_paths[-1]['scaffold'] = new_paths[-1]['scaffold'].astype(int)
+                        new_paths[-1]['distance'] = new_paths[-1]['distance'].astype(int)
                         if direction == "left":
                             new_paths[-1]['strand'] = np.where(new_paths[-1]['strand'] == '+', '-', '+')
                             new_paths[-1]['pos'] = new_paths[-1]['pos'] * (-1)
                         uni_ext['pos'] += 1
                     uni_ext['pos'] = uni_ext['new_len']-1
-                    new_paths.append(uni_ext[['center','pos','to','to_strand']].rename(columns={'to':'scaffold', 'to_strand':'strand'}))
+                    new_paths.append(uni_ext[['center','pos','to','to_strand','last_dist']].rename(columns={'to':'scaffold', 'to_strand':'strand', 'last_dist':'distance'}))
                     if direction == "left":
                         new_paths[-1]['pos'] = new_paths[-1]['pos'] * (-1)
                     ext = ext.merge(uni_ext[['center','new_len']], on=['center'], how='left')
@@ -1966,72 +2021,251 @@ def TraverseScaffoldingGraph(scaffolds, scaffold_parts, scaffold_graph, contig_p
                     bext = bext[ bext['new_len'] > bext['len'] ].copy() # Remove extensions that are shorter or equally long as the current path (don't extend)
                     if len(bext):
                         bext['cur_pos'] = bext['pos'] + 1
-                        for s in range(1,bext['length'].max()+1):
-                            bext = bext.merge(cur_paths[['center', ('pos' if direction == "right" else 'rev_pos'), 'scaffold', ('strand' if direction == "right" else 'rev_strand')]].rename(columns={('pos' if direction == "right" else 'rev_pos'):'cur_pos', 'scaffold':'pscaf', ('strand' if direction == "right" else 'rev_strand'):'pstrand'}), on=['center','cur_pos'], how='left')
-                            bext = bext[np.isnan(bext['pscaf']) | ((bext['pscaf'] == bext['scaf'+str(s)]) & (bext['pstrand'] == bext['strand'+str(s)]))].copy()
-                            bext.drop(columns=['pscaf','pstrand'], inplace=True)
-                            bext['cur_pos'] += 1
                         if direction == "right":
                             bext['to_strand'] = np.where(bext['to_side'] == 'l', '+', '-')
                         else:
                             bext['to_strand'] = np.where(bext['to_side'] == 'l', '-', '+')
+                        alt_ext = [] # Before removing bubbles that do not fit the current path store them to check if they are from an alternative path
+                        for s in range(1,bext['length'].max()+1):
+                            bext = bext.merge(cur_paths[['center', ('pos' if direction == "right" else 'rev_pos'), 'scaffold', ('strand' if direction == "right" else 'rev_strand'), 'distance']].rename(columns={('pos' if direction == "right" else 'rev_pos'):'cur_pos', 'scaffold':'pscaf', ('strand' if direction == "right" else 'rev_strand'):'pstrand', 'distance':'pdist'}), on=['center','cur_pos'], how='left')
+                            alt_ext.append( bext[(np.isnan(bext['pscaf']) == False) & ((bext['pscaf'] != bext['scaf'+str(s)]) | (bext['pstrand'] != bext['strand'+str(s)]) | (bext['pdist'] != bext['dist'+str(s)]))].drop(columns=['pscaf','pstrand','pdist']) )
+                            bext = bext[np.isnan(bext['pscaf']) | ((bext['pscaf'] == bext['scaf'+str(s)]) & (bext['pstrand'] == bext['strand'+str(s)]) & (bext['pdist'] == bext['dist'+str(s)]))].copy()
+                            bext.drop(columns=['pscaf','pstrand','pdist'], inplace=True)
+                            bext['cur_pos'] += 1
                         bext['cur_pos'] = bext['new_len']-1
-                        bext = bext.merge(cur_paths[['center', ('pos' if direction == "right" else 'rev_pos'), 'scaffold', 'strand']].rename(columns={('pos' if direction == "right" else 'rev_pos'):'cur_pos', 'scaffold':'pscaf', 'strand':'pstrand'}), on=['center','cur_pos'], how='left')
-                        bext = bext[np.isnan(bext['pscaf']) | ((bext['pscaf'] == bext['to']) & (bext['pstrand'] == bext['to_strand']))].copy()
-                        bext.drop(columns=['pscaf','pstrand','cur_pos'], inplace=True)
+                        bext = bext.merge(cur_paths[['center', ('pos' if direction == "right" else 'rev_pos'), 'scaffold', 'strand', 'distance']].rename(columns={('pos' if direction == "right" else 'rev_pos'):'cur_pos', 'scaffold':'pscaf', 'strand':'pstrand', 'distance':'pdist'}), on=['center','cur_pos'], how='left')
+                        alt_ext.append( bext[(np.isnan(bext['pscaf']) == False) & ((bext['pscaf'] != bext['to']) | (bext['pstrand'] != bext['to_strand']) | (bext['pdist'] != bext['last_dist']))].drop(columns=['pscaf','pstrand','pdist']) )
+                        bext = bext[np.isnan(bext['pscaf']) | ((bext['pscaf'] == bext['to']) & (bext['pstrand'] == bext['to_strand']) & (bext['pdist'] == bext['last_dist']))].copy() # 'to_strand' we do not need to reverse, because we directly created it correctly based on direction
+                        bext.drop(columns=['pscaf','pstrand','pdist','cur_pos'], inplace=True)
+                        if 0 == len(cur_alters):
+                            alt_ext = []
+                        else:
+                            # Remove alternatives that do not belong to one that is consistent with the main path
+                            alt_ext = pd.concat(alt_ext)
+                            alt_ext = alt_ext.merge(bext[['center']].drop_duplicates(), on=['center'], how='inner')
+                            # Remove alternatives where we are currently in a bubble or a bubble comes afterwards
+                            alt_ext = alt_ext.merge(cur_alters.rename(columns={'scaffold':'alt_scaf','strand':'alt_strand','distance':'alt_dist'}), on=['center'], how='inner') # If there is no previous alternative it cannot connect to one
+                            if len(alt_ext) and direction == "right":
+                                # Ignore the alternatives from the other direction
+                                alt_ext = alt_ext[alt_ext['end_pos'] > 0].copy()
+                            if len(alt_ext):
+                                alt_ext.sort_values(['center','alt_id','alt_pos'], inplace=True)
+                                last_alt = alt_ext.groupby(['center'], sort=False)['start_pos'].agg(['min' if direction == "left" else 'max', 'size'])
+                                alt_ext['last_alt'] = np.repeat(last_alt['min' if direction == "left" else 'max'].values, last_alt['size'].values)
+                                alt_ext = alt_ext[alt_ext['start_pos'] == alt_ext['last_alt']].drop(columns=['last_alt'])
+                                alt_ext = alt_ext[alt_ext['pos'] >= np.abs(alt_ext['end_pos'])-1].copy()
+                            if len(alt_ext):
+                                alt_ext['alt_dist'] = alt_ext['alt_dist'].shift(1 if direction == "left" else -1, fill_value=0)
+                                # Store alternatives that cannot connect (because they are a distance variant or a deletion or they are supposed to connect to a deletion)
+                                alt_size = alt_ext.groupby(['center'], sort=False).size().values
+                                alt_ext['alt_size'] = np.repeat(alt_size, alt_size)
+                                non_connectable = (0 == alt_ext['length']) | ((1 == alt_ext['alt_size']) & (1 < np.abs(alt_ext['end_pos']-alt_ext['start_pos'])))
+                                accepted_alts = alt_ext[non_connectable].copy()
+                                accepted_alts['alt_id'] = np.nan # Remove alternative id, because we cannot phase it without connection
+                                alt_ext = alt_ext[(False == non_connectable) & (np.abs(alt_ext['alt_pos'])+1 != alt_ext['alt_size'])].copy() # Additionally remove the 'to' scaffold from the alternatives, because it is also part of the main path
+                                # Remove alternatives that do not connect with a previous alternative (the main connects to the previous main otherwise it would be handled in the alt_ext cases in the next section)
+                                if len(alt_ext):
+                                    alt_path = []
+                                    for s in range(1, (alt_ext['cur_pos']-alt_ext['pos']).max()+1):
+                                        alt_path.append( alt_ext.loc[alt_ext['cur_pos']-alt_ext['pos'] >= s, ['scaf'+str(s),'strand'+str(s),'alt_scaf','alt_strand','alt_dist']].rename(columns={('scaf'+str(s)):'from', ('strand'+str(s)):'from_strand', 'alt_scaf':'to', 'alt_strand':'to_strand','alt_dist':'last_dist'}).reset_index() )
+                                        alt_path[-1]['bpos'] = s
+                                    alt_path = pd.concat(alt_path)
+                                    alt_path['from'] = alt_path['from'].astype(int)
+                                    alt_path['from_side'] = np.where(alt_path['from_strand'] == '+', 'l', 'r')
+                                    if direction == "left": 
+                                        alt_path['to_side'] = np.where(alt_path['to_strand'] == '+', 'l', 'r')
+                                    else:
+                                        alt_path['to_side'] = np.where(alt_path['to_strand'] == '+', 'r', 'l')
+                                    alt_path.drop(columns=['from_strand','to_strand'], inplace=True)
+                                    alt_path = pd.concat([alt_path.merge(unique_paths, on=['from','from_side','to','to_side','last_dist'], how='inner'), alt_path.merge(bubbles.drop(columns=['alts']), on=['from','from_side','to','to_side','last_dist'], how='inner')])
+                                    if len(alt_path):
+                                        ## Check that the paths are consistent
+                                        # First check that the paths have the right length
+                                        alt_path = alt_path[ alt_path['length']+2 == alt_path['bpos'] + (alt_ext.loc[alt_path['index'].values, 'pos'].values - np.abs(alt_ext.loc[alt_path['index'].values, 'end_pos'].values) + 1) + (alt_ext.loc[alt_path['index'].values, 'alt_size'].values - np.abs(alt_ext.loc[alt_path['index'].values, 'alt_pos'].values))].copy()
+                                        # Then check all the scaffolds within the current bubble before the connecting scaffold
+                                        for cbpos in range(alt_path['bpos'].min(), alt_path['bpos'].max()+1):
+                                            # The last one in the bubble was already checked by merging except for the distance
+                                            alt_path = alt_path[ (alt_path['bpos'] != cbpos) | ( alt_path['dist1'].values == alt_ext.loc[alt_path['index'].values, 'dist'+str(cbpos)].values) ].copy()
+                                        alt_path['bpos'] -= 1
+                                        alt_path['check'] = 1 # The next scaffold to check
+                                        cbpos = alt_path['bpos'].max()
+                                        while 0 < cbpos:
+                                            for ccheck in range(alt_path.loc[alt_path['bpos'] == cbpos, 'check'].min(), alt_path.loc[alt_path['bpos'] == cbpos, 'check'].max()+1):
+                                                alt_path = alt_path[ (alt_path['bpos'] != cbpos) | (alt_path['check'] != ccheck) |
+                                                                     ( (alt_path['scaf'+str(ccheck)].values == alt_ext.loc[alt_path['index'].values, 'scaf'+str(cbpos)].values) &
+                                                                       (alt_path['strand'+str(ccheck)].values != alt_ext.loc[alt_path['index'].values, 'strand'+str(cbpos)].values) & # Strand must be different because we go in different directions
+                                                                       (alt_path['dist'+str(ccheck+1)].values == alt_ext.loc[alt_path['index'].values, 'dist'+str(cbpos)].values) ) ].copy() # We have to take the next distance because we go in different directions
+                                            alt_path.loc[alt_path['bpos'] == cbpos, 'check'] += 1
+                                            alt_path.loc[alt_path['bpos'] == cbpos, 'bpos'] -= 1
+                                            cbpos = alt_path['bpos'].max()
+                                        # Check all scaffolds on the main path in between the current bubble and the connected alternative path
+                                        if len(alt_path):
+                                            alt_path.rename(columns={'bpos':'cpos'}, inplace=True)
+                                            alt_path['cpos'] = alt_ext.loc[alt_path['index'].values, 'pos'].values # Start of the bubble
+                                            alt_path['apos'] = np.abs(alt_ext.loc[alt_path['index'].values, 'end_pos'].values)-1 # Last position of the alternative path
+                                            alt_path['center'] = alt_ext.loc[alt_path['index'].values, 'center'].values
+                                            tmp_path = cur_paths.merge(alt_path.loc[alt_path['cpos'] > alt_path['apos'], ['center']], on=['center'], how='inner')
+                                            if direction == "left":
+                                                tmp_path.drop(columns=['pos','strand'], inplace=True)
+                                                tmp_path.rename(columns={'rev_pos':'cpos', 'scaffold':'cscaf', 'rev_strand':'cstrand', 'distance':'cdist'}, inplace=True)
+                                            else:
+                                                tmp_path.rename(columns={'pos':'cpos', 'scaffold':'cscaf', 'strand':'cstrand', 'distance':'cdist'}, inplace=True)
+                                            tmp_path = tmp_path[tmp_path['cpos'] > 1].copy() # Position 0 cannot have an alternative, thus pos 1 is the first possible alternative and therefore we never compare it to the main path
+                                            while len(tmp_path):
+                                                alt_path = alt_path.merge(tmp_path, on=['center','cpos'], how='left')
+                                                for ccheck in range(alt_path.loc[alt_path['cpos'] > alt_path['apos'], 'check'].min(), alt_path.loc[alt_path['cpos'] > alt_path['apos'], 'check'].max()+1):
+                                                    alt_path = alt_path[ (alt_path['cpos'] <= alt_path['apos']) | (alt_path['check'] != ccheck) |
+                                                                         ( (alt_path['scaf'+str(ccheck)] == alt_path['cscaf']) &
+                                                                           (alt_path['strand'+str(ccheck)] != alt_path['cstrand']) & # Strand must be different because we go in different directions
+                                                                           (alt_path['dist'+str(ccheck+1)].values == alt_path['cdist']) ) ].copy() # We have to take the next distance because we go in different directions
+                                                alt_path.loc[alt_path['cpos'] > alt_path['apos'], 'check'] += 1
+                                                alt_path.loc[alt_path['cpos'] > alt_path['apos'], 'cpos'] -= 1
+                                                alt_path.drop(columns=['cscaf','cstrand','cdist'], inplace=True)
+                                                tmp_path = tmp_path.merge(alt_ext.loc[alt_path[alt_path['cpos'] > alt_path['apos']].index.values, ['center']], on=['center'], how='inner')
+                                        # Check all scaffolds in the connected alternative after the connected scaffold
+                                        if len(alt_path):
+                                            alt_path.rename(columns={'cpos':'epos'}, inplace=True)
+                                            alt_path['epos'] = np.abs(alt_ext.loc[alt_path['index'].values, 'alt_pos'].values) # Connected position on the alternative path (end position: Has already been tested by the original merge)
+                                            alt_path['apos'] = alt_ext.loc[alt_path['index'].values, 'alt_size'].values - 1 # Last position of the alternative path
+                                            alt_path['alt_id'] = alt_ext.loc[alt_path['index'].values, 'alt_id'].values
+                                            alt_path['dist'+str(alt_path['length'].max()+1)] = np.nan # Make sure this dist exists, because we might read one over the existing ones for distances
+                                            tmp_alts = cur_alters.merge(alt_path.loc[alt_path['apos'] > alt_path['epos'], ['center','alt_id']], on=['center','alt_id'], how='inner')
+                                            tmp_alts.drop(columns=['start_pos','end_pos'], inplace=True)
+                                            tmp_alts.rename(columns={'alt_pos':'apos', 'scaffold':'cscaf', 'strand':'cstrand', 'distance':'cdist'}, inplace=True)
+                                            tmp_alts['apos'] = np.abs(tmp_alts['apos'])
+                                            if direction == "left":
+                                                tmp_alts['cstrand'] = np.where(tmp_alts['cstrand'] == '+', '-', '+')
+                                            while len(tmp_alts):
+                                                alt_path = alt_path.merge(tmp_alts, on=['center','alt_id','apos'], how='left')
+                                                for ccheck in range(alt_path.loc[alt_path['apos'] > alt_path['epos'], 'check'].min(), alt_path.loc[alt_path['apos'] > alt_path['epos'], 'check'].max()+1):
+                                                    alt_path = alt_path[ (alt_path['apos'] <= alt_path['epos']) | (alt_path['check'] != ccheck) |
+                                                                         ( (alt_path['scaf'+str(ccheck)] == alt_path['cscaf']) &
+                                                                           (alt_path['strand'+str(ccheck)] != alt_path['cstrand']) & # Strand must be different because we go in different directions
+                                                                           ((alt_path['dist'+str(ccheck+1)].values == alt_path['cdist']) | (1 == alt_path['apos'] - alt_path['epos'])) ) ].copy() # We have to take the next distance because we go in different directions and if we check the last scaffold the distance is stored in last_dist, which we already checked
+                                                alt_path.loc[alt_path['apos'] > alt_path['epos'], 'check'] += 1
+                                                alt_path.loc[alt_path['apos'] > alt_path['epos'], 'apos'] -= 1
+                                                alt_path.drop(columns=['cscaf','cstrand','cdist'], inplace=True)
+                                                tmp_alts = tmp_alts.merge(alt_path.loc[alt_path['apos'] > alt_path['epos'], ['center','alt_id']], on=['center','alt_id'], how='inner')
+                                    # Only keep extensions that still have a connecting path
+                                    if len(alt_path):
+                                        alt_ext = alt_ext.loc[np.unique(alt_path['index'].values)]
+                                    else:
+                                        alt_ext = []
+                                # Recombine with the non_connectable
+                                if len(alt_ext):
+                                    alt_ext = pd.concat([alt_ext, accepted_alts])
+                                else:
+                                    alt_ext = accepted_alts
+                            # Prepare alt_ext for the next section
+                            if len(alt_ext):
+                                alt_ext = [alt_ext.drop(columns=['cur_pos','start_pos','end_pos','alt_pos','alt_scaf','alt_strand','alt_dist','alt_size'])]
+                            else:
+                                alt_ext = []
                 if len(bext):
-                    # From all consistent paths through a bubble pick the one with more reads supporting the bridge
+                    # From all consistent paths through a bubble pick the one with more reads supporting the bridge as main path
                     bext['first'] = np.where(bext['length'] == 0, bext['to'], bext['scaf1']).astype(int)
                     bext['first_side'] = np.where(bext['length'] == 0, bext['to_side'], np.where(bext['strand1'] == '+', 'l', 'r'))
-                    bext = bext.merge(scaf_bridges[['from','from_side','to','to_side','bcount']].rename(columns={'from':'scaffold', 'from_side':'side', 'to':'first', 'to_side':'first_side'}), on=['scaffold','side','first','first_side'], how='left')
+                    bext['first_dist'] = np.where(bext['length'] == 0, bext['last_dist'], bext['dist1']).astype(int)
+                    bext = bext.merge(scaf_bridges[['from','from_side','to','to_side','mean_dist','bcount']].rename(columns={'from':'scaffold', 'from_side':'side', 'to':'first', 'to_side':'first_side', 'mean_dist':'first_dist'}), on=['scaffold','side','first','first_side','first_dist'], how='left')
                     bext.sort_values(['center'], inplace=True)
                     bcounts = bext.groupby(['center'], sort=False)['bcount'].agg(['max','size'])
+                    alt_ext.append(bext[bext['bcount'] != np.repeat(bcounts['max'].values, bcounts['size'].values)].drop(columns=['first','first_side','first_dist','bcount']))
                     bext = bext[bext['bcount'] == np.repeat(bcounts['max'].values, bcounts['size'].values)].copy()
-                    bext.drop(columns=['first','first_side','bcount'], inplace=True)
+                    bext.drop(columns=['first','first_side','first_dist','bcount'], inplace=True)
                     bext['last'] = bext['scaffold']
                     bext['last_side'] = bext['side']
                     for s in range(1,bext['length'].max()+1):
                         bext.loc[bext['length'] == s, 'last'] = bext.loc[bext['length'] == s, 'scaf'+str(s)].astype(int)
                         bext.loc[bext['length'] == s, 'last_side'] = np.where(bext.loc[bext['length'] == s, 'strand'+str(s)] == '+', 'r', 'l')
-                    bext = bext.merge(scaf_bridges[['from','from_side','to','to_side','bcount']].rename(columns={'from':'last', 'from_side':'last_side'}), on=['last','last_side','to','to_side'], how='left')
+                    bext = bext.merge(scaf_bridges[['from','from_side','to','to_side','mean_dist','bcount']].rename(columns={'from':'last', 'from_side':'last_side', 'mean_dist':'last_dist'}), on=['last','last_side','to','to_side','last_dist'], how='left')
                     bcounts = bext.groupby(['center'], sort=False)['bcount'].agg(['max','size'])
+                    alt_ext.append(bext[bext['bcount'] != np.repeat(bcounts['max'].values, bcounts['size'].values)].drop(columns=['last','last_side','bcount']))
                     bext = bext[bext['bcount'] == np.repeat(bcounts['max'].values, bcounts['size'].values)].copy()
                     bext.drop(columns=['last','last_side','bcount'], inplace=True)
                     # If bridges are equal take the ones including more scaffolds
                     max_len = bext.groupby(['center'], sort=False)['length'].agg(['max','size'])
+                    alt_ext.append(bext[bext['length'] != np.repeat(max_len['max'].values, max_len['size'].values)].copy())
                     bext = bext[bext['length'] == np.repeat(max_len['max'].values, max_len['size'].values)].copy()
-                    bext = bext.groupby(['center'], sort=False).first().reset_index() # If there are still multiple options just take the first
+                    # If there are still multiple options just take the first
+                    bext['option'] = bext.groupby(['center'], sort=False).cumcount()
+                    alt_ext.append(bext[0 < bext['option']].drop(columns=['option']))
+                    bext = bext[0 == bext['option']].drop(columns=['option'])
                     # Check if the extension is already included (so that we do not get stuck in a loop)
                     bext['included'] = (bext[['center','to','to_strand']].rename(columns={'to':'scaffold', 'to_strand':'strand'}).merge(cur_paths[['center','scaffold','strand']], on=['center','scaffold','strand'], how='left', indicator=True).drop_duplicates()['_merge'] == "both").values
                     for s in range(1,bext['length'].max()+1):
                         bext.loc[bext['included'] & (bext['length'] >= s), 'included'] = (bext.loc[bext['included'] & (bext['length'] >= s), ['center','scaf'+str(s),'strand'+str(s)]].rename(columns={('scaf'+str(s)):'scaffold', ('strand'+str(s)):'strand'}).merge((cur_paths[['center','scaffold','strand']] if direction == "right" else cur_paths[['center','scaffold','rev_strand']].rename(columns={'rev_strand':'strand'})), on=['center','scaffold','strand'], how='left', indicator=True).drop_duplicates()['_merge'] == "both").values
                     bext = bext[ bext['included'] == False ].copy()
+                    # Join alternative extensions
+                    alt_ext = pd.concat(alt_ext).sort_values(['center'])
+                    if len(alt_ext):
+                        alt_ext = alt_ext[np.isin(alt_ext['center'], bext['center'].values)].copy()
                 if len(bext):
                     # Insert new scaffolds into path
                     bext['pos'] += 1
                     for s in range(1,bext['length'].max()+1):
-                        new_paths.append(bext.loc[(bext['length'] >= s) & (bext['pos'] >= bext['len']), ['center','pos','scaf'+str(s),'strand'+str(s)]].rename(columns={('scaf'+str(s)):'scaffold', ('strand'+str(s)):'strand'}))
+                        new_paths.append(bext.loc[(bext['length'] >= s) & (bext['pos'] >= bext['len']), ['center','pos','scaf'+str(s),'strand'+str(s),'dist'+str(s)]].rename(columns={('scaf'+str(s)):'scaffold', ('strand'+str(s)):'strand', ('dist'+str(s)):'distance'}))
                         new_paths[-1]['scaffold'] = new_paths[-1]['scaffold'].astype(int)
+                        new_paths[-1]['distance'] = new_paths[-1]['distance'].astype(int)
                         if direction == "left":
                             new_paths[-1]['strand'] = np.where(new_paths[-1]['strand'] == '+', '-', '+')
-                            new_paths[-1]['pos'] = new_paths[-1]['pos'] * (-1)
+                            new_paths[-1]['pos'] *= -1
                         bext['pos'] += 1
                     bext['pos'] = bext['new_len']-1
-                    new_paths.append(bext[['center','pos','to','to_strand']].rename(columns={'to':'scaffold', 'to_strand':'strand'}))
+                    new_paths.append(bext[['center','pos','to','to_strand','last_dist']].rename(columns={'to':'scaffold', 'to_strand':'strand', 'last_dist':'distance'}))
                     if direction == "left":
-                        new_paths[-1]['pos'] = new_paths[-1]['pos'] * (-1)
+                        new_paths[-1]['pos'] *= -1
                     ext = ext.merge(bext[['center','new_len']], on=['center'], how='left')
                     ext.loc[np.isnan(ext['new_len']) == False, 'len'] = ext.loc[np.isnan(ext['new_len']) == False, 'new_len'].astype(int)
                     ext.drop(columns=['new_len'], inplace=True)
+                    # Handle alternatives (must be in the "if len(bext)", because otherwise alt_ext is not well-defined)
+                    if len(alt_ext):
+                        # Assign alt_id, for the ones that don't have one yet. Keeps track of phased bubbles and separates bubbles if we have multiple alternatives (polyploid case)
+                        if 0 == len(cur_alters):
+                            if 0 == len(final_alternatives):
+                                alt_ext['alt_id'] = np.arange(0,len(alt_ext))
+                            else:
+                                alt_ext['alt_id'] = np.arange(0,len(alt_ext)) + final_alternatives[-1]['alt_id'].max()+1
+                        else:
+                            if 'alt_id' not in list(alt_ext.columns):
+                                alt_ext['alt_id'] = np.arange(0,len(alt_ext)) + cur_alters['alt_id'].max()+1
+                            else:
+                                alt_ext.loc[np.isnan(alt_ext['alt_id']), 'alt_id'] = np.arange(0,np.sum(np.isnan(alt_ext['alt_id']))) + cur_alters['alt_id'].max()+1
+                                alt_ext['alt_id'] = alt_ext['alt_id'].astype(int)
+                        # Insert alternative paths
+                        alt_ext = alt_ext.merge(bext[['center','pos']].rename(columns={'pos':'end_pos'}), on=['center'], how='left')
+                        alt_ext['end_pos'] += 1 # Before it was the last pos, now it is one after
+                        alt_ext['start_pos'] = alt_ext['pos'] + 1
+                        if direction == "left":
+                            alt_ext['start_pos'] *= -1
+                            alt_ext['end_pos'] *= -1
+                        alt_ext['alt_pos'] = 0
+                        for s in range(1,alt_ext['length'].max()+1):
+                            new_alters.append(alt_ext.loc[alt_ext['length'] >= s, ['center','start_pos','end_pos','alt_id','alt_pos','scaf'+str(s),'strand'+str(s),'dist'+str(s)]].rename(columns={('scaf'+str(s)):'scaffold', ('strand'+str(s)):'strand', ('dist'+str(s)):'distance'}))
+                            new_alters[-1]['scaffold'] = new_alters[-1]['scaffold'].astype(int)
+                            new_alters[-1]['distance'] = new_alters[-1]['distance'].astype(int)
+                            if direction == "left":
+                                new_alters[-1]['strand'] = np.where(new_alters[-1]['strand'] == '+', '-', '+')
+                                alt_ext['alt_pos'] -= 1
+                            else:
+                                alt_ext['alt_pos'] += 1
+                        if direction == "left":
+                            alt_ext['alt_pos'] = -alt_ext['length']
+                        else:
+                            alt_ext['alt_pos'] = alt_ext['length']
+                        new_alters.append(alt_ext[['center','start_pos','end_pos','alt_id','alt_pos','to','to_strand','last_dist']].rename(columns={'to':'scaffold', 'to_strand':'strand', 'last_dist':'distance'}))
 #
                 ## Remove finished extensions
                 ext['pos'] += 1
                 ext = ext[ext['pos'] < ext['len']].copy()
-                ext.drop(columns=['scaffold','strand','side'], inplace=True)
+                ext.drop(columns=['scaffold','strand','side','distance'], inplace=True)
                 cur_paths = pd.concat(new_paths)
+                if len(new_alters):
+                    cur_alters = pd.concat(new_alters)
 #
         # Book keeping
         final_paths.append(cur_paths)
+        if len(cur_alters):
+            final_alternatives.append(cur_alters)
         if len(included_scaffolds):
             included_scaffolds = np.unique(np.concatenate(included_scaffolds))
             duplicated_scaffolds.append(included_scaffolds)
@@ -2392,7 +2626,7 @@ def ScaffoldContigs(contig_parts, bridges, mappings, ploidy):
     # Each contig starts with being its own scaffold
     scaffold_parts = pd.DataFrame({'conpart': contig_parts.index.values, 'scaffold': contig_parts.index.values, 'pos': 0, 'reverse': False})
     scaffolds = pd.DataFrame({'scaffold': contig_parts.index.values, 'left': contig_parts.index.values, 'lside':'l', 'right': contig_parts.index.values, 'rside':'r', 'lextendible':True, 'rextendible':True, 'circular':False, 'size':1})
-    
+#
     # Combine contigs into scaffolds on unique bridges
     unique_bridges = bridges.loc[(bridges['to_alt'] == 1) & (bridges['from_alt'] == 1), ['from','from_side','to','to_side']]
     scaffolds = scaffolds.merge(unique_bridges[unique_bridges['from_side']=='l'].drop(columns=['from_side']).rename(columns={'from':'scaffold', 'to':'lscaf', 'to_side':'lscaf_side'}), on=['scaffold'], how='left')
@@ -2401,8 +2635,9 @@ def ScaffoldContigs(contig_parts, bridges, mappings, ploidy):
     scaffolds[['lscaf_side','rscaf_side']] = scaffolds[['lscaf_side','rscaf_side']].fillna('')
     scaffolds, scaffold_parts = ScaffoldAlongGivenConnections(scaffolds, scaffold_parts)
     scaffolds.drop(columns=['lscaf','lscaf_side','rscaf','rscaf_side'], inplace = True)
+    scaffold_parts = AddDistaneInformation(scaffold_parts, bridges[(bridges['to_alt'] == 1) & (bridges['from_alt'] == 1)]) # Do not use unique_bridges, because we require 'mean_dist' column
     scaf_bridges = LiftBridgesFromContigsToScaffolds(bridges, scaffolds)
-
+#
     # Build scaffold graph to find unique bridges over scaffolds with alternative connections
     long_range_connections = GetLongRangeConnections(bridges, mappings)
     long_range_connections = TransformContigConnectionsToScaffoldConnections(long_range_connections, scaffold_parts)
@@ -2584,6 +2819,8 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     cov_bin_fraction = 0.01
     num_read_len_groups = 10
     prob_factor = 10
+    min_distance_tolerance = 20
+    rel_distance_tolerance = 0.2
     ploidy = 2 
     org_scaffold_trust = "basic" # blind: If there is a read that supports it use the org scaffold; Do not break contigs
                                  # full: If there is no confirmed other option use the org scaffold
@@ -2605,19 +2842,19 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     contigs, contig_ids = ReadContigs(assembly_file)
     result_info = {}
     result_info = GetInputInfo(result_info, contigs)
-
+#
     print( str(timedelta(seconds=clock())), "Processing repeats")
 #    contigs, center_repeats = MaskRepeatEnds(contigs, repeat_file, contig_ids, max_repeat_extension, min_len_repeat_connection, repeat_len_factor_unique, remove_duplicated_contigs, pdf)
-
+#
     print( str(timedelta(seconds=clock())), "Filtering mappings")
     mappings, cov_counts, cov_probs = ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, alignment_precision, min_num_reads, cov_bin_fraction, num_read_len_groups, pdf)
     contigs = RemoveUnmappedContigs(contigs, mappings, remove_zero_hit_contigs)
 #    mappings = RemoveUnanchoredMappings(mappings, contigs, center_repeats, min_mapping_length, pdf, max_dist_contig_end)
 #    del center_repeats
-
+#
     print( str(timedelta(seconds=clock())), "Account for left-over adapters")
     mappings = BreakReadsAtAdapters(mappings, alignment_precision, keep_all_subreads)
-
+#
     print( str(timedelta(seconds=clock())), "Search for possible break points")
     if "blind" == org_scaffold_trust:
         # Do not break contigs
@@ -2626,15 +2863,15 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
         break_groups, spurious_break_indexes, non_informative_mappings, unconnected_breaks = FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, min_length_contig_break, max_break_point_distance, min_num_reads, min_extension, merge_block_length, org_scaffold_trust, cov_probs, prob_factor, pdf)
     mappings.drop(np.concatenate([spurious_break_indexes, non_informative_mappings]), inplace=True) # Remove not-accepted breaks from mappings and mappings that do not contain any information (mappings inside of contigs that do not overlap with breaks)
     del spurious_break_indexes, non_informative_mappings
-
+#
     contig_parts, contigs = GetContigParts(contigs, break_groups, remove_short_contigs, min_mapping_length, alignment_precision, pdf)
     result_info = GetBreakAndRemovalInfo(result_info, contigs, contig_parts)
     mappings = UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length)
     del break_groups, contigs, contig_ids
-
+#
     print( str(timedelta(seconds=clock())), "Search for possible bridges")
-    bridges, contig_parts = GetBridges(mappings, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, cov_probs, prob_factor, min_mapping_length, pdf)
-
+    bridges = GetBridges(mappings, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, cov_probs, prob_factor, min_mapping_length, min_distance_tolerance, rel_distance_tolerance, pdf)
+#
     print( str(timedelta(seconds=clock())), "Scaffold the contigs")
     scaffolds, scaffold_parts, scaffold_table = ScaffoldContigs(contig_parts, bridges, mappings, ploidy)
     result_info = GetOutputInfo(result_info, scaffolds, scaffold_parts, scaffold_table, contig_parts)
