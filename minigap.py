@@ -1433,6 +1433,23 @@ def LiftBridgesFromContigsToScaffolds(bridges, scaffolds):
 
     return scaf_bridges
 
+def GetOriginalScaffoldConnections(contig_parts, scaffolds):
+    org_scaf_conns = scaffolds[['scaffold','left','lside','right','rside']].copy()
+    org_scaf_conns['org_dist_left'] = np.where(org_scaf_conns['lside'] == 'l', contig_parts.loc[org_scaf_conns['left'].values, 'org_dist_left'].values, contig_parts.loc[org_scaf_conns['left'].values, 'org_dist_right'].values)
+    org_scaf_conns['org_dist_right'] = np.where(org_scaf_conns['rside'] == 'l', contig_parts.loc[org_scaf_conns['right'].values, 'org_dist_left'].values, contig_parts.loc[org_scaf_conns['right'].values, 'org_dist_right'].values)
+    org_scaf_conns = [ org_scaf_conns.loc[org_scaf_conns['org_dist_left'] >= 0, ['scaffold','left','lside','org_dist_left']].rename(columns={'left':'conpart','lside':'cside','org_dist_left':'distance'}),
+                       org_scaf_conns.loc[org_scaf_conns['org_dist_right'] >= 0, ['scaffold','right','rside','org_dist_right']].rename(columns={'right':'conpart','rside':'cside','org_dist_right':'distance'}) ]
+    org_scaf_conns[0]['side'] = 'l'
+    org_scaf_conns[1]['side'] = 'r'
+    org_scaf_conns = pd.concat(org_scaf_conns, ignore_index=True, sort=False)
+    org_scaf_conns['conpart1'] = org_scaf_conns['conpart'] - np.where(org_scaf_conns['cside'] == 'l', 1, 0)
+    org_scaf_conns['conpart2'] = org_scaf_conns['conpart'] + np.where(org_scaf_conns['cside'] == 'r', 1, 0)
+    org_scaf_conns.drop(columns=['conpart','cside'], inplace=True)
+    org_scaf_conns = org_scaf_conns.rename(columns={'scaffold':'from','side':'from_side'}).merge(org_scaf_conns.rename(columns={'scaffold':'to','side':'to_side'}), on=['conpart1','conpart2','distance'], how='left')
+    org_scaf_conns = org_scaf_conns.loc[org_scaf_conns['from'] != org_scaf_conns['to'], ['from','from_side','to','to_side','distance']].copy()
+#
+    return org_scaf_conns
+
 def GetSizeAndEnumeratePositionsForLongRangeConnections(long_range_connections):
     con_size = long_range_connections.groupby(['conn_id'], sort=False).size().reset_index(name='size')
     long_range_connections['size'] = np.repeat(con_size['size'].values, con_size['size'].values)
@@ -1583,7 +1600,7 @@ def BuildScaffoldGraph(long_range_connections, scaf_bridges):
     scaffold_graph.drop(columns=['pos','conn_id'],inplace=True)
 #
     # Then add scaf_bridges with alternatives
-    short_bridges = scaf_bridges.loc[(scaf_bridges['from_alt'] > 1) | (scaf_bridges['to_alt'] > 1), ['from','from_side','to','to_side','mean_dist']].copy()
+    short_bridges = scaf_bridges[['from','from_side','to','to_side','mean_dist']].copy()
     short_bridges.rename(columns={'to':'scaf1','to_side':'strand1','mean_dist':'dist1'}, inplace=True)
     short_bridges['strand1'] = np.where(short_bridges['strand1'] == 'l', '+', '-')
     short_bridges['size'] = 2
@@ -1618,12 +1635,6 @@ def BuildScaffoldGraph(long_range_connections, scaf_bridges):
 #        scaffold_graph.drop(columns=['rep_len'], inplace=True)
 
     return scaffold_graph
-
-def RemoveEmptyColumns(df):
-    # Clean up columns with all NaN
-    cols = df.count()
-    df.drop(columns=cols[cols == 0].index.values,inplace=True)
-    return df
 
 def UnravelKnots(scaffold_graph, scaffolds):
     knots = []
@@ -1783,39 +1794,1225 @@ def FollowUniquePathsThroughGraph(knots, scaffold_graph):
 #
     return scaffold_paths
 
-def AddPathTroughRepeats(scaffold_paths, scaffold_graph):
-    # Repeats need to be handled separately
+def FindRepeatedScaffolds(scaffold_graph):
     repeated_scaffolds = []
     for s in range(1, scaffold_graph['length'].max()):
         repeated_scaffolds.append(np.unique(scaffold_graph.loc[scaffold_graph['from'] == scaffold_graph[f'scaf{s}'], 'from']))
     repeated_scaffolds = np.unique(np.concatenate(repeated_scaffolds))
-#
-    # Finally handle repeats
     repeat_graph = scaffold_graph[np.isin(scaffold_graph['from'], repeated_scaffolds)].copy()
-    ravels = []
-    for s in range(1, repeat_graph['length'].max()):
-        ravels.append(repeat_graph.loc[np.isnan(repeat_graph[f'scaf{s}']) == False, ['from',f'scaf{s}']].rename(columns={'from':'ravel',f'scaf{s}':'scaf'}))
-    ravels = pd.concat(ravels, ignore_index=True).drop_duplicates()
-    ravels['scaf'] = ravels['scaf'].astype(int)
-    ravels['repeated'] = np.isin(ravels['scaf'], repeated_scaffolds)
+#
+    return repeated_scaffolds, repeat_graph
+
+def ConnectLoopsThatShareScaffolds(loop_scafs):
     while True:
-        ravels['min_ravel'] = ravels[['scaf']].merge(ravels.loc[ravels['repeated'], ['scaf','ravel']].groupby(['scaf']).min().reset_index(), on=['scaf'], how='left')['ravel'].values
-        ravels['min_ravel'] = ravels[['ravel']].merge(ravels.loc[ravels['repeated'], ['ravel','min_ravel']].groupby(['ravel']).min().reset_index(), on=['ravel'], how='left')['min_ravel'].values
-        if np.sum(ravels['min_ravel'] != ravels['ravel']):
+        loop_scafs['min_loop'] = loop_scafs[['scaf']].merge(loop_scafs.loc[loop_scafs['inside'], ['scaf','loop']].groupby(['scaf']).min().reset_index(), on=['scaf'], how='left')['loop'].values
+        loop_scafs['min_loop'] = loop_scafs[['loop']].merge(loop_scafs.loc[loop_scafs['inside'], ['loop','min_loop']].groupby(['loop']).min().reset_index(), on=['loop'], how='left')['min_loop'].values
+        if np.sum(loop_scafs['min_loop'] != loop_scafs['loop']) == 0:
             break
         else:
-            ravels['ravel'] = ravels['min_ravel'].astype(int)
-    ravels.drop(columns=['min_ravel'], inplace=True)
-    ravels.drop_duplicates(inplace=True)
-    
-    
-    
-    
-    exit_graph = scaffold_graph[np.isin(scaffold_graph['from'], ravels.loc[ravels['repeated'] == False, 'scaf'].values)].copy()
-    
-    return scaffold_paths
+            loop_scafs['loop'] = loop_scafs['min_loop'].astype(int)
+    loop_scafs.drop(columns=['min_loop'], inplace=True)
+    loop_scafs = loop_scafs.groupby(['loop','scaf']).agg({'exit':['min'], 'inside':['max']}).droplevel(1, axis=1).reset_index()
+    loop_scafs.sort_values(['loop','scaf','exit','inside'], ascending=[True,True,False,False], inplace=True)
+#
+    return loop_scafs
 
-def AddUntraversedConnectedPaths(scaffold_paths, knots, scaffold_graph):
+def AddConnectedScaffolds(loop_scafs, scaffold_graph):
+    loop_graph = scaffold_graph.merge(loop_scafs.loc[loop_scafs['inside'], ['scaf','loop']].rename(columns={'scaf':'from'}), on=['from'], how='inner')
+    new_scafs = []
+    for s in range(1,loop_graph['length'].max()):
+        new_scafs.append( loop_graph.loc[loop_graph['length'] > s, ['loop',f'scaf{s}']].drop_duplicates().astype(int).rename(columns={f'scaf{s}':'scaf'}) )
+    new_scafs = pd.concat(new_scafs)
+    new_scafs.drop_duplicates(inplace=True)
+    loop_scafs = loop_scafs.merge(new_scafs, on=['loop','scaf'], how='outer')
+    loop_scafs[['inside','exit']] = loop_scafs[['inside','exit']].fillna(False)
+#
+    return loop_scafs
+
+def RemoveEmptyColumns(df):
+    # Clean up columns with all NaN
+    cols = df.count()
+    df.drop(columns=cols[cols == 0].index.values,inplace=True)
+    return df
+
+def FindLoopExits(loop_scafs, scaffold_graph):
+    loop_scafs.loc[np.isin(loop_scafs['loop'], loop_scafs.loc[loop_scafs['inside'] == loop_scafs['exit'], 'loop'].drop_duplicates().values), 'exit'] = False # If we added new scaffolds to the loop we cannot guarantee anymore that the exits are still exits, so check again
+    exit_graph = scaffold_graph[['from','from_side','length']+[f'scaf{s}' for s in range(1,scaffold_graph['length'].max())]].merge(loop_scafs.loc[loop_scafs['inside'] == loop_scafs['exit'], ['scaf','loop']].rename(columns={'scaf':'from'}), on=['from'], how='inner')
+    exit_graph = RemoveEmptyColumns(exit_graph)
+    while len(exit_graph):
+        num_undecided = np.sum(loop_scafs['inside'] == loop_scafs['exit'])
+        exit_graph['exit'] = True
+        exit_graph['inside'] = False
+        for s in range(1,exit_graph['length'].max()):
+            # Everything that is connected to something that is not an exit scaffolds is not a guaranteed exit paths
+            exit_graph.loc[exit_graph[['loop',f'scaf{s}']].rename(columns={f'scaf{s}':'scaf'}).merge(loop_scafs.loc[loop_scafs['exit'] == False, ['loop','scaf']], on=['loop','scaf'], how='left', indicator=True)['_merge'].values == "both", 'exit'] = False
+            # Everything that is connected to at least one scaffold inside the loop is an inside paths
+            exit_graph.loc[exit_graph[['loop',f'scaf{s}']].rename(columns={f'scaf{s}':'scaf'}).merge(loop_scafs.loc[loop_scafs['inside'], ['loop','scaf']], on=['loop','scaf'], how='left', indicator=True)['_merge'].values == "both", 'inside'] = True
+        # If all paths on one side are an exit paths the scaffold is an exit and if at least one paths on both sides is an inside paths the scaffold is inside the loop
+        summary = exit_graph.groupby(['loop','from','from_side']).agg({'exit':['min'], 'inside':['max']}).droplevel(1, axis=1).reset_index()
+        summary.sort_values(['loop','from','from_side'], inplace=True)
+        summary = summary.loc[np.repeat(summary.index.values, 1+( ((summary['from_side'] == 'l') & ((summary['loop'] != summary['loop'].shift(-1)) | (summary['from'] != summary['from'].shift(-1)))) |
+                                                                  ((summary['from_side'] == 'r') & ((summary['loop'] != summary['loop'].shift(1)) | (summary['from'] != summary['from'].shift(1)))) ))].reset_index(drop=True)
+        summary.loc[(summary['from_side'] == 'l') & (summary['loop'] == summary['loop'].shift(1)) & (summary['from'] == summary['from'].shift(1)), ['from_side','exit','inside']] = ['r',True,False] # Add the exits where nothing connects on one side
+        summary.loc[(summary['from_side'] == 'r') & (summary['loop'] == summary['loop'].shift(-1)) & (summary['from'] == summary['from'].shift(-1)), ['from_side','exit','inside']] = ['l',True,False]
+        summary = summary.groupby(['loop','from']).agg({'exit':['max'], 'inside':['min']}).droplevel(1, axis=1).reset_index()
+        summary.rename(columns={'from':'scaf'}, inplace=True)
+        loop_scafs.loc[loop_scafs[['loop','scaf']].merge(summary.loc[summary['exit'], ['loop','scaf']], on=['loop','scaf'], how='left', indicator=True)['_merge'] == "both", 'exit'] = True
+        loop_scafs.loc[loop_scafs[['loop','scaf']].merge(summary.loc[summary['inside'], ['loop','scaf']], on=['loop','scaf'], how='left', indicator=True)['_merge'] == "both", 'inside'] = True
+        # If we cannot reduce the number of undecided scaffolds anymore they are looped within itself, but that means they are exits (into another loop)
+        if np.sum(loop_scafs['inside'] == loop_scafs['exit']) == num_undecided:
+            loop_scafs.loc[loop_scafs['inside'] == loop_scafs['exit'], 'exit'] = True
+        # Delete all decided scaffolds from exit_graph
+        exit_graph = exit_graph.merge(loop_scafs.loc[loop_scafs['inside'] == loop_scafs['exit'], ['scaf','loop']].rename(columns={'scaf':'from'}), on=['from','loop'], how='inner')
+#
+    return loop_scafs
+
+def ReverseVerticalPaths(loops):
+    reverse_loops = []
+    for l in np.unique(loops['length']):
+        reverse_loops.append( loops.loc[loops['length'] == l, ['length','scaf0','strand0']+[f'{n}{s}' for s in range(1,l) for n in ['scaf','strand','dist']]].rename(columns={**{f'{n}{s}':f'{n}{l-s-1}' for s in range(l) for n in ['scaf','strand']}, **{f'dist{s+1}':f'dist{l-s-1}' for s in range(l)}}).reset_index() )
+    reverse_loops = pd.concat(reverse_loops, ignore_index=True, sort=False)
+    reverse_loops = reverse_loops[['index','length','scaf0','strand0']+[f'{n}{s}' for s in range(1,reverse_loops['length'].max()) for n in ['scaf','strand','dist']]].copy()
+    for s in range(reverse_loops['length'].max()):
+        reverse_loops.loc[reverse_loops['length'] > s, f'strand{s}'] = np.where(reverse_loops.loc[reverse_loops['length'] > s, f'strand{s}'] == '+', '-', '+')
+    reverse_loops.rename(columns={'index':'lindex'}, inplace=True)
+#
+    return reverse_loops
+
+def GetLoopUnits(loop_scafs, scaffold_graph, max_loop_units):
+    # Get loops by extending the inside scaffolds until we find an exit or they have multiple options after finding the starting scaffold again
+    loops = []
+    pot_loops = loop_scafs.loc[loop_scafs['inside'], ['loop','scaf']].rename(columns={'scaf':'scaf0'})
+    pot_loops['strand0'] = '+'
+    pot_loops['len'] = 1
+    loop_graph = scaffold_graph[np.isin(scaffold_graph['from'], pot_loops['scaf0'].values)].copy()
+    loop_graph.rename(columns={'from':'scaf0','from_side':'strand0'}, inplace=True)
+    loop_graph['strand0'] = np.where(loop_graph['strand0'] == 'r', '+', '-')
+    sfix = 0
+    while len(pot_loops):
+        # Merge with loop_graph to extend
+        pot_loops['index'] = pot_loops.index.values
+        new_loops = []
+        for l in range(pot_loops['len'].min(),pot_loops['len'].max()+1):
+            mcols = ['scaf0','strand0']+[f'{n}{s}' for s in range(1,l) for n in ['scaf','strand','dist']]
+            new_loops.append( pot_loops.loc[pot_loops['len'] == l, ['loop']+[col for col in pot_loops.columns if col[:3] == "fix"]+['index','len']+(['dist0'] if 'dist0' in pot_loops.columns else [])+mcols].merge(loop_graph, on=mcols, how='inner') )
+        pot_loops = pd.concat(new_loops, ignore_index=True, sort=False)
+        pot_loops = RemoveEmptyColumns(pot_loops)
+        # Prepare columns for next round
+        pot_loops.rename(columns={f'{n}0':f'fix{n}{sfix}' for n in ['scaf','strand','dist']}, inplace=True)
+        sfix += 1
+        pot_loops.rename(columns={f'{n}{s}':f'{n}{s-1}' for s in range(1,pot_loops['length'].max())for n in ['scaf','strand','dist']}, inplace=True)
+        pot_loops['len'] = pot_loops['length']-1
+        pot_loops.drop(columns=['length'], inplace=True)
+        # Check if we have an exit, close the loop or have a repeated scaffold
+        repeats = []
+        for s in range(1,sfix): # We explicitly compare for fixscaf0 later, so we do not need it here
+            repeats.append( pot_loops.loc[np.isnan(pot_loops[f'fixscaf{s}']) == False, [f'fixscaf{s}',f'fixstrand{s}']].rename(columns={f'fixscaf{s}':'scaf',f'fixstrand{s}':'strand'}).reset_index() )
+        pot_loops['exit'] = False
+        pot_loops['closed'] = False
+        for s in range(pot_loops['len'].max()):
+            pot_loops.loc[(pot_loops['fixscaf0'] == pot_loops[f'scaf{s}']) & (pot_loops['fixstrand0'] == pot_loops[f'strand{s}']), 'closed'] = True
+            pot_loops.loc[ pot_loops[['loop',f'scaf{s}']].rename(columns={f'scaf{s}':'scaf'}).merge(loop_scafs.loc[loop_scafs['exit'], ['loop','scaf']], on=['loop','scaf'], how='left', indicator=True)['_merge'] == "both", 'exit'] = True
+            repeats.append( pot_loops.loc[np.isnan(pot_loops[f'scaf{s}']) == False, [f'scaf{s}',f'strand{s}']].rename(columns={f'scaf{s}':'scaf',f'strand{s}':'strand'}).reset_index() )
+        repeats = pd.concat(repeats, ignore_index=True, sort=False).groupby(['index','scaf','strand']).size().reset_index(name='repeats')
+        pot_loops['repeat'] = False
+        pot_loops.loc[ np.unique(repeats.loc[repeats['repeats'] > 1, 'index'].values), 'repeat' ] = True
+        pot_loops['max_units'] = pot_loops[['loop','fixscaf0']].merge(pot_loops.groupby(['loop','fixscaf0']).size().reset_index(name='count'), on=['loop','fixscaf0'], how='left')['count'] > max_loop_units
+        # Add closed loops to loops and remove the dead ends or closed loops that do not involve the starting scaffold (and would lead to endless loops)
+        loops.append( RemoveEmptyColumns(pot_loops[pot_loops['closed']].drop(columns=['index','exit','closed','repeat','max_units']).rename(columns={**{f'{n}{s}':f'{n}{s+sfix}' for s in range(pot_loops['len'].max()) for n in ['scaf','strand','dist']}, **{f'fix{n}{s}':f'{n}{s}' for s in range(sfix) for n in ['scaf','strand','dist']}})) )
+        if len(loops[-1]):
+            loops[-1]['len'] += sfix
+        else:
+            del loops[-1]
+        pot_loops = pot_loops[ (pot_loops['closed'] == False) & (pot_loops['repeat'] == False) & (pot_loops['exit'] == False) & (pot_loops['max_units'] == False) ].copy()
+        pot_loops.drop(columns=['exit','closed','repeat','max_units'], inplace=True)
+    loops = pd.concat(loops, ignore_index=True, sort=False)
+    loops.rename(columns={'len':'length'}, inplace=True)
+    # Truncate the ends that reach into the next loop unit
+    loops['truncate'] = True
+    for s in range(loops['length'].max()-1, 1, -1):
+        loops.loc[(loops['scaf0'] == loops[f'scaf{s}']) & (loops['strand0'] == loops[f'strand{s}']), 'truncate'] = False
+        truncate = loops['truncate'] & (loops['length'] > s)
+        loops.loc[truncate, [f'scaf{s}',f'strand{s}',f'dist{s}']] = np.nan
+        loops.loc[truncate, 'length'] -= 1
+    loops.drop(columns=['truncate'], inplace=True)
+    loops = RemoveEmptyColumns(loops)
+    loops.drop_duplicates(inplace=True)
+    # Verify that the loop units are also valid in reverse direction
+    loops.reset_index(drop=True, inplace=True)
+    reverse_loops = ReverseVerticalPaths(loops)
+    valid_indexes = []
+    mcols = ['from','from_side','scaf1','strand1','dist1']
+    while len(reverse_loops):
+        # Remove invalid loop units
+        reverse_loops.rename(columns={'scaf0':'from','strand0':'from_side'}, inplace=True)
+        reverse_loops['from_side'] = np.where(reverse_loops['from_side'] == '+', 'r', 'l')
+        check = reverse_loops[mcols].reset_index().rename(columns={'index':'rindex'}).merge(scaffold_graph[mcols].reset_index().rename(columns={'index':'sindex'}), on=mcols, how='inner').drop(columns=mcols)
+        check['length'] = np.minimum(reverse_loops.loc[check['rindex'].values, 'length'].values, scaffold_graph.loc[check['sindex'].values, 'length'].values)
+        reverse_loops['valid'] = False
+        s = 2
+        while len(check):
+            reverse_loops.loc[np.unique(check.loc[check['length'] == s, 'rindex'].values), 'valid'] = True
+            check = check[check['length'] > s].copy()
+            if len(check):
+                check = check[(reverse_loops.loc[check['rindex'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values == scaffold_graph.loc[check['sindex'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values).all(axis=1)].copy()
+                s += 1
+        reverse_loops = reverse_loops[reverse_loops['valid']].copy()
+        # Store valid indexces
+        valid_indexes.append( np.unique(reverse_loops.loc[reverse_loops['length'] == 2, 'lindex'].values) )
+        reverse_loops = reverse_loops[reverse_loops['length'] > 2].copy()
+        # Prepare next round
+        if len(reverse_loops):
+            reverse_loops.drop(columns=['from','from_side','dist1'], inplace=True)
+            reverse_loops['length'] -= 1
+            reverse_loops.rename(columns={f'{n}{s+1}':f'{n}{s}' for s in range(reverse_loops['length'].max()) for n in ['scaf','strand','dist']}, inplace=True)
+    valid_indexes = np.unique(np.concatenate(valid_indexes))
+    loops = loops.loc[valid_indexes].copy()
+    # Finish
+    loops.sort_values(['scaf0','length'], inplace=True)
+    loops.reset_index(drop=True, inplace=True)
+#
+    return loops
+
+def CheckConsistencyOfVerticalPaths(vpaths):
+    if 'from' in vpaths.columns:
+        inconsistent = vpaths[np.isnan(vpaths['from']) | ((vpaths['from_side'] != 'r') & (vpaths['from_side'] != 'l'))].copy()
+    else:
+        inconsistent = vpaths[np.isnan(vpaths['scaf0']) | ((vpaths['strand0'] != '+') & (vpaths['strand0'] != '-'))].copy()
+    if len(inconsistent):
+        print("Warning: Position 0 is inconsistent in vertical paths.")
+        print(inconsistent)
+#
+    for s in range(1, vpaths['length'].max()):
+        inconsistent = vpaths[ ((vpaths['length'] > s) & (np.isnan(vpaths[f'scaf{s}']) | ((vpaths[f'strand{s}'] != '+') & (vpaths[f'strand{s}'] != '-')) | np.isnan(vpaths[f'dist{s}']))) |
+                              ((vpaths['length'] <= s) & ((np.isnan(vpaths[f'scaf{s}']) == False) | (vpaths[f'strand{s}'].isnull() == False) | (np.isnan(vpaths[f'dist{s}']) == False))) ].copy()
+        if len(inconsistent):
+            print(f"Warning: Position {s} is inconsistent in vertical paths.")
+            print(inconsistent)
+
+def GetLoopUnitsInBothDirections(loops):
+    bidi_loops = ReverseVerticalPaths(loops)
+    bidi_loops['loop'] = loops.loc[bidi_loops['lindex'].values, 'loop'].values
+    bidi_loops = pd.concat([loops.reset_index().rename(columns={'index':'lindex'}), bidi_loops], ignore_index=True, sort=False)
+    bidi_loops.sort_values(['lindex','strand0'], inplace=True)
+    bidi_loops.reset_index(drop=True,inplace=True)
+#
+    return bidi_loops
+
+def FindConnectionsBetweenLoopUnits(loops, scaffold_graph, full_info):
+    # Get the positions where the scaffold_graph from the end of the loop units splits to later check only there to reduce the advantage of long reads just happen to be on one connection
+    first_diff = scaffold_graph.loc[np.isin(scaffold_graph['from'], np.unique(loops['scaf0'].values)), ['from','from_side']].reset_index().rename(columns={'index':'index1'})
+    first_diff = first_diff.merge(first_diff.rename(columns={'index1':'index2'}), on=['from','from_side'], how='inner').drop(columns=['from','from_side'])
+    first_diff = first_diff[first_diff['index1'] != first_diff['index2']].copy()
+    first_diff['diff'] = -1
+    s = 1
+    diffs = []
+    while len(first_diff['diff']):
+        first_diff.loc[(scaffold_graph.loc[first_diff['index1'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values != scaffold_graph.loc[first_diff['index2'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values).any(axis=1), 'diff'] = s
+        diffs.append(first_diff.loc[first_diff['diff'] >= 0, ['index1','diff']].drop_duplicates())
+        first_diff = first_diff[first_diff['diff'] < 0].copy()
+        s += 1
+    diffs = pd.concat(diffs, ignore_index=True, sort=False)
+    # Find associated loop units
+    units = diffs[['index1']].drop_duplicates()
+    units[['scaf0','strand0']] = scaffold_graph.loc[ units['index1'].values, ['from','from_side']].values
+    units['strand0'] = np.where(units['strand0'] == 'l', '+', '-') # For the first_diffs we went into the oppositee direction to get the diffs from which we can extend over the ends
+    bidi_loops = GetLoopUnitsInBothDirections(loops)
+    units = units.merge(bidi_loops[['scaf0','strand0']].reset_index().rename(columns={'index':'bindex'}), on=['scaf0','strand0'], how='left').drop(columns=['scaf0','strand0'])
+    units['ls'] = bidi_loops.loc[units['bindex'].values, 'length'].values - 2
+    units['len'] = np.minimum(scaffold_graph.loc[units['index1'].values, 'length'].values, units['ls']+2)
+    valid_units = []
+    s = 1
+    units[['scaf','strand','dist']] = np.nan
+    while len(units):
+        for ls in np.unique(units['ls']):
+            units.loc[units['ls'] == ls, ['scaf','strand','dist']] = bidi_loops.loc[ units.loc[units['ls'] == ls, 'bindex'].values, [f'scaf{ls}',f'strand{ls}',f'dist{ls+1}']].values
+        units['strand'] = np.where(units['strand'] == '+', '-', '+') # We compare graph entries in different orientations
+        units = units[(units[['scaf','strand','dist']].values == scaffold_graph.loc[units['index1'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values).all(axis=1)].copy()
+        units['ls'] -= 1
+        s += 1
+        valid_units.append( units.loc[units['len'] == s, ['index1','bindex']].copy() )
+        units = units[units['len'] > s].copy()
+    valid_units = pd.concat(valid_units, ignore_index=True, sort=False)
+    diffs = diffs.merge(valid_units, on=['index1'], how='inner')
+    # Check if the scaffold_graph extends from the position of difference into the next loop unit (otherwise it does not hold any information)
+    info = diffs[['index1','diff']].drop_duplicates()
+    info[['from','from_side']+[f'{n}{s}' for s in range(1,info['diff'].max()+1) for n in ['scaf','strand','dist']]] = np.nan
+    for d in np.unique(info['diff']):
+        info.loc[info['diff'] == d, ['from','from_side']+[f'{n}{s}' for s in range(1,d+1) for n in ['scaf','strand']]+[f'dist{s}' for s in range(1,d+1)]] = scaffold_graph.loc[info.loc[info['diff'] == d,'index1'].values, [f'{n}{s}' for s in range(d,0,-1) for n in ['scaf','strand']]+['from','from_side']+[f'dist{s}' for s in range(d,0,-1)]].values
+        info.loc[info['diff'] == d, f'strand{d}'] = np.where(info.loc[info['diff'] == d, f'strand{d}'] == 'l', '+', '-')
+    info['from_side'] = np.where(info['from_side'] == '+', 'l', 'r')
+    for s in range(1,info['diff'].max()):
+        info.loc[info['diff'] > s, [f'strand{s}']] = np.where(info.loc[info['diff'] > s, [f'strand{s}']] == '+', '-', '+')
+    extensions = []
+    for d in np.unique(info['diff']):
+        mcols = ['from','from_side'] + [f'{n}{s}' for s in range(1,d+1) for n in ['scaf','strand','dist']]
+        extensions.append( info.loc[info['diff'] == d, ['index1','diff']+mcols].merge(scaffold_graph, on=mcols, how='inner').drop(columns=[col for col in mcols if col not in [f'scaf{d}',f'strand{d}']]).rename(columns={f'{n}{s}':f'{n}{s-d}' for s in range(d,scaffold_graph['length'].max()) for n in ['scaf','strand','dist']}) )
+    extensions = pd.concat(extensions, ignore_index=True, sort=False)
+    extensions = extensions[extensions['diff']+1 < extensions['length']].copy()
+    extensions['length'] -= extensions['diff']
+    # Merge the extensions from different positions (only keep extensions with highest diff/longest mapping in the loop unit, but use all consistent extending scafs)
+    if len(extensions):
+        extensions.sort_values(['index1','scaf0','strand0']+[f'{n}{s}' for s in range(1,extensions['length'].max()) for n in ['scaf','strand','dist']]+['diff'], inplace=True)
+        first_iter = True
+        while True:
+            extensions['consistent'] = (extensions['index1'] == extensions['index1'].shift(-1)) & (extensions['diff'] < extensions['diff'].shift(-1))
+            for s in range(1, extensions['length'].max()):
+                cur = extensions['consistent'] & (extensions['length'].shift(-1) > s)
+                extensions.loc[cur, 'consistent'] = (extensions.loc[cur, [f'scaf{s}',f'strand{s}',f'dist{s}']].values == extensions.loc[cur.shift(1, fill_value=False).values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values).all(axis=1)
+            if first_iter:
+                # Extensions that have a lower diff, but the same length and are fully consistent can be removed, because they do not contain additional information
+                extensions = extensions[(extensions['consistent'] == False) | (extensions['length'] > extensions['length'].shift(-1))].copy()
+                first_iter = False
+            else:
+                extensions['del'] = extensions['consistent'].shift(1) & (extensions['consistent'] == False)
+                extensions.loc[extensions['del'].shift(-1, fill_value=False).values, 'diff'] = extensions.loc[extensions['del'], 'diff'].values
+                extensions = extensions[extensions['del'] == False].drop(columns=['del'])
+            if np.sum(extensions['consistent']) == 0:
+                break
+        extensions.drop(columns=['consistent'], inplace=True)
+        max_diff = extensions.groupby(['index1'])['diff'].agg(['max','size'])
+        extensions = extensions[extensions['diff'] == np.repeat(max_diff['max'].values, max_diff['size'].values)].drop(columns=['diff'])
+        extensions = RemoveEmptyColumns(extensions)
+        extendible = diffs.loc[np.isin(diffs['index1'], max_diff.index.values), ['index1','bindex']].drop_duplicates()
+    # Get the loop units matching the extensions
+    loop_conns = []
+    if len(extensions):
+        ext_units = extensions.reset_index().rename(columns={'index':'extindex'}).merge(bidi_loops[['scaf0','strand0','scaf1','strand1','dist1']].reset_index().rename(columns={'index':'bindex'}), on=['scaf0','strand0','scaf1','strand1','dist1'], how='inner')
+        if len(ext_units):
+            ext_units['length'] = np.minimum(ext_units['length'].values, bidi_loops.loc[ext_units['bindex'].values, 'length'].values)
+            for s in range(2,ext_units['length'].max()):
+                ext_units = ext_units[(ext_units['length'] <= s) | (ext_units[[f'scaf{s}',f'strand{s}',f'dist{s}']].values == bidi_loops.loc[ext_units['bindex'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values).all(axis=1)].copy()
+        if len(ext_units):
+            # Get the connected loop units
+            loop_conns = extendible.rename(columns={'bindex':'bindex1'}).merge(ext_units[['index1','bindex']].rename(columns={'bindex':'bindex2'}), on=['index1'], how='inner').drop(columns=['index1'])
+            loop_conns['wildcard'] = False
+            # Only keep extensions that extend into another loop unit, because we later use them to check if we have evidence for an additional copy of a loop unit
+            extensions = RemoveEmptyColumns( extensions.loc[ext_units['extindex'].values].copy() )
+        else:
+            extensions = []
+    # Non extendible loop units can connect to all other loop units, because we do not know what comes after them (we only take into account other loop units here, because extensions into exits are not an issue, if we do not have a true loop, but just a repeated scaffold, we will only create a duplicated paths that we later remove)
+    if len(loop_conns):
+        non_extendible = np.setdiff1d(bidi_loops.index.values, np.unique(loop_conns['bindex1'].values))
+    else:
+        non_extendible = bidi_loops.index.values
+    non_extendible = bidi_loops.loc[non_extendible, ['scaf0','strand0']].reset_index().rename(columns={'index':'bindex1'})
+    non_extendible = non_extendible.merge(bidi_loops[['scaf0','strand0']].reset_index().rename(columns={'index':'bindex2'}), on=['scaf0','strand0'], how='left').drop(columns=['scaf0','strand0'])
+    non_extendible['wildcard'] = True
+    if len(non_extendible):
+        if len(loop_conns):
+            loop_conns = pd.concat([loop_conns, non_extendible], ignore_index=True, sort=False)
+        else:
+            loop_conns = non_extendible
+    # Get the loop indixes from the bidirectional loop indexes and verify that both directions are supported
+    if len(loop_conns):
+        loop_conns.drop_duplicates(inplace=True)
+        for i in [1,2]:
+            loop_conns[[f'lindex{i}',f'dir{i}']] = bidi_loops.loc[loop_conns[f'bindex{i}'].values, ['lindex','strand0']].values
+            loop_conns[f'rdir{i}'] = np.where(loop_conns[f'dir{i}'] == '+', '-', '+')
+        loop_conns = loop_conns[['lindex1','dir1','lindex2','dir2','wildcard']].merge(loop_conns[['lindex1','rdir1','lindex2','rdir2']].rename(columns={'lindex1':'lindex2','rdir1':'dir2','lindex2':'lindex1','rdir2':'dir1'}), on=['lindex1','dir1','lindex2','dir2'], how='inner')
+#
+    if len(loop_conns):
+        if full_info == False:
+            loop_conns = loop_conns[(loop_conns[['dir1','dir2']] == '+').all(axis=1)].drop(columns=['dir1','dir2'])
+            loop_conns.sort_values(['lindex1','lindex2'], inplace=True)
+        else:
+            # Get loop units that overlap by more than the starting scaffold
+            overlapping_units = []
+            for sfrom in range(1,bidi_loops['length'].max()-1):
+                for l in np.unique(bidi_loops.loc[bidi_loops['length'] > sfrom+1, 'length'].values):
+                    overlapping_units.append( bidi_loops[bidi_loops['length'] == l].reset_index().rename(columns={'index':'bindex1'}).merge(bidi_loops[bidi_loops['length'] > l-sfrom+1].reset_index().rename(columns={'index':'bindex2'}), left_on=['loop',f'scaf{sfrom}',f'strand{sfrom}']+[f'{n}{s}' for s in range(sfrom+1, l) for n in ['scaf','strand','dist']], right_on=['loop','scaf0','strand0']+[f'{n}{s}' for s in range(1, l-sfrom) for n in ['scaf','strand','dist']], how='inner')[['bindex1','bindex2']].copy() )
+                    overlapping_units[-1]['sfrom'] = sfrom
+            if len(overlapping_units):
+                overlapping_units = pd.concat(overlapping_units, ignore_index=True)
+            # Filter out the ones that do not match an extension
+            if len(overlapping_units):
+                overlapping_units = overlapping_units.merge(extendible.rename(columns={'bindex':'bindex1'}), on=['bindex1'], how='left')
+                overlapping_units['index1'] = overlapping_units['index1'].fillna(-1).astype(int)
+                overlapping_units = overlapping_units.merge(extensions, on=['index1'], how='left')
+                overlapping_units['length'] = overlapping_units['length'].fillna(0).astype(int)
+                overlapping_units['s2'] = bidi_loops.loc[overlapping_units['bindex1'].values, 'length'].values - overlapping_units['sfrom']
+                for s in range(1, overlapping_units['length'].max()):
+                    overlapping_units['valid'] = overlapping_units['length'] <= s
+                    overlapping_units.loc[overlapping_units['valid'], 's2'] = -1 # So we do not compare them in the next step
+                    for s2 in np.unique(overlapping_units.loc[overlapping_units['valid'] == False, 's2'].values):
+                        overlapping_units.loc[overlapping_units['s2'] == s2, 'valid'] = (overlapping_units.loc[overlapping_units['s2'] == s2, [f'scaf{s}',f'strand{s}',f'dist{s}']].values == bidi_loops.loc[overlapping_units.loc[overlapping_units['s2'] == s2, 'bindex2'].values, [f'scaf{s2}',f'strand{s2}',f'dist{s2}']].values).all(axis=1)
+                    overlapping_units = overlapping_units[overlapping_units['valid']].copy()
+                    overlapping_units['s2'] += 1
+                overlapping_units = overlapping_units[['bindex1','bindex2','sfrom']].drop_duplicates()
+            # Get the loop indixes from the biderectional loop indexes and verify that both directions are supported
+            if len(overlapping_units):
+                for i in [1,2]:
+                    overlapping_units[[f'lindex{i}',f'dir{i}']] = bidi_loops.loc[overlapping_units[f'bindex{i}'].values, ['lindex','strand0']].values
+                    overlapping_units[f'rdir{i}'] = np.where(overlapping_units[f'dir{i}'] == '+', '-', '+')
+                overlapping_units['overlap'] = bidi_loops.loc[overlapping_units['bindex1'].values, 'length'].values - overlapping_units['sfrom']
+                overlapping_units = overlapping_units[['lindex1','dir1','lindex2','dir2','sfrom','overlap']].merge(overlapping_units[['lindex1','rdir1','lindex2','rdir2','overlap']].rename(columns={'lindex1':'lindex2','rdir1':'dir2','lindex2':'lindex1','rdir2':'dir1'}), on=['lindex1','dir1','lindex2','dir2','overlap'], how='inner').drop(columns=['overlap'])
+                overlapping_units['wildcard'] = False
+            loop_conns['sfrom'] = loops.loc[loop_conns['lindex1'].values, 'length'].values - 1
+            if len(overlapping_units):
+                loop_conns = pd.concat([loop_conns, overlapping_units], ignore_index=True)
+            # If multiple starting positions of unit 2 exist in unit 1 take the first, such that we have the minimum length of the combined unit
+            loop_conns = loop_conns.groupby(['lindex1','dir1','lindex2','dir2','wildcard'])['sfrom'].min().reset_index()
+            # Prepare possible extensions of the loop units
+            if len(extensions):
+                extensions = extendible.merge(extensions, on=['index1'], how='inner').drop(columns=['index1'])
+                extensions = bidi_loops[['lindex']].reset_index().rename(columns={'index':'bindex'}).merge(extensions, on=['bindex'], how='inner').drop(columns=['bindex'])
+#
+    if full_info:
+        return loop_conns, extensions
+    else:
+        return loop_conns
+
+def TryReducingAlternativesToPloidy(alternatives, scaf_bridges, ploidy):
+    # If we have less than ploidy alternatives  they are directly ok
+    alternatives.sort_values(['group'], inplace=True)
+    nalts = alternatives.groupby(['group'], sort=False).size().values
+    nalts = np.repeat(nalts, nalts)
+    valid_alts = alternatives[nalts <= ploidy].copy()
+    alternatives['nalts'] = nalts
+    alternatives = alternatives[nalts > ploidy].copy()
+    if len(alternatives) == 0:
+        alternatives = valid_alts
+    else:
+        # Find the alternatives that differ only by distance or additionally by a missing scaffold
+        alternatives.reset_index(drop=True, inplace=True)
+        pairs = alternatives[['group']].reset_index().rename(columns={'index':'index1'}).merge( alternatives[['group']].reset_index().rename(columns={'index':'index2'}), on=['group'], how='left' )
+        pairs = pairs[pairs['index1'] != pairs['index2']].drop(columns=['group'])
+        pairs['scaf_miss'] = False
+        for i in [1,2]:
+            pairs[f'len{i}'] = alternatives.loc[pairs[f'index{i}'].values, 'length'].values
+        pairs['s2'] = 1
+        reducible = []
+        pairs[['scaf','strand']] = [-1,'']
+        for s1 in range(1,alternatives['length'].max()):
+            pairs['match'] = False
+            while np.sum(pairs['match'] == False):
+                for s2 in np.unique(pairs.loc[pairs['match'] == False, 's2'].values):
+                    cur = (pairs['match'] == False) & (pairs['s2'] == s2)
+                    pairs.loc[cur, ['scaf','strand']] = alternatives.loc[pairs.loc[cur, 'index2'].values, [f'scaf{s2}',f'strand{s2}']].values
+                pairs.loc[pairs['match'] == False, 'match'] = (pairs.loc[pairs['match'] == False, ['scaf','strand']].values == alternatives.loc[pairs.loc[pairs['match'] == False, 'index1'].values, [f'scaf{s1}',f'strand{s1}']].values).all(axis=1)
+                pairs.loc[pairs['match'] == False, 's2'] += 1
+                pairs.loc[pairs['match'] == False, 'scaf_miss'] = True
+                pairs = pairs[ pairs['s2'] < pairs['len2'] ].copy()
+            reducible.append( pairs.loc[ s1+1 == pairs['len1'], ['index1','index2','scaf_miss'] ].copy() )
+            pairs = pairs[ s1+1 < pairs['len1'] ].copy()
+            pairs['s2'] += 1
+        reducible = pd.concat(reducible, ignore_index=True)
+        # Get bridge support for reducible alternatives
+        bsupp_indexes = reducible[['index1']].copy()
+        bsupp = alternatives.loc[bsupp_indexes['index1'].values, ['from','from_side','scaf1','strand1','dist1']].reset_index().rename(columns={'index':'index1','scaf1':'to','strand1':'to_side','dist1':'mean_dist'})
+        bsupp['to_side'] = np.where(bsupp['to_side'] == '+', 'l', 'r')
+        bsupp = [bsupp]
+        bsupp_indexes['len1'] = alternatives.loc[bsupp_indexes['index1'].values, 'length'].values
+        for s1 in range(1,alternatives['length'].max()-1):
+            bsupp.append( alternatives.loc[bsupp_indexes.loc[bsupp_indexes['len1'] > s1+1, 'index1'].values, [f'scaf{s1}',f'strand{s1}',f'scaf{s1+1}',f'strand{s1+1}',f'dist{s1+1}']].reset_index().rename(columns={'index':'index1',f'scaf{s1}':'from',f'strand{s1}':'from_side',f'scaf{s1+1}':'to',f'strand{s1+1}':'to_side',f'dist{s1+1}':'mean_dist'}) )
+            bsupp[-1]['from_side'] = np.where(bsupp[-1]['from_side'] == '+', 'r', 'l')
+            bsupp[-1]['to_side'] = np.where(bsupp[-1]['to_side'] == '+', 'l', 'r')
+        bsupp = pd.concat(bsupp, ignore_index=True)
+        bsupp = bsupp.merge(scaf_bridges[['from','from_side','to','to_side','mean_dist','bcount']], on=['from','from_side','to','to_side','mean_dist'], how='left')
+        bsupp = bsupp.groupby(['index1'])['bcount'].agg(['min','median','max']).reset_index()
+        reducible = reducible.merge(bsupp, on=['index1'], how='left')
+        # Distance only differences are only allowed if the reversed pair does not exist or the bridge support is lower (otherwise we might wrongly remove both of the alternatives)
+        for col in ['min','median','max']:
+            reducible = reducible[ reducible[col] <= reducible[['index1','index2']].rename(columns={'index1':'index2','index2':'index1'}).merge(reducible, on=['index1','index2'], how='left')[col].fillna(sys.maxsize).values ].copy()
+        # In case of a tie remove the one with the higher index
+        reducible = reducible[ (reducible['index1'] > reducible['index2']) | (reducible[['index1','index2']].rename(columns={'index1':'index2','index2':'index1'}).merge(reducible[['index1','index2']], on=['index1','index2'], how='left', indicator=True)['_merge'].values == "left_only") ].copy()
+        reducible = reducible.groupby(['index1'])['scaf_miss'].min().reset_index()
+        reducible[['group','loop','from','from_side','nalts']] = alternatives.loc[reducible['index1'].values, ['group','loop','from','from_side','nalts']].values
+        # Remove the reducible ones with the lowest bridge support until we arrive at ploidy alternatives (distance only alternatives are always removed before missing scaffold alternatives)
+        alternatives.drop(columns=['nalts'], inplace=True)
+        reducible = reducible.merge(bsupp, on=['index1'], how='left')
+        reducible.sort_values(['group','scaf_miss','min','median','max'], inplace=True)
+        alternatives.drop(reducible.loc[reducible['nalts'] - reducible.groupby(['group'], sort=False).cumcount() > ploidy, 'index1'].values, inplace=True)
+        # Add the already valid ones back in
+        alternatives = pd.concat([valid_alts, alternatives], ignore_index=True).sort_values(['group']).reset_index(drop=True)
+#
+    return alternatives
+
+def GetOtherSideOfExitConnection(conns, exit_conns):
+    other_side = conns[['ito']].merge(exit_conns[['ifrom','length','from','from_side']+[f'{n}{s}' for s in range(1,exit_conns['length'].max()) for n in ['scaf','strand','dist']]].drop_duplicates().rename(columns={'ifrom':'ito'}), on=['ito'], how='left')
+    other_side.rename(columns={'from':'scaf0','from_side':'strand0'}, inplace=True)
+    other_side['strand0'] = np.where(other_side['strand0'] == 'r', '+', '-')
+    other_side = ReverseVerticalPaths(other_side)
+    other_side.sort_values(['lindex'], inplace=True)
+    other_side.drop(columns=['lindex'], inplace=True)
+    other_side.rename(columns={f'{col}':f'r{col}' for col in other_side.columns}, inplace=True)
+    conns = pd.concat([conns.reset_index(drop=True), other_side.reset_index(drop=True)], axis=1)
+#
+    return conns
+
+def AppendScaffoldsToExitConnection(conns):
+    conns[[f'{n}{s}' for s in range(conns['length'].max(), (conns['sfrom']+conns['rlength']).max()) for n in ['scaf','strand','dist']]] = np.nan
+    for sfrom in np.unique(conns.loc[conns['rlength'] > 0, 'sfrom']):
+        inconsistent = conns[ (conns['rlength'] > 0) & (conns['sfrom'] == sfrom) & (conns[[f'{n}{sfrom}' for n in ['scaf','strand']]].values != conns[[f'r{n}0' for n in ['scaf','strand']]].values).any(axis=1) ].copy()
+        if len(inconsistent):
+            print("Warning: Appending vertical paths without proper match.")
+            print(inconsistent)
+        max_len = conns.loc[conns['sfrom'] == sfrom, 'rlength'].max()
+        conns.loc[conns['sfrom'] == sfrom, [f'{n}{s}' for s in range(sfrom+1, sfrom+max_len) for n in ['scaf','strand','dist']]] = conns.loc[conns['sfrom'] == sfrom, [f'r{n}{s}' for s in range(1, max_len) for n in ['scaf','strand','dist']]].values
+    conns['length'] = conns['sfrom']+conns['rlength']
+    conns.drop(columns=['sfrom','rlength','rscaf0','rstrand0']+[f'r{n}{s}' for s in range(1, conns['rlength'].max()) for n in ['scaf','strand','dist']], inplace=True)
+    conns = RemoveEmptyColumns(conns)
+#
+    return conns
+
+def GetHandledScaffoldConnectionsFromVerticalPath(vpaths):
+    handled_scaf_conns = []
+    for s in range(1,vpaths['length'].max()):
+        handled_scaf_conns.append(vpaths.loc[vpaths['length'] > s, [f'scaf{s-1}',f'strand{s-1}',f'scaf{s}',f'strand{s}',f'dist{s}']].rename(columns={f'scaf{s-1}':'scaf0',f'strand{s-1}':'strand0',f'scaf{s}':'scaf1',f'strand{s}':'strand1',f'dist{s}':'dist1'}))
+    handled_scaf_conns = pd.concat(handled_scaf_conns, ignore_index=True)
+    handled_scaf_conns[['scaf0','scaf1','dist1']] = handled_scaf_conns[['scaf0','scaf1','dist1']].astype(int)
+    handled_scaf_conns.drop_duplicates(inplace=True)
+    # Also get reverse direction
+    handled_scaf_conns = pd.concat([handled_scaf_conns, handled_scaf_conns.rename(columns={'scaf0':'scaf1','scaf1':'scaf0','strand0':'strand1','strand1':'strand0'})], ignore_index=True)
+    handled_scaf_conns.drop_duplicates(inplace=True)
+#
+    return handled_scaf_conns
+
+def TurnHorizontalPathIntoVertical(vpaths, min_path_id):
+    vpaths['dist0'] = 0
+    vpaths['pid'] = np.arange(min_path_id, min_path_id+len(vpaths))
+#
+    hpaths = []
+    for s in range(vpaths['length'].max()):
+        hpaths.append( vpaths.loc[vpaths['length'] > s, ['pid',f'scaf{s}',f'strand{s}',f'dist{s}']].rename(columns={f'scaf{s}':'scaf0',f'strand{s}':'strand0',f'dist{s}':'dist0'}) )
+        hpaths[-1]['pos'] = s
+    hpaths = pd.concat(hpaths, ignore_index=True)
+    hpaths[['scaf0','dist0']] = hpaths[['scaf0','dist0']].astype(int)
+    hpaths = hpaths[['pid','pos','scaf0','strand0','dist0']].copy()
+    hpaths.sort_values(['pid','pos'], inplace=True)
+#
+    vpaths.drop(columns=['dist0','pid'], inplace=True)
+#
+    return hpaths
+
+def AddPathThroughLoops(scaffold_paths, scaffold_graph, scaf_bridges, org_scaf_conns, ploidy, max_loop_units):
+    # Get the loop units and find scaffolds in them
+    repeated_scaffolds, repeat_graph = FindRepeatedScaffolds(scaffold_graph)
+    if len(repeated_scaffolds):
+        loops = []
+        for s in range(1, repeat_graph['length'].max()):
+            loops.append(repeat_graph.loc[(repeat_graph['from'] == repeat_graph[f'scaf{s}']) & (repeat_graph['from_side'] == 'r') & (repeat_graph[f'strand{s}'] == '+'), ['from','length']+[f'scaf{s1}' for s1 in range(1,s+1) for n in ['scaf']]])
+            loops[-1]['length'] = s+1
+        loops = pd.concat(loops, ignore_index=True, sort=False)
+        loops['scaf0'] = loops['from']
+    loop_scafs = []
+    if len(loops):
+        for s in range(loops['length'].max()-1): # The last base is just the repeated scaffold again
+            loop_scafs.append( loops.loc[loops['length'] > s+1, ['from',f'scaf{s}']].drop_duplicates().astype(int).rename(columns={'from':'loop',f'scaf{s}':'scaf'}) )
+        loop_scafs = pd.concat(loop_scafs)
+        loop_scafs.drop_duplicates(inplace=True)
+        # Find all scaffolds connected to the loop
+        loop_scafs['inside'] = True
+        loop_scafs['exit'] = False
+        loop_scafs = ConnectLoopsThatShareScaffolds(loop_scafs)
+        loop_scafs = AddConnectedScaffolds(loop_scafs, scaffold_graph)
+        while np.sum(loop_scafs['inside'] == loop_scafs['exit']): # New entries, where we do not know yet if they are inside the loop or an exit
+            loop_scafs = FindLoopExits(loop_scafs, scaffold_graph)
+            loop_size = loop_scafs.groupby(['loop']).size().reset_index(name='nbefore')
+            loop_scafs = ConnectLoopsThatShareScaffolds(loop_scafs)
+            loop_size['nafter'] = loop_size[['loop']].merge(loop_scafs.groupby(['loop']).size().reset_index(name='nafter'), on=['loop'], how='left')['nafter'].values
+            loop_scafs.loc[np.isin(loop_scafs['loop'], loop_size.loc[loop_size['nbefore'] < loop_size['nafter'], 'loop'].values), 'exit'] = False # We cannot guarantee that the exits are still exits in merged loops
+            loop_scafs = AddConnectedScaffolds(loop_scafs, scaffold_graph)
+#
+    if len(loop_scafs):
+        # Get loop units by exploring possible paths in scaffold_graph
+        loops = GetLoopUnits(loop_scafs, scaffold_graph, max_loop_units)
+        if len(loops):
+            CheckConsistencyOfVerticalPaths(loops)
+    if len(loops):
+        # Remove loop units that are already part of a multi-repeat unit
+        multi_repeat = []
+        max_len = loops['length'].max()
+        for s in range(1, max_len-1):
+            found_repeat = (loops['scaf0'] == loops[f'scaf{s}']) & (loops[f'strand{s}'] == '+') & (loops['length'] > s+1) # Do not take the last position into account, otherwise we would end up with the full loop unit
+            multi_repeat.append( loops[found_repeat].drop(columns=[f'scaf{s1}' for s1 in range(0,s)]+[f'strand{s1}' for s1 in range(0,s)]+[f'dist{s1}' for s1 in range(1,s+1)]).rename(columns={f'{n}{s1}':f'{n}{s1-s}' for s1 in range(s, max_len) for n in ['scaf','strand','dist']}) )
+            multi_repeat[-1]['length'] -= s
+            multi_repeat.append( loops[found_repeat].drop(columns=[f'{n}{s1}' for s1 in range(s+1, max_len) for n in ['scaf','strand','dist']]) )
+            multi_repeat[-1]['length'] = s+1
+        if len(multi_repeat):
+            multi_repeat = pd.concat(multi_repeat, ignore_index=True, sort=False)
+        if len(multi_repeat):
+            multi_repeat.drop_duplicates(inplace=True)
+            multi_repeat = RemoveEmptyColumns(multi_repeat)
+            loops = loops[ loops.merge(multi_repeat, on=list(multi_repeat.columns.values), how='left', indicator=True)['_merge'].values == "left_only" ].copy()
+        # Find connections between loop units
+        loop_conns = FindConnectionsBetweenLoopUnits(loops, scaffold_graph, False)
+        loop_conns['loop'] = loops.loc[loop_conns['lindex1'].values, 'loop'].values
+        loops = loops[np.isin(loops['loop'], np.unique(loop_conns['loop']))].copy()
+    if len(loop_conns):
+        # Check if we have evidence for an order for the repeat copies (only one valid connection)
+        conn_count = loop_conns.groupby(['lindex1']).size().values
+        loop_conns['unique'] = (loop_conns['lindex1'] != loop_conns['lindex2']) & np.repeat(conn_count == 1, conn_count) & loop_conns[['lindex2']].merge( (loop_conns.groupby(['lindex2']).size() == 1).reset_index(name='unique'), on=['lindex2'], how='left')['unique'].values
+        while np.sum(loop_conns['unique']):
+            loop_conns['append'] = loop_conns['unique'] & (np.isin(loop_conns['lindex2'].values, loop_conns.loc[loop_conns['unique'], 'lindex1'].values) == False) # Make sure we are not appending something that itselfs appends something in this round
+            if np.sum(loop_conns['append']) == 0:
+                loop_conns.reset_index(drop=True, inplace=True)
+                loop_conns.loc[np.max(loop_conns[loop_conns['unique']].index.values), 'unique'] = False
+            else:
+                for i in [1,2]:
+                    loop_conns[f'len{i}'] = loops.loc[loop_conns[f'lindex{i}'].values, 'length'].values
+                for l in np.unique(loop_conns.loc[loop_conns['append'], 'len1']):
+                    cur = loop_conns[loop_conns['append'] & (loop_conns['len1'] == l)]
+                    loops.loc[cur['lindex1'].values, [f'{n}{s}' for s in range(l,l+cur['len2'].max()) for n in ['scaf','strand','dist']]] = loops.loc[cur['lindex2'].values, [f'{n}{s}' for s in range(1,1+cur['len2'].max()) for n in ['scaf','strand','dist']]].values
+                cur = loop_conns[loop_conns['append']].copy()
+                loops.loc[cur['lindex1'].values, 'length'] += cur['len2'].values - 1
+                loop_conns.drop(columns=['len1','len2'], inplace=True) # Lengths change, so do not keep outdated information
+                loops.drop(cur['lindex2'].values, inplace=True)
+                loop_conns = loop_conns[loop_conns['append'] == False].copy()
+                loop_conns['new_index'] = loop_conns[['lindex1']].merge(cur[['lindex1','lindex2']].rename(columns={'lindex1':'new_index','lindex2':'lindex1'}), on=['lindex1'], how='left')['new_index'].values
+                loop_conns.loc[np.isnan(loop_conns['new_index']) == False, 'lindex1'] = loop_conns.loc[np.isnan(loop_conns['new_index']) == False, 'new_index'].astype(int)
+        CheckConsistencyOfVerticalPaths(loops)
+#
+    # Get exits for the repeats
+    if len(loop_scafs):
+        exits = loop_scafs.loc[loop_scafs['exit'],['loop','scaf']].rename(columns={'scaf':'from'})
+        if len(exits):
+            exits = exits.merge(scaffold_graph, on=['from'], how='left')
+            exits = exits[ exits[['loop','scaf1']].rename(columns={'scaf1':'scaf'}).merge(loop_scafs.loc[loop_scafs['exit'],['loop','scaf']], on=['loop','scaf'], how='left', indicator=True)['_merge'].values == "left_only" ].copy() # Only keep the first scaffold of the exit
+            exits['loopside'] = False
+            for s in range(1,exits['length'].max()):
+                exits.loc[exits[['loop',f'scaf{s}']].rename(columns={f'scaf{s}':'scaf'}).merge(loop_scafs.loc[loop_scafs['inside'],['loop','scaf']], on=['loop','scaf'], how='left', indicator=True)['_merge'].values == "both", 'loopside'] = True
+            exits = exits[exits['loopside']].drop(columns=['loopside'])
+#
+    # Handle bridged repeats
+    bridged_repeats = []
+    if len(exits):
+        for s in range(2,exits['length'].max()):
+            exits['bridged'] = exits[['loop',f'scaf{s}']].rename(columns={f'scaf{s}':'scaf'}).merge(loop_scafs.loc[loop_scafs['exit'],['loop','scaf']], on=['loop','scaf'], how='left', indicator=True)['_merge'].values == "both"
+            bridged_repeats.append( exits.loc[exits['bridged'] & (exits['from'] < exits[f'scaf{s}']), ['loop','from','from_side']+[f'{n}{s}' for s in range(1,s+1) for n in ['scaf','strand','dist']]].drop_duplicates() )
+            bridged_repeats[-1]['length'] = s+1
+            exits = exits[exits['bridged'] == False].copy()
+        exits.drop(columns=['bridged'], inplace=True)
+        bridged_repeats = pd.concat(bridged_repeats, ignore_index=True, sort=False)
+        if len(bridged_repeats):
+            bridged_repeats.rename(columns={'from':'scaf0','from_side':'strand0'}, inplace=True)
+            bridged_repeats['strand0'] = np.where(bridged_repeats['strand0'] == 'r', '+', '-')
+#
+    # Only keep exits of unbridged repeats, where we know from where to where they go (either because we only have two exits or because we have scaffolding information that tells us), for the rest we will later add the loop units as path
+    if len(exits):
+        exit_scafs = exits[['loop','from','from_side']].drop_duplicates()
+        exit_conns = exit_scafs.merge(org_scaf_conns[org_scaf_conns['distance'] > 0], on=['from','from_side'], how='inner')
+        if len(exit_conns):
+            exit_conns = exit_conns.merge( exit_conns.rename(columns={'from':'to','from_side':'to_side','to':'from','to_side':'from_side'}), on=['loop','from','from_side','to','to_side','distance'], how='inner')
+        if len(exit_conns):
+            exit_scafs = exit_scafs[ exit_scafs[['loop','from','from_side']].merge(exit_conns[['loop','from','from_side']], on=['loop','from','from_side'], how='left', indicator=True)['_merge'].values == "left_only" ].copy()
+        if len(exit_scafs):
+            exit_scafs.sort_values(['loop','from','from_side'], inplace=True)
+            exit_count = exit_scafs.groupby(['loop'], sort=False).size().values
+            exit_scafs = exit_scafs[np.repeat(exit_count == 2, exit_count)].copy()
+        if len(exit_scafs):
+            exit_scafs['to'] = np.where(exit_scafs['loop'] == exit_scafs['loop'].shift(-1), exit_scafs['from'].shift(-1, fill_value=-1), exit_scafs['from'].shift(1, fill_value=-1))
+            exit_scafs['to_side'] = np.where(exit_scafs['loop'] == exit_scafs['loop'].shift(-1), exit_scafs['from_side'].shift(-1, fill_value=''), exit_scafs['from_side'].shift(1, fill_value=''))
+            exit_scafs['distance'] = 0
+            exit_conns = pd.concat([exit_conns, exit_scafs], ignore_index=True)
+    # Unbridged repeats are not allowed to have more alternatives than ploidy
+    if len(exit_conns):
+        exit_conns = exit_conns.merge(exits, on=['loop','from','from_side'], how='left')
+        exit_conns.sort_values(['loop','from','from_side'], inplace=True)
+        exit_conns['group'] = (exit_conns.groupby(['loop','from','from_side'], sort=False).cumcount() == 0).cumsum()
+        exit_conns = TryReducingAlternativesToPloidy(exit_conns, scaf_bridges, ploidy)
+        exit_conns['from_alts'] = exit_conns.merge(exit_conns.groupby(['group']).size().reset_index(name='count'), on=['group'], how='left')['count'].values
+        exit_conns.drop(columns=['group'], inplace=True)
+        exit_conns = exit_conns[exit_conns['from_alts'] <= ploidy].copy()
+        exit_conns = exit_conns.merge( exit_conns[['loop','from','from_side','to','to_side','distance']].drop_duplicates().rename(columns={'from':'to','from_side':'to_side','to':'from','to_side':'from_side','from_alts':'to_alts'}), on=['loop','from','from_side','to','to_side','distance'], how='inner')
+        exit_conns = RemoveEmptyColumns(exit_conns)
+    # Reverse loop units to have both directions
+    if len(loops):
+        bidi_loops = GetLoopUnitsInBothDirections(loops)
+        CheckConsistencyOfVerticalPaths(bidi_loops)
+    # Get the loop units to fill the connections
+    start_units = []
+    if len(exit_conns) and len(loops):
+        for sfrom in range(1,exit_conns['length'].max()):
+            pairs = exit_conns.loc[exit_conns['length'] > sfrom, ['loop',f'scaf{sfrom}',f'strand{sfrom}']].reset_index().rename(columns={'index':'eindex',f'scaf{sfrom}':'scaf0',f'strand{sfrom}':'strand0'}).merge(bidi_loops[['loop','scaf0','strand0']].reset_index().rename(columns={'index':'bindex'}), on=['loop','scaf0','strand0'], how='inner').drop(columns=['loop','scaf0','strand0'])
+            pairs['length'] = np.minimum(exit_conns.loc[pairs['eindex'].values, 'length'].values - sfrom, bidi_loops.loc[pairs['bindex'].values, 'length'].values)
+            s = 1
+            while len(pairs):
+                start_units.append(pairs.loc[pairs['length'] == s, ['eindex','bindex']].copy())
+                start_units[-1]['sfrom'] = sfrom
+                pairs = pairs[pairs['length'] > s].copy()
+                if len(pairs):
+                    pairs = pairs[(exit_conns.loc[pairs['eindex'].values, [f'scaf{sfrom+s}',f'strand{sfrom+s}',f'dist{sfrom+s}']].values == bidi_loops.loc[pairs['bindex'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values).all(axis=1)].copy()
+                    s += 1
+        exit_conns['from_units'] = 0
+        if len(start_units):
+            start_units = pd.concat(start_units, ignore_index=True)
+            start_units.sort_values(['eindex','sfrom','bindex'], inplace=True)
+            first_match = start_units.groupby(['eindex'])['sfrom'].agg(['min','size'])
+            start_units = start_units[start_units['sfrom'] == np.repeat(first_match['min'].values, first_match['size'].values)].copy()
+            # Add loop unit information and try to reduce to ploidy alternatives
+            start_units[['loop','from','from_side','length']] = bidi_loops.loc[ start_units['bindex'].values, ['loop','scaf0','strand0','length']].values
+            start_units['from_side'] = np.where(start_units['from_side'] == '+', 'r', 'l')
+            cols = [f'{n}{s}' for s in range(1,start_units['length'].max()) for n in ['scaf','strand','dist']]
+            start_units[cols] = bidi_loops.loc[ start_units['bindex'].values, cols].values
+            start_units['group'] = start_units['eindex']
+            start_units = TryReducingAlternativesToPloidy(start_units, scaf_bridges, ploidy)
+            start_units.drop(columns=['group'], inplace=True)
+            # Remove exit_conns with more than ploidy units
+            nalts = start_units.groupby(['eindex']).size().reset_index(name='nalts')
+            exit_conns.loc[nalts['eindex'].values, 'from_units'] = nalts['nalts'].values
+            exit_conns = exit_conns[exit_conns['from_units'] <= ploidy].copy()
+        exit_conns['ifrom'] = exit_conns.index.values
+        exit_conns = exit_conns.merge( exit_conns[['loop','from','from_side','to','to_side','distance','from_alts','from_units','ifrom']].rename(columns={'from':'to','from_side':'to_side','to':'from','to_side':'from_side','from_alts':'to_alts','from_units':'to_units','ifrom':'ito'}), on=['loop','from','from_side','to','to_side','distance'], how='inner')
+#
+    # Handle direct connections, where no loop unit fits in by chosing one side and then extending it with the other side
+    if len(exit_conns) and len(loops):
+        direct_conns = exit_conns.loc[(exit_conns['from_units'] == 0) & ((exit_conns['to_units'] != 0) | (exit_conns['ifrom'] < exit_conns['ito'])), ['loop','ifrom','ito','length','from','from_side']+[f'{n}{s}' for s in range(1,exit_conns['length'].max()) for n in ['scaf','strand','dist']]].copy()
+        if len(direct_conns):
+            direct_conns = GetOtherSideOfExitConnection(direct_conns, exit_conns)
+            direct_conns['sfrom'] = 1
+    else:
+        direct_conns = []
+    if len(direct_conns):
+        for sfrom in range(1,direct_conns['length'].max()):
+            direct_conns['match'] = True
+            cur = direct_conns['sfrom'] == sfrom
+            direct_conns.loc[cur, 'match'] = (direct_conns.loc[cur, [f'scaf{sfrom}',f'strand{sfrom}']].values == direct_conns.loc[cur, ['rscaf0','rstrand0']].values).all(axis=1)
+            for s in range(sfrom+1, direct_conns['length'].max()):
+                cur = direct_conns['match'] & (direct_conns['sfrom'] == sfrom) & (direct_conns['length'] > s)
+                direct_conns.loc[cur, 'match'] = (direct_conns.loc[cur, [f'scaf{s}',f'strand{s}',f'dist{s}']].values == direct_conns.loc[cur, [f'rscaf{s-sfrom}',f'rstrand{s-sfrom}',f'rdist{s-sfrom}']].values).all(axis=1)
+            direct_conns.loc[direct_conns['match'] == False, 'sfrom'] += 1
+        direct_conns = direct_conns[direct_conns['match']].drop(columns=['match'])
+    if len(direct_conns):
+        direct_conns = AppendScaffoldsToExitConnection(direct_conns)
+        CheckConsistencyOfVerticalPaths(direct_conns)
+    # If we do not have loop units and cannot build a direct connection, we cannot use the exit_conns
+    if len(loops) == 0:
+        exit_conns = []
+    # Handle indirect connections by first finding a valid path through the loop units to connect from and to
+    if len(exit_conns):
+        indirect_conns = exit_conns.loc[(exit_conns['from_units'] > 0) & (exit_conns['to_units'] > 0) & (exit_conns['ifrom'] < exit_conns['ito']), ['loop','ifrom','ito','length','from','from_side']+[f'{n}{s}' for s in range(1,exit_conns['length'].max()) for n in ['scaf','strand','dist']]].copy()
+    else:
+        indirect_conns = []
+    if len(loops):
+        loop_conns, extensions = FindConnectionsBetweenLoopUnits(loops[np.isin(loops['loop'], np.unique(indirect_conns['loop'].values))], scaffold_graph, True)
+    if len(loop_conns):
+        for i in [1,2]:
+            loop_conns = loop_conns.merge(bidi_loops[['lindex','strand0']].reset_index().rename(columns={'index':f'bindex{i}','lindex':f'lindex{i}','strand0':f'dir{i}'}), on=[f'lindex{i}',f'dir{i}'], how='left')
+    if len(indirect_conns) and len(start_units):
+        indirect_paths = indirect_conns[['ifrom','ito']].reset_index().rename(columns={'index':'cindex'})
+        indirect_paths = indirect_paths.merge(start_units[['eindex','bindex']].rename(columns={'eindex':'ifrom','bindex':'bifrom'}), on=['ifrom'], how='left')
+        indirect_paths = indirect_paths.merge(start_units[['eindex','bindex']].rename(columns={'eindex':'ito','bindex':'bito'}), on=['ito'], how='left')
+        indirect_paths[['lindex','strand0']] = bidi_loops.loc[indirect_paths['bito'].values, ['lindex','strand0']].values # We need to get the bidi_loop that goes in the other direction, because we start from 'from' not 'to'
+        indirect_paths.drop(columns=['ifrom','ito','bito'], inplace=True)
+        indirect_paths['strand0'] = np.where(indirect_paths['strand0'] == '+', '-', '+')
+        indirect_paths = indirect_paths.merge(bidi_loops[['lindex','strand0']].reset_index().rename(columns={'index':'bito'}), on=['lindex','strand0'], how='left').drop(columns=['lindex','strand0'])
+        indirect_paths['len'] = 0
+        finished_paths = [ indirect_paths[indirect_paths['bifrom'] == indirect_paths['bito']].copy() ]
+        indirect_paths = indirect_paths[indirect_paths['bifrom'] != indirect_paths['bito']].copy()
+        indirect_paths['bicur'] = indirect_paths['bifrom']
+        indirect_paths['nwildcards'] = 0
+        s = 0
+        while True:
+            # Extend path on valid connections with loop units
+            new_path = indirect_paths[indirect_paths['len'] == s].rename(columns={'bicur':'bindex1'}).merge(loop_conns.loc[loop_conns['wildcard'] == False, ['bindex1','bindex2']], on=['bindex1'], how='inner')
+            if len(new_path) == 0:
+                # Add wildcard connections (loop units that do not have an extension and can connect to all other loop units) only if we have no other choice
+                new_path = indirect_paths[indirect_paths['len'] == s].rename(columns={'bicur':'bindex1'}).merge(loop_conns.loc[loop_conns['wildcard'], ['bindex1','bindex2']], on=['bindex1'], how='inner')
+                new_path['nwildcards'] += 1
+                if len(new_path) == 0:
+                    break
+            new_path.rename(columns={'bindex2':'bicur','bindex1':f'bi{s}'}, inplace=True)
+            new_path['len'] += 1
+            # Only keep the shortest path of the ones with the lowest number of wildcard connections to each possible loop unit
+            indirect_paths[f'bi{s}'] = -1 # We cannot use NaN here because the following first command ignores NaNs and would mix rows
+            indirect_paths = pd.concat([indirect_paths, new_path], ignore_index=True)
+            indirect_paths.sort_values(['cindex','bifrom','bito','bicur','nwildcards','len'], inplace=True)
+            indirect_paths = indirect_paths.groupby(['cindex','bifrom','bito','bicur'], sort=False).first().reset_index()
+            # If we reached 'bito' store the path and remove all other path for this search
+            finished_paths.append( indirect_paths[indirect_paths['bicur'] == indirect_paths['bito']].drop(columns=['bicur','nwildcards']) )
+            indirect_paths = indirect_paths[ indirect_paths.merge(finished_paths[-1][['cindex','bifrom','bito']], on=['cindex','bifrom','bito'], how='left', indicator=True)['_merge'].values == "left_only" ].copy()
+            s += 1
+        if len(finished_paths):
+            finished_paths = pd.concat(finished_paths, ignore_index=True)
+            finished_paths['bi'+str(finished_paths['len'].max())] = np.nan # Make room for bito
+            for l in np.unique(finished_paths['len']):
+                finished_paths.loc[finished_paths['len'] == l, f'bi{l}'] = finished_paths.loc[finished_paths['len'] == l, 'bito']
+            finished_paths.drop(columns=['bifrom'], inplace=True) # bi0 is identical to bifrom
+            finished_paths['len'] += 1
+    else:
+        finished_paths = []
+    # Now extend along the valid path
+    if len(finished_paths):
+        indirect_conns['cindex'] = indirect_conns.index.values
+        indirect_conns = indirect_conns.merge(finished_paths, on=['cindex'], how='inner')
+        indirect_conns.drop(columns=['cindex'], inplace=True)
+        for b in range(indirect_conns['len'].max()):
+            if b == 0:
+                indirect_conns['sfrom'] = indirect_conns[['ifrom','bi0']].rename(columns={'ifrom':'eindex','bi0':'bindex'}).merge(start_units[['eindex','bindex','sfrom']], on=['eindex','bindex'], how='left')['sfrom'].values
+            else:
+                indirect_conns['sfrom'] = indirect_conns['length']
+                indirect_conns.loc[indirect_conns['len'] > b, 'sfrom'] = indirect_conns.loc[indirect_conns['len'] > b, [f'bi{b-1}',f'bi{b}']].rename(columns={f'bi{b-1}':'bindex1',f'bi{b}':'bindex2'}).merge(loop_conns[['bindex1','bindex2','sfrom']], on=['bindex1','bindex2'], how='left')['sfrom'].values + indirect_conns.loc[indirect_conns['len'] > b, 'old_sfrom']
+            indirect_conns['old_sfrom'] = indirect_conns['sfrom']
+            ext = RemoveEmptyColumns(bidi_loops.loc[indirect_conns.loc[indirect_conns['len'] > b, f'bi{b}']].drop(columns=['lindex','loop']).rename(columns={col:f'r{col}' for col in bidi_loops.columns}))
+            ext.index = indirect_conns[indirect_conns['len'] > b].index.values
+            indirect_conns = pd.concat([indirect_conns, ext], axis=1)
+            indirect_conns['rlength'] = indirect_conns['rlength'].fillna(0).astype(int)
+            indirect_conns = AppendScaffoldsToExitConnection(indirect_conns)
+        indirect_conns.drop(columns=['old_sfrom'], inplace=True)
+        # Check if we have evidence for another loop unit at the end (no extension of the last loop unit is already present in the indirect connection and the loop unit has a valid connection to itself)
+        if len(extensions):
+            extensions['lindex'] = extensions[['lindex','strand0']].merge(bidi_loops[['lindex','strand0']].reset_index(), on=['lindex','strand0'], how='left')['index'].values
+            extensions.rename(columns={'lindex':'bindex'}, inplace=True)
+            indirect_conns['extra_unit'] = np.isin(indirect_conns['bito'], np.unique(extensions['bindex'].values)) & np.isin(indirect_conns['bito'], loop_conns.loc[loop_conns['bindex1'] == loop_conns['bindex2'], 'bindex1'].values)
+            extensions.rename(columns={f'{n}{s}':f'e{n}{s+1}' for s in range(extensions['length'].max()) for n in ['scaf','strand','dist']}, inplace=True) # We add the second to last position in the loop unit to the extension, such that it is likely that it came from a loop unit if something matches the whole extension
+            extensions['length'] += 1
+            extensions['blen'] = bidi_loops.loc[extensions['bindex'].values, 'length'].values
+            extensions[['escaf0','estrand0','edist1']] = [-1,'',0]
+            for l in np.unique(extensions['blen']):
+                extensions.loc[extensions['blen'] == l, ['escaf0','estrand0','edist1']] = bidi_loops.loc[extensions.loc[extensions['blen'] == l, 'bindex'].values, [f'scaf{l-2}',f'strand{l-2}',f'dist{l-1}']].values
+            extensions.drop(columns=['blen'], inplace=True)
+            extensions.rename(columns={'bindex':'bito','length':'elength'}, inplace=True)
+            extensions = indirect_conns[indirect_conns['extra_unit']].reset_index().rename(columns={'index':'iindex'}).merge(extensions, on=['bito'], how='left')
+            sfrom = 1
+            extensions = extensions[extensions['length'] >= sfrom + extensions['elength']].copy()
+            while len(extensions):
+                extensions['valid'] = False
+                for l in np.unique(extensions['elength']):
+                    extensions.loc[extensions['elength'] == l, 'valid'] = (extensions.loc[extensions['elength'] == l, [f'scaf{sfrom}',f'strand{sfrom}']+[f'{n}{s}' for s in range(sfrom+1, sfrom+l) for n in ['scaf','strand','dist']]].values == extensions.loc[extensions['elength'] == l, ['escaf0','estrand0']+[f'e{n}{s}' for s in range(1, l) for n in ['scaf','strand','dist']]].values).all(axis=1)
+                found_index = np.unique(extensions.loc[extensions['valid'], 'iindex'].values)
+                indirect_conns.loc[found_index, 'extra_unit'] = False
+                sfrom += 1
+                extensions = extensions[(np.isin(extensions['iindex'].values, found_index) == False) & (extensions['length'] >= sfrom + extensions['elength'])].copy()
+            # Add the extra loop unit, where we found evidence
+            if np.sum(indirect_conns['extra_unit']):
+                indirect_conns['sfrom'] = indirect_conns['length'] - np.where(indirect_conns['extra_unit'], 1, 0)
+                ext = RemoveEmptyColumns(bidi_loops.loc[indirect_conns.loc[indirect_conns['extra_unit'], 'bito']].drop(columns=['lindex','loop']).rename(columns={col:f'r{col}' for col in bidi_loops}))
+                ext.index = indirect_conns[indirect_conns['extra_unit']].index.values
+                indirect_conns = pd.concat([indirect_conns, ext], axis=1)
+                indirect_conns['rlength'] = indirect_conns['rlength'].fillna(0).astype(int)
+                indirect_conns = AppendScaffoldsToExitConnection(indirect_conns)
+            indirect_conns.drop(columns=['extra_unit'], inplace=True)
+        # Add the exit on the other side
+        indirect_conns[['lindex','lstrand0']] = bidi_loops.loc[indirect_conns['bito'].values, ['lindex','strand0']].values # The bindex is the reverse of what is stored in start_units, so reverse it
+        indirect_conns['lstrand0'] = np.where(indirect_conns['lstrand0'] == '+', '-', '+')
+        indirect_conns['bito'] = indirect_conns[['lindex','lstrand0']].merge(bidi_loops[['lindex','strand0']].reset_index().rename(columns={'index':'bito','strand0':'lstrand0'}), on=['lindex','lstrand0'], how='left')['bito'].values
+        indirect_conns.drop(columns=['lindex','lstrand0'], inplace=True)
+        indirect_conns['sfrom'] = indirect_conns[['ito','bito']].rename(columns={'ito':'eindex','bito':'bindex'}).merge(start_units[['eindex','bindex','sfrom']], on=['eindex','bindex'], how='left')['sfrom'].values
+        indirect_conns = GetOtherSideOfExitConnection(indirect_conns, exit_conns)
+        indirect_conns['sfrom'] = indirect_conns['length'] - (indirect_conns['rlength'] - indirect_conns['sfrom'])
+        indirect_conns = AppendScaffoldsToExitConnection(indirect_conns)
+        indirect_conns.drop(columns=['bito'], inplace=True)
+        CheckConsistencyOfVerticalPaths(indirect_conns)
+#
+    # Reduce number of alternatives in direct and indirect connections together to ploidy
+    if len(direct_conns):
+        direct_conns['lunits'] = 0
+    if len(indirect_conns):
+        used_units = []
+        for u in range(indirect_conns['len'].max()):
+            used_units.append( indirect_conns.loc[indirect_conns['len'] > u, [f'bi{u}']].reset_index().rename(columns={'index':'cindex',f'bi{u}':'bindex'}) )
+        used_units = pd.concat(used_units, ignore_index=True)
+        used_units['lindex'] = bidi_loops.loc[used_units['bindex'].values, 'lindex'].values
+        used_units.drop(columns=['bindex'], inplace=True)
+        used_units.sort_values(['cindex','lindex'], inplace=True)
+        used_units.drop_duplicates(inplace=True)
+        used_units['pos'] = used_units.groupby(['cindex'], sort=False).cumcount()
+        indirect_conns.drop(columns=['len']+[f'bi{u}' for u in range(indirect_conns['len'].max())], inplace=True)
+        indirect_conns['lunits'] = 0
+        lunits = used_units.groupby(['cindex']).size().reset_index(name='lunits')
+        indirect_conns.loc[lunits['cindex'].values, 'lunits'] = lunits['lunits'].values
+        for u in range(lunits['lunits'].max()):
+            indirect_conns[f'li{u}'] = np.nan
+            indirect_conns.loc[used_units.loc[used_units['pos'] == u, 'cindex'].values, f'li{u}'] = used_units.loc[used_units['pos'] == u, 'lindex'].values
+    if len(direct_conns):
+        if len(indirect_conns):
+            combined_conns = pd.concat([direct_conns, indirect_conns], ignore_index=True)
+        else:
+            combined_conns = direct_conns
+    else:
+        if len(indirect_conns):
+            combined_conns = indirect_conns
+        else:
+            combined_conns = []
+    if len(combined_conns):
+        combined_conns[['to','to_side']] = [-1,'']
+        for l in np.unique(combined_conns['length']):
+            combined_conns.loc[combined_conns['length'] == l, ['to','to_side']] = combined_conns.loc[combined_conns['length'] == l, [f'scaf{l-1}',f'strand{l-1}']].values
+        combined_conns['to'] = combined_conns['to'].astype(int)
+        combined_conns['to_side'] = np.where(combined_conns['to_side'] == '+', 'l', 'r')
+        combined_conns.sort_values(['from','from_side','to','to_side'], inplace=True)
+        nalts = combined_conns.groupby(['from','from_side','to','to_side'], sort=False).size().values
+        nalts = np.repeat(nalts <= ploidy, nalts)
+        drop_cols = ['ifrom','ito','lunits']+[f'li{u}' for u in range(lunits['lunits'].max())]
+        unbridged_repeats = combined_conns[nalts].drop(columns=drop_cols)
+        combined_conns = combined_conns[nalts==False].copy()
+    else:
+        unbridged_repeats = []
+    if len(combined_conns):
+        # Get all possible combinations of conns to keep
+        combinations = combined_conns[['from','from_side','to','to_side']].copy()
+        combinations['c0'] = combinations.index.values
+        for h in range(1,ploidy):
+            combinations = combinations.merge(combined_conns[['from','from_side','to','to_side']].reset_index().rename(columns={'index':f'c{h}'}), on=['from','from_side','to','to_side'], how='left')
+            combinations = combinations[combinations[f'c{h-1}'] < combinations[f'c{h}']].copy()
+        combinations['group'] = (combinations.groupby(['from','from_side','to','to_side'], sort=False).cumcount() == 0).cumsum()
+        combinations.drop(columns=['from','from_side','to','to_side'], inplace=True)
+        # Pick the combinations that include the most exit paths
+        comb_inc = []
+        for h in range(ploidy):
+            cur = combinations[[f'c{h}']].reset_index().rename(columns={f'c{h}':'conn'})
+            cur[['e1','e2']] = combined_conns.loc[cur['conn'].values, ['ifrom','ito']].values
+            for i in [1,2]:
+                comb_inc.append(cur[['index',f'e{i}']].rename(columns={f'e{i}':'exit'}))
+        comb_inc = pd.concat(comb_inc, ignore_index=True).drop_duplicates().groupby(['index']).size().reset_index(name='count')
+        combinations['ninc'] = 0
+        combinations.loc[comb_inc['index'].values, 'ninc'] = comb_inc['count'].values
+        ninc = combinations.groupby(['group'], sort=False)['ninc'].agg(['size','max'])
+        combinations = combinations[combinations['ninc'] == np.repeat(ninc['max'].values, ninc['size'].values)].copy()
+        # Pick the combinations that include the most kinds of loop units
+        comb_inc = []
+        for h in range(ploidy):
+            cur = combinations[[f'c{h}']].reset_index().rename(columns={f'c{h}':'conn'})
+            cols = ['lunits']+[f'li{u}' for u in range(combined_conns['lunits'].max())]
+            cur[cols] = combined_conns.loc[cur['conn'].values, cols].values
+            usize = cur['lunits'].max()
+            if np.isnan(usize) == False:
+                for u in range(int(usize)):
+                    comb_inc.append(cur.loc[cur['lunits'] > u, ['index',f'li{u}']].rename(columns={f'li{u}':'lunit'}))
+        if len(comb_inc):
+            comb_inc = pd.concat(comb_inc, ignore_index=True).drop_duplicates().groupby(['index']).size().reset_index(name='count')
+        combinations['ninc'] = 0
+        if len(comb_inc):
+            combinations.loc[comb_inc['index'].values, 'ninc'] = comb_inc['count'].values
+        ninc = combinations.groupby(['group'], sort=False)['ninc'].agg(['size','max'])
+        combinations = combinations[combinations['ninc'] == np.repeat(ninc['max'].values, ninc['size'].values)].drop(columns=['ninc'])
+        # Pick the ones with the shortest maximum length and if we have multiple where all length are identical, n arbitrary (the first) one (sorting length with simple bubble sort)
+        for h in range(ploidy):
+            combinations[f'len{h}'] = combined_conns.loc[combinations[f'c{h}'].values, 'length'].values
+        n = ploidy-1
+        while(n > 0):
+            swapped = 0
+            for i in range(n):
+                swap = combinations[f'len{i}'] < combinations[f'len{i+1}']
+                if np.sum(swap):
+                    swapped = i
+                    combinations.loc[swap, [f'len{i}',f'len{i+1}']] = combinations.loc[swap, [f'len{i+1}',f'len{i}']].values
+            n = swapped
+        combinations.sort_values(['group']+[f'len{h}' for h in range(ploidy)], inplace=True)
+        combinations = combinations.groupby(['group']).first().reset_index()
+        # Pick the chosen indexes and add those connections to unbridged repeats
+        chosen_indexes = []
+        for h in range(ploidy):
+            chosen_indexes.append(combinations[f'c{h}'].values)
+        combined_conns = combined_conns.loc[np.concatenate(chosen_indexes)].drop(columns=drop_cols)
+        if len(combined_conns):
+            if len(unbridged_repeats):
+                unbridged_repeats = pd.concat( [unbridged_repeats, combined_conns], ignore_index=True )
+            else:
+                unbridged_repeats = combined_conns
+    if len(unbridged_repeats):
+        unbridged_repeats = RemoveEmptyColumns(unbridged_repeats)
+#
+    # Only keep loop units, where we have unconnected exits or never had exits at all
+    if len(exits):
+        unconnected_exits = exits[['loop','from','from_side']].drop_duplicates()
+        if len(unbridged_repeats):
+            unconnected_exits = unconnected_exits[unconnected_exits.merge(unbridged_repeats[['loop','from','from_side']].drop_duplicates(), on=['loop','from','from_side'], how='left', indicator=True)['_merge'].values == "left_only"].copy()
+            unconnected_exits = unconnected_exits[unconnected_exits.merge(unbridged_repeats[['loop','to','to_side']].drop_duplicates().rename(columns={'to':'from','to_side':'from_side'}), on=['loop','from','from_side'], how='left', indicator=True)['_merge'].values == "left_only"].copy()
+    else:
+        unconnected_exits = []
+    if len(loops):
+        loops = loops[np.isin(loops['loop'], np.setdiff1d(np.unique(exits['loop'].values), np.unique(unconnected_exits['loop'].values))) == False].copy()
+    if len(unbridged_repeats):
+        unbridged_repeats.drop(columns=['to','to_side'], inplace=True)
+        unbridged_repeats.rename(columns={'from':'scaf0','from_side':'strand0'}, inplace=True)
+        unbridged_repeats['strand0'] = np.where(unbridged_repeats['strand0'] == 'r', '+', '-')
+    if len(loops):
+        # Only keep the start position with the most loop units per loop
+        loops.sort_values(['loop','scaf0'], inplace=True)
+        loop_count = loops.groupby(['loop','scaf0'], sort=False).size().reset_index(name='count')
+        loop_count.sort_values(['loop','count'], ascending=[True,False], inplace=True)
+        loop_count = loop_count.groupby(['loop'], sort=False).first().reset_index()
+        loops = loops.merge(loop_count[['loop','scaf0']], on=['loop','scaf0'], how='inner')
+    # Remove loop units already in bridged or unbridged repeats 
+    if len(unbridged_repeats):
+        if len(bridged_repeats):
+            loop_paths = pd.concat([unbridged_repeats, bridged_repeats], ignore_index=True)
+        else:
+            loop_paths = unbridged_repeats
+    else:
+        if len(bridged_repeats):
+            loop_paths = bridged_repeats
+        else:
+            loop_paths = []
+    if len(loop_paths) and len(loops):
+        max_len = loop_paths['length'].max()
+        search_space = np.unique(loops['scaf0'].values)
+        inner_repeats = []
+        for s1 in range(1, max_len-1):
+            for s2 in range(s1+1, max_len-1):
+                found_repeats = loop_paths.loc[np.isin(loop_paths[f'scaf{s1}'], search_space) & (loop_paths[f'scaf{s1}'] == loop_paths[f'scaf{s2}']) & (loop_paths[f'strand{s1}'] == loop_paths[f'strand{s2}']), ['length']+[f'scaf{s1}',f'strand{s1}']+[f'{n}{s}' for s in range(s1+1, s2+1) for n in ['scaf','strand','dist']]].rename(columns={f'{n}{s}':f'{n}{s-s1}' for s in range(s1, s2+1) for n in ['scaf','strand','dist']})
+                if len(found_repeats):
+                    found_repeats['length'] = s2-s1
+                    inner_repeats.append(found_repeats[found_repeats['strand0'] == '+'].copy())
+                    found_repeats = found_repeats[found_repeats['strand0'] == '-'].copy()
+                    if len(found_repeats):
+                        found_repeats = ReverseVerticalPaths(found_repeats)
+                        inner_repeats.append(found_repeats.drop(columns=['lindex']))
+        if len(inner_repeats):
+            inner_repeats = pd.concat(inner_repeats, ignore_index=True, sort=False)
+        if len(inner_repeats):
+            inner_repeats.drop_duplicates(inplace=True)
+            loops = loops[ loops.merge(inner_repeats, on=list(inner_repeats.columns.values), how='left', indicator=True)['_merge'].values == "left_only" ].copy()
+#
+    # Add remaining loop units to loop_paths, get all scaffold connections in the path and make it a vertical path
+    if len(loops):
+        if len(loop_paths):
+            loop_paths = pd.concat([loop_paths, loops], ignore_index=True).drop(columns=['loop'])
+        else:
+            loop_paths = loops.drop(columns=['loop'])
+    if len(loop_paths):
+        handled_scaf_conns = GetHandledScaffoldConnectionsFromVerticalPath(loop_paths)
+        loop_paths = TurnHorizontalPathIntoVertical(loop_paths, scaffold_paths['pid'].max()+1)
+        scaffold_paths = pd.concat([scaffold_paths, loop_paths], ignore_index=True)
+    else:
+        handled_scaf_conns = []
+# 
+    return scaffold_paths, handled_scaf_conns
+
+def AddAlternativesToInversionsToPaths(inv_paths, inversions, scaffold_graph):
+    # Add all paths to inv_path between the two outer scaffolds that go through the inverted scaffold
+    pot_paths = scaffold_graph.merge(inversions, on=['from','from_side','scaf1'], how='inner')
+    for l in range(3,scaffold_graph['length'].max()):
+        pot_paths = pot_paths[pot_paths['length'] >= l].copy()
+        cur = pot_paths.loc[(pot_paths[f'scaf{l-2}'] == pot_paths['scaf1']) & (pot_paths[f'scaf{l-1}'] == pot_paths['escaf']) & (pot_paths[f'strand{l-1}'] == pot_paths['estrand']), ['length','from','from_side']+[f'{n}{s}' for s in range(1,l) for n in ['scaf','strand','dist']]].rename(columns={'from':'scaf0','from_side':'strand0'})
+        if len(cur):
+            cur['strand0'] = np.where(cur['strand0'] == 'r', '+', '-')
+            cur['length'] = l
+            cur.drop_duplicates(inplace=True)
+            inv_paths.append(cur)
+#
+    return inv_paths
+
+def RemoveInvertedRepeatsThatMightBeTwoHaplotypesOnOneSide(cur, scaffold_graph, max_length):
+    # Find the connected scaffold through the repeat also on the not repeat side
+    cur['other_side'] = np.where(cur['to_side'] == 'r','l','r')
+    remove = cur[['to','other_side','from']].reset_index().rename(columns={'from':'veto','to':'from','other_side':'from_side'}).merge(scaffold_graph, on=['from','from_side'], how='inner')
+    if len(remove):
+        remove['veto_pos'] = -1
+        for s in range(remove['length'].max()-1,0,-1):
+            remove.loc[remove[f'scaf{s}'] == remove['veto'], 'veto_pos'] = s
+        remove = remove.loc[remove['veto_pos'] > 0].copy()
+    # If the reversed path goes to somewhere else and not the inverted repeat it was a false alarm
+    if len(remove):
+        # Get the found path up to the veto
+        pot_vetos = []
+        for l1 in np.unique(remove['veto_pos'].values):
+            pot_vetos.append( remove.loc[remove['veto_pos'] == l1, ['index','veto_pos','from','from_side']+[f'{n}{s}' for s in range(1,l1+1) for n in ['scaf','strand','dist']]].drop_duplicates() )
+        pot_vetos = pd.concat(pot_vetos, ignore_index=True)
+        pot_vetos.rename(columns={'index':'dindex','from':'scaf0','from_side':'strand0','veto_pos':'length'}, inplace=True)
+        pot_vetos['strand0'] = np.where(pot_vetos['strand0'] == 'r', '+', '-')
+        # Append the inverted repeat to the paths
+        pot_vetos.rename(columns={f'{n}{s}':f'{n}{s+max_length-1}' for s in range(pot_vetos['length'].max()+1) for n in ['scaf','strand','dist']}, inplace=True)
+        pot_vetos[[f'{n}{s}' for s in range(max_length-1) for n in ['scaf','strand','dist']]+[f'dist{max_length-1}']] = cur.loc[pot_vetos['dindex'].values, [f'{n}{s}' for s in range(1,max_length) for n in ['scaf','strand','dist']]+[f'dist{max_length}']].values
+        pot_vetos.drop(columns=['dist0'], inplace=True)
+        pot_vetos['length'] += max_length
+        # Reverse it
+        remove = ReverseVerticalPaths(pot_vetos)
+        remove['lindex'] = pot_vetos.loc[remove['lindex'].values, 'dindex'].values
+        remove.rename(columns={'lindex':'dindex'}, inplace=True)
+        # Check if we find a consistent paths (which means we have evidence for two haplotypes on one side instead of both sides of an inverted repeat)
+        remove.rename(columns={'scaf0':'from','strand0':'from_side'}, inplace=True)
+        remove['from_side'] = np.where(remove['from_side'] == '+', 'r', 'l')
+        pairs = remove[['from','from_side','scaf1','strand1','dist1']].reset_index().rename(columns={'index':'rindex'}).merge(scaffold_graph[['from','from_side','scaf1','strand1','dist1']].reset_index().rename(columns={'index':'sindex'}), on=['from','from_side','scaf1','strand1','dist1'], how='inner').drop(columns=['from','from_side','scaf1','strand1','dist1'])
+        pairs['length'] = np.minimum(remove.loc[pairs['rindex'].values, 'length'].values, scaffold_graph.loc[pairs['sindex'].values, 'length'].values)
+        s = 2
+        valid_removal = [ np.unique(remove.loc[pairs.loc[pairs['length'] <= s, 'rindex'].values, 'dindex'].values) ]
+        pairs = pairs[np.isin(remove.loc[pairs['rindex'].values, 'dindex'].values, valid_removal[-1]) == False].copy()
+        while len(pairs):
+            pairs = pairs[(remove.loc[pairs['rindex'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values == scaffold_graph.loc[pairs['sindex'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values).all(axis=1)].copy()
+            s += 1
+            valid_removal.append( np.unique(remove.loc[pairs.loc[pairs['length'] <= s, 'rindex'].values, 'dindex'].values) )
+            pairs = pairs[np.isin(remove.loc[pairs['rindex'].values, 'dindex'].values, valid_removal[-1]) == False].copy()
+        valid_removal = np.concatenate(valid_removal)
+        # Drop the valid_removal (and their partners)
+        cur.drop(columns=['other_side'], inplace=True)
+        cur.drop(valid_removal, inplace=True)
+        mcols = ['from','from_side','to','to_side']+[f'{n}{s}' for s in range(1,max_length) for n in ['scaf','strand','dist']]+[f'dist{max_length}']
+        cur = cur.merge(cur[mcols].rename(columns={**{'from':'to','to':'from','from_side':'to_side','to_side':'from_side'}, **{f'dist{s}':f'dist{max_length+1-s}' for s in range(1,max_length+1)}}), on=mcols, how='inner')
+#
+    return cur
+
+def AddPathThroughInvertedRepeats(scaffold_paths, handled_scaf_conns, scaffold_graph, scaf_bridges, ploidy):
+    inv_paths = []
+    # Check for bridged inverted repeats without a scaffold in between
+    if scaffold_graph['length'].max() > 3:
+        bridged_inversions = []
+        l = 4
+        while True:
+            if scaffold_graph['length'].max() < l:
+                cur = []
+            else:
+                cur = scaffold_graph.loc[(scaffold_graph['length'] >= l) & (scaffold_graph['scaf1'] == scaffold_graph[f'scaf{l-2}']) & (scaffold_graph['strand1'] != scaffold_graph[f'strand{l-2}']), ['from','from_side']+[f'{n}{s}' for s in range(1,l) for n in ['scaf','strand','dist']]].copy()
+                for s in range(2,l//2):
+                    cur = cur[(cur[f'scaf{s}'] == cur[f'scaf{l-s-1}']) & (cur[f'strand{s}'] != cur[f'strand{l-s-1}'])].copy()
+            if len(cur):
+                cur.drop_duplicates(inplace=True)
+                # Filter the ones that will show up in the next iteration again (and if they are too short to do so, they are not truely bridged)
+                cur = cur[(cur['from'] != cur[f'scaf{l-1}']) | ((cur['from_side'] == 'r') == (cur[f'strand{l-1}'] == '+'))].copy()
+                # Only keep one direction for each inverted repeat
+                if len(cur):
+                    cur = cur[(cur['from'] < cur[f'scaf{l-1}']) | ((cur['from'] == cur[f'scaf{l-1}']) & (cur['from_side'] == 'r'))].copy()
+                    # Only keep the relevant columns to later find all connections that match this
+                    cur = cur[['from','from_side','scaf1']+[f'scaf{l-1}',f'strand{l-1}']].drop_duplicates().rename(columns={f'scaf{l-1}':'escaf',f'strand{l-1}':'estrand'})
+                    bridged_inversions.append(cur)
+                l += 2
+            else:
+                break
+        if len(bridged_inversions):
+            bridged_inversions = pd.concat(bridged_inversions, ignore_index=True)
+            # Add all paths to inv_path between the two outer scaffolds that go through the inverted scaffold
+            inv_paths = AddAlternativesToInversionsToPaths(inv_paths, bridged_inversions, scaffold_graph)
+#
+    # Check for scaffolds that are uniquely connected by an inverted (but not bridged) repeat
+    if scaffold_graph['length'].max() > 2:
+        unique_inversions = []
+        l = 3
+        while True:
+            if scaffold_graph['length'].max() < l:
+                cur = []
+            else:
+                max_length = 2*l - 3
+                cur = scaffold_graph.loc[(scaffold_graph['length'] >= l) & (scaffold_graph['length'] <= max_length) & (scaffold_graph[f'scaf{l-2}'] == scaffold_graph[f'scaf{l-1}']) & (scaffold_graph[f'strand{l-2}'] != scaffold_graph[f'strand{l-1}']), ['length','from','from_side']+[f'{n}{s}' for s in range(1,np.minimum(max_length, scaffold_graph['length'].max())) for n in ['scaf','strand','dist']]].copy()
+                for s in range(1,l-2):
+                    if cur['length'].max() > max_length-s:
+                        cur = cur[(cur['length'] <= max_length-s) | ((cur[f'scaf{s}'] == cur[f'scaf{max_length-s}']) & (cur[f'strand{s}'] != cur[f'strand{max_length-s}']))].copy()
+            if len(cur):
+                cur.drop_duplicates(inplace=True)
+                cur.reset_index(drop=True, inplace=True)
+                cur['ifrom'] = cur.index.values
+                # Guarantee we have all possible dist columns
+                cur[[f'dist{s}' for s in range(cur['length'].max(), max_length)]] = np.nan
+                # Combine the paths with the same inverted repeats
+                cols = ['ifrom','from','from_side']+[f'{n}{s}' for s in range(1,l) for n in ['scaf','strand']]+[f'dist{s}' for s in range(1,max_length)]
+                cur = cur[cols].merge(cur[cols].rename(columns={**{'from':'to','from_side':'to_side','ifrom':'ito'}, **{f'dist{s}':f'tdist{max_length-s+1}' for s in range(1,max_length) if s != l-1}}), on=[f'{n}{s}' for s in range(1,l) for n in ['scaf','strand']]+[f'dist{l-1}'])
+                cur = cur[(cur['ifrom'] != cur['ito'])].drop(columns=['ito','ifrom'])
+                check_dist = [s for s in list(range(2,l-1)) if (np.isnan(cur[f'tdist{s}']) == False).any()] + [s for s in list(range(l,max_length)) if (np.isnan(cur[f'dist{s}']) == False).any()]
+                if len(check_dist):
+                    cur = cur[((cur[[f'dist{s}' for s in check_dist]].values == cur[[f'tdist{s}' for s in check_dist]].values) | np.isnan(cur[[f'dist{s}' for s in check_dist]].values) | np.isnan(cur[[f'tdist{s}' for s in check_dist]].values)).all(axis=1)].copy()
+                cur.drop(columns=[f'dist{s}' for s in range(l,max_length)]+[f'tdist{s}' for s in range(2,l-1)], inplace=True)
+                cur.rename(columns={f'tdist{s}':f'dist{s}' for s in range(l,max_length+1)}, inplace=True)
+                if len(cur):
+                    # Only keep the paths through the inverted repeats that do not have alternatives
+                    cur.drop_duplicates(inplace=True)
+                    cols = ['from','from_side']+[f'{n}{s}' for s in range(1,l-1) for n in ['scaf','strand','dist']]+[f'dist{l-1}']
+                    cur.sort_values(cols, inplace=True)
+                    nalts = cur.groupby(cols, sort=False).size().values
+                    cur = cur[np.repeat(nalts==1, nalts)].copy()
+                    # Filter the ones that will show up in the next iteration again (and if they are too short to do so, they are not guaranteed to be unique)
+                    cur = cur[(cur['from'] != cur['to']) | (cur['from_side'] != cur['to_side'])].copy()
+                if len(cur):
+                    if l < max_length:
+                        cur[[f'{n}{s}' for s in range(l,max_length) for n in ['scaf','strand']]] = cur[[f'{n}{s}' for s in range(l-3,0,-1) for n in ['scaf','strand']]].values
+                        cur[[f'strand{s}' for s in range(l,max_length)]] = np.where(cur[[f'strand{s}' for s in range(l,max_length)]].values == '+', '-', '+')
+                    # Remove the ones, where we have evidence that we might have two haplotypes on one side instead of both sides of the inverted repeat
+                    if ploidy > 1:
+                        cur = RemoveInvertedRepeatsThatMightBeTwoHaplotypesOnOneSide(cur, scaffold_graph, max_length)
+                if len(cur):
+                    # Only keep one direction
+                    cur = cur[(cur['from'] < cur['to']) | ((cur['from'] == cur['to']) & (cur['from_side'] == 'r'))].copy()
+                    # Add the valid paths to unique_inversions to later get all (bridged) alternatives and to inv_paths directly, because we will not retrieve them, when we check for the alternatives
+                    cur['to_side'] = np.where(cur['to_side'] == 'l', '+', '-')
+                    unique_inversions.append( cur[['from','from_side','scaf1','to','to_side']].rename(columns={'to':'escaf','to_side':'estrand'}) )
+                    cur.rename(columns={'from':'scaf0','from_side':'strand0','to':f'scaf{max_length}','to_side':f'strand{max_length}'}, inplace=True)
+                    cur['strand0'] = np.where(cur['strand0'] == 'r', '+', '-')
+                    cur['length'] = max_length+1
+                    inv_paths.append(cur[['length','scaf0','strand0']+[f'{n}{s}' for s in range(1,max_length+1) for n in ['scaf','strand','dist']]])
+                l += 1
+            else:
+                break
+        # Add all paths to inv_path between the two outer scaffolds that go through the inverted scaffold
+        if len(unique_inversions):
+            unique_inversions = pd.concat(unique_inversions, ignore_index=True)
+            inv_paths = AddAlternativesToInversionsToPaths(inv_paths, unique_inversions, scaffold_graph)
+#
+    # Check for inverted repeat, which only have two connected scaffolds, so the paths is clear
+    inv_scafs = scaf_bridges.loc[(scaf_bridges['from'] == scaf_bridges['to']) & (scaf_bridges['from_side'] == scaf_bridges['to_side']) & (scaf_bridges['from_alt'] == 1), ['from','from_side','mean_dist']].rename(columns={'mean_dist':'idist0'})
+    inv_scafs['from_side'] = np.where(inv_scafs['from_side'] == 'r', 'l', 'r') # Flip 'from_side' so it is pointing in the direction of the continuation not the inversion
+    s = 0
+    two_connections = []
+    inv_scafs[f'iscaf{s}'] = inv_scafs['from']
+    inv_scafs[f'istrand{s}'] = np.where(inv_scafs['from_side'] == 'l', '+', '-') # Choice is arbitrary here, just needs to be consistent
+    while len(inv_scafs):
+        inv_scafs['length'] = s+1
+        inv_scafs['nalt'] = inv_scafs[['from','from_side']].merge(scaf_bridges[['from','from_side','from_alt']].drop_duplicates(), on=['from','from_side'], how='left')['from_alt'].fillna(0).astype(int).values
+        two_connections.append(inv_scafs[inv_scafs['nalt'] == 2].drop(columns=['nalt']))
+        # If we have a single connection, we can continue and see if we find two connections in the next scaffold
+        inv_scafs = inv_scafs[inv_scafs['nalt'] == 1].merge(scaf_bridges.loc[scaf_bridges['to_alt'] == 1, ['from','from_side','to','to_side','mean_dist']], on=['from','from_side'], how='inner')
+        if len(inv_scafs):
+            s += 1
+            inv_scafs.rename(columns={'mean_dist':f'idist{s}'}, inplace=True)
+            inv_scafs['from'] = inv_scafs['to']
+            inv_scafs['from_side'] = np.where(inv_scafs['to_side'] == 'r', 'l', 'r')
+            inv_scafs.drop(columns=['to','to_side'], inplace=True)
+            inv_scafs[f'iscaf{s}'] = inv_scafs['from']
+            inv_scafs[f'istrand{s}'] = np.where(inv_scafs['from_side'] == 'l', '+', '-') # Choice is arbitrary here, just needs to be consistent
+    if len(two_connections):
+        two_connections = pd.concat(two_connections, ignore_index=True)
+    if len(two_connections):
+        # Create the paths through the inverted repeat
+        for l in np.unique(two_connections['length']):
+            for s in range(l):
+                two_connections.loc[two_connections['length'] == l, [f'scaf{l-s}',f'strand{l-s}',f'strand{l-s+1}']] = two_connections.loc[two_connections['length'] == l, [f'iscaf{s}',f'istrand{s}',f'idist{s}']].values
+                two_connections.loc[two_connections['length'] == l, [f'scaf{l+1+s}',f'strand{l+1+s}',f'dist{l+1+s}']] = two_connections.loc[two_connections['length'] == l, [f'iscaf{s}',f'istrand{s}',f'idist{s}']].values
+                two_connections.loc[two_connections['length'] == l, f'strand{l+1+s}'] = np.where(two_connections.loc[two_connections['length'] == l, f'strand{l+1+s}'] == '+', '-', '+')
+        two_connections['length'] = two_connections['length']*2+2
+        exits = two_connections[['from','from_side']].reset_index().merge(scaf_bridges[['from','from_side','to','to_side','mean_dist']], on=['from','from_side'], how='left')
+        exits.sort_values(['index','to','to_side'], inplace=True)
+        start = exits.groupby(['index']).first().reset_index()
+        two_connections.loc[start['index'].values, 'scaf0'] = start['to'].values
+        two_connections.loc[start['index'].values, 'strand0'] = np.where(start['to_side'].values == 'r', '+', '-') # Needs to be consistent with previous choice
+        two_connections.loc[start['index'].values, 'dist1'] = start['mean_dist'].values
+        ends = exits.groupby(['index']).last().reset_index()
+        ends['len'] = two_connections.loc[ends['index'].values, 'length'].values
+        for l in np.unique(two_connections['length']):
+            two_connections.loc[ends.loc[ends['len'] == l, 'index'].values, f'scaf{l-1}'] = ends.loc[ends['len'] == l, 'to'].values
+            two_connections.loc[ends.loc[ends['len'] == l, 'index'].values, f'strand{l-1}'] = np.where(ends.loc[ends['len'] == l, 'to_side'].values == 'l', '+', '-') # Needs to be consistent with previous choice
+            two_connections.loc[ends.loc[ends['len'] == l, 'index'].values, f'dist{l-1}'] = ends.loc[ends['len'] == l, 'mean_dist'].values
+        # Remove the ones, where we have evidence that we might have two haplotypes on one side instead of both sides of the inverted repeat
+        if ploidy > 1:
+            valid_connections = []
+            for l in np.unique(two_connections['length']):
+                cur = two_connections.loc[two_connections['length'] == l, ['length','scaf0','strand0']+[f'{n}{s}' for s in range(1,l) for n in ['scaf','strand','dist']]].rename(columns={'scaf0':'from','strand0':'from_side',f'scaf{l-1}':'to',f'strand{l-1}':'to_side'})
+                cur['from_side'] = np.where(cur['from_side'] == '+', 'r', 'l')
+                cur['to_side'] = np.where(cur['to_side'] == '+', 'l', 'r')
+                cur = pd.concat([cur, cur.rename(columns={**{'from':'to','to':'from','from_side':'to_side','to_side':'from_side'}, **{f'dist{s}':f'dist{l-s}' for s in range(1,l)}})], ignore_index=True)
+                cur = RemoveInvertedRepeatsThatMightBeTwoHaplotypesOnOneSide(cur, scaffold_graph, l-1)
+                cur.rename(columns={'from':'scaf0','from_side':'strand0','to':f'scaf{l-1}','to_side':f'strand{l-1}'}, inplace=True)
+                cur['strand0'] = np.where(cur['strand0'] == 'r', '+', '-')
+                cur[f'strand{l-1}'] = np.where(cur[f'strand{l-1}'] == 'l', '+', '-')
+                valid_connections.append(cur)
+            two_connections = pd.concat(valid_connections)
+    if len(two_connections):
+        inv_paths.append( two_connections[['length','scaf0','strand0']+[f'{n}{s}' for s in range(1,two_connections['length'].max()) for n in ['scaf','strand','dist']]].copy() )
+#
+    # Filter the inv_paths that are fully included in another inv_paths
+    if len(inv_paths):
+        inv_paths = pd.concat(inv_paths, ignore_index=True).drop_duplicates()
+        inv_paths['included'] = False
+        for sfrom in range(inv_paths['length'].max()-2):
+            for l in range(3,inv_paths['length'].max()+1-sfrom):
+                check = inv_paths.loc[inv_paths['length'] >= sfrom+l, ['length',f'scaf{sfrom}',f'strand{sfrom}']+[f'{n}{s}' for s in range(sfrom+1,sfrom+l) for n in ['scaf','strand','dist']]].rename(columns={f'{n}{s}':f'{n}{s-sfrom}' for s in range(sfrom,sfrom+l) for n in ['scaf','strand','dist']})
+                if sfrom == 0:
+                    check = check[check['length'] > l].copy() # To avoid self-matching of inv_paths
+                check['length'] = l
+                inv_paths.loc[inv_paths[check.columns].merge(check, on=list(check.columns.values), how='left', indicator=True)['_merge'].values == "both", 'included'] = True
+        inv_paths = inv_paths[inv_paths['included'] == False].copy()
+#
+    # Add information to scaffold_paths and handled_scaf_conns
+    if len(inv_paths):
+        if len(handled_scaf_conns):
+            handled_scaf_conns = pd.concat([ handled_scaf_conns, GetHandledScaffoldConnectionsFromVerticalPath(inv_paths)], ignore_index=True).drop_duplicates()
+        else:
+            handled_scaf_conns = GetHandledScaffoldConnectionsFromVerticalPath(inv_paths)
+        inv_paths = TurnHorizontalPathIntoVertical(inv_paths, scaffold_paths['pid'].max()+1)
+        scaffold_paths = pd.concat([scaffold_paths, inv_paths], ignore_index=True)
+#
+    return scaffold_paths, handled_scaf_conns
+
+def AddUntraversedConnectedPaths(scaffold_paths, knots, scaffold_graph, handled_scaf_conns):
     # Get untraversed connections to neighbouring scaffolds in graph
     conn_path = scaffold_graph.loc[np.isin(scaffold_graph.index.values, knots['oindex'].values) == False, ['from','from_side','scaf1','strand1','dist1']].drop_duplicates()
     # Require that it is untraversed in both directions, otherwise we would duplicate the end of a phased path
@@ -1823,14 +3020,17 @@ def AddUntraversedConnectedPaths(scaffold_paths, knots, scaffold_graph):
     conn_path = conn_path.merge(conn_path[['from','from_side','scaf1','to_side','dist1']].rename(columns={'from':'scaf1','from_side':'to_side','scaf1':'from','to_side':'from_side'}), on=['from','from_side','scaf1','to_side','dist1'], how='inner')
     # Only use one of the two directions for the path
     conn_path = conn_path[(conn_path['from'] < conn_path['scaf1']) | ((conn_path['from'] == conn_path['scaf1']) & ((conn_path['from_side'] == conn_path['to_side']) | (conn_path['from_side'] == 'r')))].drop(columns=['to_side'])
+    # Require that is has not been handled before
+    conn_path.rename(columns={'from':'scaf0','from_side':'strand0'}, inplace=True)
+    conn_path['strand0'] = np.where(conn_path['strand0'] == 'r', '+', '-')
+    if len(handled_scaf_conns):
+        conn_path = conn_path[ conn_path.merge(handled_scaf_conns, on=['scaf0','strand0','scaf1','strand1','dist1'], how='left', indicator=True)['_merge'].values == "left_only" ].copy()
     # Turn into proper format for scaffold_paths
-    conn_path['strand0'] = np.where(conn_path['from_side'] == 'r', '+', '-')
     conn_path['pid'] = np.arange(len(conn_path)) + 1 + scaffold_paths['pid'].max()
     conn_path['dist0'] = 0
     conn_path['pos'] = 0
     conn_path['pos1'] = 1
-
-    scaffold_paths = pd.concat([scaffold_paths, conn_path[['pid','pos','from','strand0','dist0']].rename(columns={'from':'scaf0'}), conn_path[['pid','pos1','scaf1','strand1','dist1']].rename(columns={'pos1':'pos','scaf1':'scaf0','strand1':'strand0','dist1':'dist0'})], ignore_index=True)
+    scaffold_paths = pd.concat([scaffold_paths, conn_path[['pid','pos','scaf0','strand0','dist0']], conn_path[['pid','pos1','scaf1','strand1','dist1']].rename(columns={'pos1':'pos','scaf1':'scaf0','strand1':'strand0','dist1':'dist0'})], ignore_index=True)
     scaffold_paths.sort_values(['pid','pos'], inplace=True)
 
     return scaffold_paths
@@ -1848,7 +3048,17 @@ def AddUnconnectedPaths(scaffold_paths, scaffolds, scaffold_graph):
 
     return scaffold_paths
 
-def GetDuplications(scaffold_paths, ploidy):
+def GetExistingHaplotypesFromPaths(scaffold_paths, ploidy):
+    haps = [scaffold_paths[['pid']].drop_duplicates()]
+    haps[0]['hap'] = 0
+    for h in range(1, ploidy):
+        haps.append( scaffold_paths.loc[scaffold_paths[f'phase{h}'] > 0, ['pid']].drop_duplicates() )
+        haps[-1]['hap'] = h
+    haps = pd.concat(haps, ignore_index=True).sort_values(['pid','hap']).reset_index(drop=True)
+#
+    return haps
+
+def GetDuplications(scaffold_paths, ploidy, groups=[]):
     # Collect all the haplotypes for comparison
     if 1 == ploidy:
         duplications = scaffold_paths[['scaf0','pid','pos']].rename(columns={'scaf0':'scaf'})
@@ -1862,7 +3072,12 @@ def GetDuplications(scaffold_paths, ploidy):
         duplications = pd.concat(duplications, ignore_index=True)
     duplications = duplications[duplications['scaf'] >= 0].copy() # Ignore deletions
     # Get duplications
-    duplications = duplications.rename(columns={col:f'a{col}' for col in duplications.columns if col != "scaf"}).merge(duplications.rename(columns={col:f'b{col}' for col in duplications.columns if col != "scaf"}), on=['scaf'], how='left') # 'left' keeps the order and we always have at least the self mapping, thus 'inner' does not reduce the size
+    if len(groups):
+        duplications = duplications.merge(groups, on=['pid'], how='inner')
+        mcols = ['scaf','group']
+    else:
+        mcols = ['scaf']
+    duplications = duplications.rename(columns={col:f'a{col}' for col in duplications.columns if col not in mcols}).merge(duplications.rename(columns={col:f'b{col}' for col in duplications.columns if col not in mcols}), on=mcols, how='left') # 'left' keeps the order and we always have at least the self mapping, thus 'inner' does not reduce the size
     duplications = duplications[(duplications['apid'] != duplications['bpid'])].drop(columns=['scaf']) # Remove self mappings
 #
     return duplications
@@ -1878,7 +3093,7 @@ def AddStrandToDuplications(duplications, scaffold_paths, ploidy):
     return duplications
 
 def SeparateDuplicationsByHaplotype(duplications, scaffold_paths, ploidy):
-    if ploidy == 1:
+    if ploidy == 1 or len(duplications) == 0:
         duplications.reset_index(drop=True, inplace=True)
     else:
         #for h in range(1,ploidy):
@@ -1943,7 +3158,10 @@ def GetPositionsBeforeDuplication(duplications, scaffold_paths, ploidy, invert):
 def ExtendDuplicationsFromEnd(duplications, scaffold_paths, end, scaf_len, ploidy):
     # Get duplications starting at end
     ext_dups = []
-    edups = duplications[duplications['apos'] == (0 if end == 'l' else duplications[['apid']].rename(columns={'apid':'pid'}).merge(scaf_len, on=['pid'], how='left')['pos'].values)].copy()
+    if 'min_pos' in scaf_len.columns:
+        edups = duplications[duplications['apos'] == (duplications[['apid','ahap']].rename(columns={'apid':'pid','ahap':'hap'}).merge(scaf_len, on=['pid','hap'], how='left')['min_pos' if end == 'l' else 'max_pos'].values)].copy()
+    else:
+        edups = duplications[duplications['apos'] == (0 if end == 'l' else duplications[['apid']].rename(columns={'apid':'pid'}).merge(scaf_len, on=['pid'], how='left')['pos'].values)].copy()
     edups['did'] = np.arange(len(edups))
     ext_dups.append(edups.copy())
     while len(edups):
@@ -2013,14 +3231,109 @@ def RemoveHaplotypes(scaffold_paths, delete_haps, ploidy):
 #
     return scaffold_paths
 
+def CompressPaths(scaffold_paths, ploidy):
+    # Remove positions with only deletions
+    scaffold_paths = scaffold_paths[(scaffold_paths[[f'scaf{h}' for h in range(ploidy)]] >= 0).any(axis=1)].copy()
+    scaffold_paths['pos'] = scaffold_paths.groupby(['pid'], sort=False).cumcount()
+    scaffold_paths.reset_index(drop=True, inplace=True)
+    # Compress paths where we have alternating deletions
+    while True:
+        shifts = scaffold_paths.loc[ ((np.where(scaffold_paths[[f'phase{h}' for h in range(ploidy)]].values < 0, scaffold_paths[['scaf0' for h in range(ploidy)]].values, scaffold_paths[[f'scaf{h}' for h in range(ploidy)]].values) < 0) |
+                                      (np.where(scaffold_paths[[f'phase{h}' for h in range(ploidy)]].shift(1).values < 0, scaffold_paths[['scaf0' for h in range(ploidy)]].shift(1).values, scaffold_paths[[f'scaf{h}' for h in range(ploidy)]].shift(1).values) < 0)).all(axis=1) &
+                                     (scaffold_paths['pos'] > 0), ['pid'] ]
+        if len(shifts) == 0:
+            break
+        else:
+            shifts['index'] = shifts.index.values
+            shifts = shifts.groupby(['pid'], sort=False).first() # We can only take the first in each path, because otherwise we might block the optimal solution
+            shifts['new_index'] = shifts['index'] - np.where(scaffold_paths.loc[shifts['index'].values, 'pos'].values > 1, 2, 1) # Make sure we do not go into the previous path
+            while True:
+                further = ( ((np.where(scaffold_paths.loc[shifts['index'].values, [f'phase{h}' for h in range(ploidy)]].values < 0, scaffold_paths.loc[shifts['index'].values, ['scaf0' for h in range(ploidy)]].values, scaffold_paths.loc[shifts['index'].values, [f'scaf{h}' for h in range(ploidy)]].values) < 0) |
+                            (np.where(scaffold_paths.loc[shifts['new_index'].values, [f'phase{h}' for h in range(ploidy)]].values < 0, scaffold_paths.loc[shifts['new_index'].values, ['scaf0' for h in range(ploidy)]].values, scaffold_paths.loc[shifts['new_index'].values, [f'scaf{h}' for h in range(ploidy)]].values) < 0)).all(axis=1) &
+                           (scaffold_paths.loc[shifts['new_index'].values, 'pos'] > 0) )
+                if np.sum(further) == 0:
+                    break
+                else:
+                    shifts.loc[further, 'new_index'] -= 1
+            shifts['new_index'] += 1
+            for h in range(ploidy):
+                cur_shifts = (scaffold_paths.loc[shifts['index'].values, f'phase{h}'].values >= 0) & (scaffold_paths.loc[shifts['index'].values, f'scaf{h}'].values >= 0)
+                if np.sum(cur_shifts):
+                    scaffold_paths.loc[shifts.loc[cur_shifts, 'new_index'].values, f'phase{h}'] = np.abs(scaffold_paths.loc[shifts.loc[cur_shifts, 'index'].values, f'phase{h}'].values)
+                    scaffold_paths.loc[shifts.loc[cur_shifts, 'new_index'].values, [f'scaf{h}',f'strand{h}',f'dist{h}']] = scaffold_paths.loc[shifts.loc[cur_shifts, 'index'].values, [f'scaf{h}',f'strand{h}',f'dist{h}']].values
+                cur_shifts = (scaffold_paths.loc[shifts['index'].values, f'phase{h}'].values < 0) & (scaffold_paths.loc[shifts['index'].values, 'scaf0'].values >= 0)
+                if np.sum(cur_shifts):
+                    scaffold_paths.loc[shifts.loc[cur_shifts, 'new_index'].values, f'phase{h}'] = np.abs(scaffold_paths.loc[shifts.loc[cur_shifts, 'index'].values, f'phase{h}'].values)
+                    scaffold_paths.loc[shifts.loc[cur_shifts, 'new_index'].values, [f'scaf{h}',f'strand{h}',f'dist{h}']] = scaffold_paths.loc[shifts.loc[cur_shifts, 'index'].values, ['scaf0','strand0','dist0']].values
+            scaffold_paths.drop(shifts['index'].values, inplace=True)
+            scaffold_paths['pos'] = scaffold_paths.groupby(['pid'], sort=False).cumcount()
+            scaffold_paths.reset_index(drop=True, inplace=True)
+#
+    return scaffold_paths
+
+def GetEndPosForEachHaplotypes(scaffold_paths, ploidy):
+    scaf_len = scaffold_paths.groupby(['pid'])['pos'].max().reset_index(name='max_pos')
+    scaf_len['min_pos'] = 0
+    scaf_len = GetExistingHaplotypesFromPaths(scaffold_paths, ploidy).merge(scaf_len[['pid','min_pos','max_pos']], on=['pid'], how='left')
+    scaf_len['finished'] = False
+    while np.sum(scaf_len['finished'] == False):
+        for h in range(ploidy):
+            cur = (scaf_len['finished'] == False) & (scaf_len['hap'] == h)
+            scaf_len.loc[cur, ['phase','scaf','scaf0']] = scaf_len.loc[cur, ['pid','min_pos']].rename(columns={'min_pos':'pos'}).merge(scaffold_paths[['pid','pos',f'phase{h}',f'scaf{h}']+([] if h==0 else ['scaf0'])], on=['pid','pos'], how='left')[[f'phase{h}',f'scaf{h}','scaf0']].values
+        found_del = (scaf_len['scaf'] < 0) & (scaf_len['phase'] > 0) | (scaf_len['scaf0'] < 0) & (scaf_len['phase'] < 0)
+        scaf_len.loc[found_del, 'min_pos'] += 1
+        scaf_len.loc[scaf_len['min_pos'] > scaf_len['max_pos'], 'finished'] = True
+        scaf_len.loc[found_del == False, 'finished'] = True
+    scaf_len['finished'] = scaf_len['max_pos'] < scaf_len['min_pos']
+    while np.sum(scaf_len['finished'] == False):
+        for h in range(ploidy):
+            cur = (scaf_len['finished'] == False) & (scaf_len['hap'] == h)
+            scaf_len.loc[cur, ['phase','scaf','scaf0']] = scaf_len.loc[cur, ['pid','max_pos']].rename(columns={'max_pos':'pos'}).merge(scaffold_paths[['pid','pos',f'phase{h}',f'scaf{h}']+([] if h==0 else ['scaf0'])], on=['pid','pos'], how='left')[[f'phase{h}',f'scaf{h}','scaf0']].values
+        found_del = (scaf_len['scaf'] < 0) & (scaf_len['phase'] > 0) | (scaf_len['scaf0'] < 0) & (scaf_len['phase'] < 0)
+        scaf_len.loc[found_del, 'max_pos'] -= 1
+        scaf_len.loc[found_del == False, 'finished'] = True
+    scaf_len.drop(columns=['finished','phase','scaf','scaf0'], inplace=True)
+#
+    return scaf_len
+
 def RemoveDuplicates(scaffold_paths, remove_all, ploidy):
-    # Get duplications that contain both path ends for side a
+    # Get min/max position for each haplotype in paths (excluding deletions at ends)
+    scaf_len = GetEndPosForEachHaplotypes(scaffold_paths, ploidy)
+    # Remove haplotypes that are only deletions
+    rem_paths = scaf_len.loc[scaf_len['max_pos'] < scaf_len['min_pos'], ['pid','hap']].copy()
+    scaf_len = scaf_len[scaf_len['max_pos'] >= scaf_len['min_pos']].copy()
+    # Remove haplotype that are a complete duplication of another haplotype
+    scaf_len['len'] = scaf_len['max_pos'] - scaf_len['min_pos'] + 1
+    check = scaf_len.drop(columns=['max_pos']).rename(columns={'hap':'hap1','len':'len1'}).merge(scaf_len[['pid','hap','len']].rename(columns={'hap':'hap2','len':'len2'}), on=['pid'], how='left')
+    scaf_len.drop(columns=['len'], inplace=True)
+    check = check[ (check['len1'] < check['len2']) | ((check['len1'] == check['len2']) & (check['hap1'] > check['hap2'])) ].drop(columns=['len2']) # Only the shorter one can be a (partial) duplicate of the other one and if they are the same length we want to keep one of the duplications, so chose the higher haplotype for potential removal
+    if len(check):
+        check['index'] = check.index.values
+        check = check.loc[np.repeat(check['index'].values, check['len1'].values)].reset_index(drop=True)
+        check['pos'] = check.groupby(['index'], sort=False).cumcount() + check['min_pos']
+        check_paths = check[['pid','pos']].merge(scaffold_paths, on=['pid','pos'], how='left')
+        for i in [1,2]:
+            check[[f'scaf{i}',f'strand{i}',f'dist{i}']] = check_paths[['scaf0','strand0','dist0']].values
+            for h in range(1,ploidy):
+                cur = (check[f'hap{i}'] == h) & (check_paths[f'phase{h}'] > 0)
+                check.loc[cur, [f'scaf{i}',f'strand{i}',f'dist{i}']] = check_paths.loc[cur, [f'scaf{h}',f'strand{h}',f'dist{h}']].values
+        check['identical'] = (check['scaf1'] == check['scaf2']) & (check['strand1'] == check['strand2']) & ((check['dist1'] == check['dist2']) | (check['pos'] == check['min_pos']))
+        check = check.groupby(['pid','hap1','hap2'])['identical'].min().reset_index()
+        check = check[check['identical']].drop(columns=['identical','hap2']).drop_duplicates()
+        rem_paths = pd.concat([rem_paths, check.rename(columns={'hap1':'hap'})], ignore_index=True)
+    if len(rem_paths):
+        scaffold_paths = RemoveHaplotypes(scaffold_paths, rem_paths, ploidy)
+        scaf_len = GetEndPosForEachHaplotypes(scaffold_paths, ploidy)
+#
+    # Get duplications that contain both path ends for side a (we cannot go down to haplotype level here, because we have not separated the haplotypes yet, so they miss the duplications they share with main)
     duplications = GetDuplications(scaffold_paths, ploidy)
-    scaf_len = scaffold_paths.groupby(['pid'])['pos'].max().reset_index()
     ends = duplications.groupby(['apid','bpid'])['apos'].agg(['min','max']).reset_index()
-    ends['alen'] = ends[['apid']].rename(columns={'apid':'pid'}).merge(scaf_len, on=['pid'], how='left')['pos'].values
-    ends = ends.loc[(ends['min'] == 0) & (ends['max'] == ends['alen']), ['apid','bpid','alen']].copy()
+    ends['amin'] = ends[['apid']].rename(columns={'apid':'pid'}).merge(scaf_len.groupby(['pid'])['min_pos'].max().reset_index(), on=['pid'], how='left')['min_pos'].values
+    ends['amax'] = ends[['apid']].rename(columns={'apid':'pid'}).merge(scaf_len.groupby(['pid'])['max_pos'].min().reset_index(), on=['pid'], how='left')['max_pos'].values
+    ends = ends.loc[(ends['min'] <= ends['amin']) & (ends['max'] >= ends['amax']), ['apid','bpid']].copy()
     duplications = duplications.merge(ends, on=['apid','bpid'], how='inner')
+    # Add length of haplotype a
+    duplications['alen']  = duplications[['apid','ahap']].rename(columns={'apid':'pid','ahap':'hap'}).merge(scaf_len[['pid','hap','max_pos']], on=['pid','hap'], how='left')['max_pos'].values
     # Check if they are on the same or opposite strand (alone it is useless, but it sets the requirements for the direction of change for the positions)
     duplications = AddStrandToDuplications(duplications, scaffold_paths, ploidy)
     duplications['samedir'] = duplications['astrand'] == duplications['bstrand']
@@ -2036,6 +3349,7 @@ def RemoveDuplicates(scaffold_paths, remove_all, ploidy):
     rem_paths = rem_paths.loc[rem_paths['apid'] < rem_paths['bpid'], ['apid','ahap']].copy() # Only remove the lower pid (because we add merged path with new, larger pids at the end)
     if remove_all:
         rem_paths = pd.concat([rem_paths, duplications], ignore_index=True)
+    rem_paths.drop_duplicates(inplace=True)
     rem_paths.rename(columns={'apid':'pid','ahap':'hap'}, inplace=True)
     scaffold_paths = RemoveHaplotypes(scaffold_paths, rem_paths, ploidy)
     scaffold_paths = CompressPaths(scaffold_paths, ploidy)
@@ -2113,7 +3427,16 @@ def GetNextPositionInPathA(ends, scaffold_paths, ploidy):
 #
     return ends
 
+def CheckForEndOfPathB(ends, pairs):
+    ends['active'] = False
+    ends.loc[pairs['eindex'].drop_duplicates().values, 'active'] = True
+    ends.loc[ends['active'] & (ends['valid'] == False) & ((ends['mpos'] < 0) | (ends['mpos'] > ends['blen'])), ['valid','short']] = True
+    ends.drop(columns=['active'], inplace=True)
+#
+    return ends
+
 def FilterInvalidConnections(ends, scaffold_paths, scaffold_graph, ploidy, symmetrical):
+    # Check if the extensions of the paths in scaffold_graph support a connection
     ends['short'] = False # If path b is shorter than the scaffold_graph coming from path a
     if len(ends):
         ends['apos'] = np.where(ends['aside'] == 'l', ends['amax'], ends['amin'])
@@ -2178,16 +3501,17 @@ def FilterInvalidConnections(ends, scaffold_paths, scaffold_graph, ploidy, symme
             ends.loc[np.isnan(ends['next_scaf']) | (ends['nbranches'] == 1), 'nbranches'] = 0 # If we are at the end of the path or do not have any branch points anymore, we do not need further checks on this end (ends['nbranches'] == 1 must be checked on the values from last round, because there the path is already validated, which is not the case for this round)
             branches = branches[ ends.loc[branches['eindex'].values, 'nbranches'].values > 0 ].copy()
             ends['valid'] = (ends['nbranches'] == 0) # If the path does not have any branch points anymore it is automatically valid
-            for spos in range(ends['spos'].min(), ends['spos'].max()+1):
-                ends['test'] = (ends['nbranches'] > 0) & (ends['spos'] == spos)
-                test = ends.loc[branches['eindex'].values, 'test'].values
-                branches.loc[test, 'invalid'] = (scaffold_graph.loc[branches.loc[test, 'sindex'].values, [f'scaf{spos}',f'strand{spos}',f'dist{spos}']].values != ends.loc[branches.loc[test, 'eindex'].values, ['next_scaf','next_strand','next_dist']].values).any(axis=1)
-            ends['spos'] += 1
-            branches = branches[branches['invalid'] == False].copy()
-            nbranches = branches.groupby(['eindex']).size().reset_index(name='nbranches')
-            nbranches['old_number'] = ends.loc[nbranches['eindex'].values, 'nbranches'].values
-            ends.loc[nbranches['eindex'].values, 'nbranches'] = nbranches['nbranches'].values
-            ends.loc[nbranches.loc[nbranches['old_number'] == nbranches['nbranches'], 'eindex'].values, 'valid'] = True # If we do not have a break point those ends are automatically valid and we do not test them this round
+            if np.sum(ends['nbranches'] > 0):
+                for spos in range(ends.loc[ends['nbranches'] > 0, 'spos'].min(), ends.loc[ends['nbranches'] > 0, 'spos'].max()+1):
+                    ends['test'] = (ends['nbranches'] > 0) & (ends['spos'] == spos)
+                    test = ends.loc[branches['eindex'].values, 'test'].values
+                    branches.loc[test, 'invalid'] = (scaffold_graph.loc[branches.loc[test, 'sindex'].values, [f'scaf{spos}',f'strand{spos}',f'dist{spos}']].values != ends.loc[branches.loc[test, 'eindex'].values, ['next_scaf','next_strand','next_dist']].values).any(axis=1)
+                ends['spos'] += 1
+                branches = branches[branches['invalid'] == False].copy()
+                nbranches = branches.groupby(['eindex']).size().reset_index(name='nbranches')
+                nbranches['old_number'] = ends.loc[nbranches['eindex'].values, 'nbranches'].values
+                ends.loc[nbranches['eindex'].values, 'nbranches'] = nbranches['nbranches'].values
+                ends.loc[nbranches.loc[nbranches['old_number'] == nbranches['nbranches'], 'eindex'].values, 'valid'] = True # If we do not have a break point those ends are automatically valid and we do not test them this round
             # Get the corresponding 'from' 'from_side' for scaffold_graph
             pairs = ends.loc[ends['valid'] == False, ['next_scaf','next_strand']].reset_index()
             if len(pairs):
@@ -2215,6 +3539,7 @@ def FilterInvalidConnections(ends, scaffold_paths, scaffold_graph, ploidy, symme
                 s = smin
                 ends['mpos'] = np.where(ends['bside'] == 'l', ends['bmin'], ends['bmax'])
                 ends = GetNextPositionInPathB(ends, scaffold_paths, ploidy)
+                ends = CheckForEndOfPathB(ends, pairs)
                 while len(pairs):
                     # Get strand and distance between opos and mpos
                     ends = GetPositionFromPaths(ends, scaffold_paths, ploidy, 'next_strand', 'strand', 'bpid', 'mpos', 'bhap')
@@ -2224,15 +3549,12 @@ def FilterInvalidConnections(ends, scaffold_paths, scaffold_graph, ploidy, symme
                     # Check if this matches with scaffold_graph
                     pairs = pairs[ (scaffold_graph.loc[pairs['sindex'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values == ends.loc[pairs['eindex'].values, ['next_scaf','next_strand','next_dist']].values).all(axis=1) ].copy()
                     s += 1
-                    # Mark the ends that reached the end of entry in scaffold_graph as valid
-                    ends.loc[pairs.loc[scaffold_graph.loc[pairs['sindex'].values, 'length'].values == s, 'eindex'].values, 'valid'] = True
                     if len(pairs):
+                        # Mark the ends that reached the end of entry in scaffold_graph as valid
+                        ends.loc[pairs.loc[scaffold_graph.loc[pairs['sindex'].values, 'length'].values == s, 'eindex'].values, 'valid'] = True
                         # If we are at the other end of path b set it as valid but short (we do not delete anything here, because the deletion operation takes a lot of time)
                         ends = GetNextPositionInPathB(ends, scaffold_paths, ploidy)
-                        ends['active'] = False
-                        ends.loc[pairs['eindex'].drop_duplicates().values, 'active'] = True
-                        ends.loc[ends['active'] & (ends['valid'] == False) & ((ends['mpos'] < 0) | (ends['mpos'] > ends['blen'])), ['valid','short']] = True
-                        ends.drop(columns=['active'], inplace=True)
+                        ends = CheckForEndOfPathB(ends, pairs)
                         pairs = pairs[ends.loc[pairs['eindex'].values, 'valid'].values == False].copy()
             ends = ends[ends['valid']].copy()
             if symmetrical:
@@ -2243,6 +3565,72 @@ def FilterInvalidConnections(ends, scaffold_paths, scaffold_graph, ploidy, symme
             if np.sum(ends['nbranches'] > 0) == 0: # No entries in scaffold_graph reach path b anymore
                 break
         ends.drop(columns=['apos','adir','dir','mpos','nbranches','opos','next_scaf','next_strand','valid','dist_pos','next_dist','spos','test'], inplace=True)
+#
+    return ends
+
+def FindInvalidOverlaps(ends, scaffold_paths, ploidy):
+    # Check first position, where distance does not matter
+    for p in ['a','b']:
+        cur = (ends[f'{p}side'] == 'r') == (p == 'a')
+        ends[f'{p}pos'] = np.where(cur, ends[f'{p}min'], ends[f'{p}max'])
+        ends[f'{p}dir'] = np.where(cur, 1, -1)
+        ends = GetPositionFromPaths(ends, scaffold_paths, ploidy, f'{p}scaf', 'scaf', f'{p}pid', f'{p}pos', f'{p}hap')
+        ends = GetPositionFromPaths(ends, scaffold_paths, ploidy, f'{p}strand', 'strand', f'{p}pid', f'{p}pos', f'{p}hap')
+    ends['valid_overlap'] = (ends['ascaf'] == ends['bscaf']) & ((ends['astrand'] == ends['bstrand']) == ends['samedir'])
+    # Check following positions
+    ends['unfinished'] = True
+    switch_cols = {'apid':'bpid','ahap':'bhap','bpid':'apid','bhap':'ahap'}
+    while np.sum(ends['unfinished']):
+        for p in ['a','b']:
+            ends.rename(columns=switch_cols, inplace=True)
+            ends['mpos'] = ends[f'{p}pos']
+            ends['dir'] = ends[f'{p}dir']
+            ends = GetFullNextPositionInPathB(ends, scaffold_paths, ploidy)
+            ends[f'{p}pos'] = ends['mpos']
+            ends[f'{p}scaf'] = ends['next_scaf']
+            ends[f'{p}strand'] = ends['next_strand']
+            ends[f'{p}dist'] = ends['next_dist']
+            ends[f'{p}unfinished'] = (ends[f'{p}min'] <= ends[f'{p}pos']) & (ends[f'{p}pos'] <= ends[f'{p}max'])
+        ends['unfinished'] = ends['aunfinished'] | ends['bunfinished']
+        ends.loc[ends['aunfinished'] != ends['bunfinished'], 'valid_overlap'] = False
+        ends.loc[ends['unfinished'], 'valid_overlap'] = ends.loc[ends['unfinished'], 'valid_overlap'] & (ends.loc[ends['unfinished'], ['ascaf','astrand','adist']].values == ends.loc[ends['unfinished'], ['bscaf','bstrand','bdist']].values).all(axis=1)
+    ends.drop(columns=['apos','adir','ascaf','astrand','aunfinished','bpos','bdir','bscaf','bstrand','bunfinished','unfinished','mpos','dir','opos','next_scaf','next_strand','dist_pos','next_dist','adist','bdist'], inplace=True)
+    # If the haplotype is identical to a lower haplotype at the overlap, ignore this test (to be able to combine non-haploid overlaps)
+    pids = pd.concat([ends.loc[ends['valid_overlap'] == False, ['apid','amin','amax']].rename(columns={'apid':'pid','amin':'min','amax':'max'}), ends.loc[ends['valid_overlap'] == False, ['bpid','bmin','bmax']].rename(columns={'bpid':'pid','bmin':'min','bmax':'max'})], ignore_index=True).drop_duplicates()
+    pids = scaffold_paths.merge(pids, on=['pid'], how='inner')
+    pids = pids[(pids['min'] <= pids['pos']) & (pids['pos'] <= pids['max'])].drop(columns=['min','max'])
+    pids['pos'] = pids.groupby(['pid']).cumcount()
+    pids = SetDistanceAtFirstPositionToZero(pids, ploidy)
+    haps = []
+    dedup_haps = []
+    for h in range(1,ploidy):
+        cur = pids.groupby(['pid'])[f'phase{h}'].max()
+        dedup_haps.append(cur[cur < 0].reset_index()[['pid']])
+        dedup_haps[-1]['hap'] = h
+        cur = pids[np.isin(pids['pid'], cur[cur > 0].reset_index()['pid'].values)].copy()
+        cur.loc[cur[f'phase{h}'] < 0, [f'scaf{h}',f'strand{h}',f'dist{h}']] = cur.loc[cur[f'phase{h}'] < 0, ['scaf0','strand0','dist0']].values
+        cur = cur.loc[cur[f'scaf{h}'] >= 0, ['pid','pos',f'scaf{h}',f'strand{h}',f'dist{h}']].rename(columns={f'scaf{h}':'scaf',f'strand{h}':'strand',f'dist{h}':'dist'})
+        cur['pos'] = cur.groupby(['pid']).cumcount()
+        new_haps = cur[['pid']].drop_duplicates()
+        new_haps['length'] = 0
+        if len(cur):
+            for p in range(cur['pos'].max()+1):
+                new_haps[[f'scaf{p}',f'strand{p}',f'dist{p}']] = new_haps[['pid']].merge(cur[cur['pos'] == p], on=['pid'], how='left')[['scaf','strand','dist']].values
+                new_haps.loc[np.isnan(new_haps[f'scaf{p}']) == False, 'length'] += 1
+            new_haps.drop(columns=['dist0'], inplace=True)
+        if len(haps):
+            cols = list(np.intersect1d(new_haps.columns, haps.columns))
+            new_haps['dups'] = new_haps[cols].merge(haps[cols], on=cols, how='left', indicator=True)['_merge'].values == "both"
+            dedup_haps.append(new_haps.loc[new_haps['dups'], ['pid']].copy())
+            dedup_haps[-1]['hap'] = h
+            new_haps = new_haps[new_haps['dups'] == False].drop(columns=['dups'])
+            haps = pd.concat([haps, new_haps], ignore_index=True)
+        else:
+            haps = new_haps
+    dedup_haps = pd.concat(dedup_haps, ignore_index=True)
+    ends['dup_hap'] = False
+    for p in ['a','b']:
+        ends.loc[ends[[f'{p}pid',f'{p}hap']].rename(columns={f'{p}pid':'pid',f'{p}hap':'hap'}).merge(dedup_haps, on=['pid','hap'], how='left', indicator=True)['_merge'].values == "both", 'dup_hap'] = True
 #
     return ends
 
@@ -2278,6 +3666,76 @@ def ReverseScaffolds(scaffold_paths, reverse, ploidy):
     scaffold_paths['pos'] = scaffold_paths.groupby(['pid'], sort=False).cumcount()
 #
     return scaffold_paths
+
+def GetDeduplicatedHaplotypesAtPathEnds(path_sides, scaffold_paths, scaffold_graph, ploidy):
+    # Reverse the scaffolds, where we are interested on the right side, so that the position 0 is always the first on the interesting side
+    cur_paths = scaffold_paths.merge(path_sides, on=['pid'], how='inner')
+    rcur = cur_paths[cur_paths['side'] == 'r'].copy()
+    rcur['reverse'] = True
+    cur_paths = [ cur_paths[cur_paths['side'] == 'l'] ]
+    for m in np.unique(rcur['matches']):
+        cur_paths.append( ReverseScaffolds(rcur[rcur['matches'] == m].copy(), rcur.loc[rcur['matches'] == m, 'reverse'].values, ploidy).drop(columns=['reverse']) )
+    cur_paths = pd.concat(cur_paths, ignore_index=True)
+    cur_paths.sort_values(['pid','side','matches','pos'], inplace=True)
+    # Get the deduplicated haplotypes
+    haps = []
+    dedup_haps = [ path_sides ] # The main paths will never be removed through deduplication
+    dedup_haps[-1]['hap'] = 0
+    for h in range(ploidy):
+        # Get all haplotypes that differ from the main (and the main) without any deletions
+        cur = cur_paths[np.isin(cur_paths['pid'], np.unique(cur_paths.loc[cur_paths[f'phase{h}'] > 0, 'pid'].values))].copy()
+        if np.sum(cur[f'phase{h}'] < 0):
+            cur.loc[cur[f'phase{h}'] < 0, [f'scaf{h}',f'strand{h}',f'dist{h}']] = cur.loc[cur[f'phase{h}'] < 0, ['scaf0','strand0','dist0']].values
+        cur = cur.loc[cur[f'scaf{h}'] >= 0, ['pid','side','matches','pos',f'scaf{h}',f'strand{h}',f'dist{h}']].rename(columns={f'scaf{h}':'scaf',f'strand{h}':'strand',f'dist{h}':'dist'})
+        cur['pos'] = cur.groupby(['pid','side','matches'], sort=False).cumcount()
+        cur['hap'] = h
+        # Compare to with all previous haplotypes if it differs
+        if h == 0:
+            haps.append(cur) # The main does not have any to compare
+        else:
+            cur_dedups = cur[['pid','side','matches','hap']].drop_duplicates()
+            for hap in haps:
+                # Get the first position from where it differs to the currently compared haplotype
+                cur[['cscaf','cstrand','cdist']] = cur[['pid','side','matches','pos']].merge(hap, on=['pid','side','matches','pos'], how='left')[['scaf','strand','dist']].values
+                cur['diff'] = np.isnan(cur['cscaf']) | (cur[['cscaf','cstrand','cdist']].values != cur[['scaf','strand','dist']].values).any(axis=1)
+                cur['diff'] = cur.groupby(['pid','side','matches'], sort=False)['diff'].cummax()
+                # Also get it the other way round
+                chap = hap.merge(cur[['pid']].drop_duplicates(), on=['pid'], how='inner')
+                chap[['cscaf','cstrand','cdist']] = chap[['pid','side','matches','pos']].merge(cur, on=['pid','side','matches','pos'], how='left')[['scaf','strand','dist']].values
+                chap['diff'] = np.isnan(chap['cscaf']) | (chap[['cscaf','cstrand','cdist']].values != chap[['scaf','strand','dist']].values).any(axis=1)
+                chap['diff'] = chap.groupby(['pid','side','matches'], sort=False)['diff'].cummax()
+                # Do the next tests on both haplotypes combined and if one of them passes all the two haplotypes are no duplicates
+                chap = pd.concat([chap,cur], ignore_index=True)
+                # Keep paths up to first difference
+                chap['diff'] = chap['diff'] & (chap['diff'].shift(1) | (chap[['pid','side','matches','hap']] != chap[['pid','side','matches','hap']].shift(1)).any(axis=1))
+                chap = chap[chap['diff'] == False].drop(columns=['diff'])
+                # Make it a vertical paths starting from the highest position
+                vpaths = chap.groupby(['pid','side','matches','hap'])['pos'].max().reset_index()
+                vpaths['length'] = 0
+                s = 0
+                while vpaths['length'].max() == s:
+                    vpaths[[f'scaf{s}',f'strand{s}',f'dist{s+1}']] = vpaths[['pid','side','matches','hap','pos']].merge(chap, on=['pid','side','matches','hap','pos'], how='left')[['scaf','strand','dist']].values
+                    if np.sum(np.isnan(vpaths[f'scaf{s}']) == False):
+                        vpaths.loc[np.isnan(vpaths[f'scaf{s}']) == False, 'length'] += 1
+                        vpaths.loc[np.isnan(vpaths[f'scaf{s}']) == False, f'strand{s}'] = np.where(vpaths.loc[np.isnan(vpaths[f'scaf{s}']) == False, f'strand{s}'] == '+', '-', '+') # We go in reverse order so we have to flip the strand
+                    vpaths['pos'] -= 1
+                    s += 1
+                # Check scaffold_graph to see if the haplotype extends from its first unique position over the end
+                vpaths = vpaths[vpaths['length'] < scaffold_graph['length'].max()].drop(columns=['pos']) # If a path is as long or longer than any in scaffold_graph, scaffold_graph cannot extend on this path
+                vpaths.rename(columns={'scaf0':'from','strand0':'from_side'}, inplace=True)
+                vpaths['from_side'] = np.where(vpaths['from_side'] == '+', 'r', 'l')
+                vpaths['slen'] = -1
+                for l in np.unique(vpaths['length']):
+                    mcols = ['from','from_side']+[f'{n}{s}' for s in range(1,l) for n in ['scaf','strand','dist']]
+                    vpaths.loc[vpaths['length'] == l, 'slen'] = vpaths.loc[vpaths['length'] == l, mcols].merge(scaffold_graph.groupby(mcols)['length'].max().reset_index(), on=mcols, how='left')['length'].values
+                cur_dedups = cur_dedups.merge(vpaths.loc[vpaths['length'] < np.maximum(vpaths['slen'],vpaths['matches']+1), ['pid','side','matches']].drop_duplicates(), on=['pid','side','matches'], how='inner')
+            # Store the haplotypes that are different to all other haplotypes
+            dedup_haps.append(cur_dedups)
+            # Store the haplotype to compare it to the next haplotypes in the loop
+            haps.append(cur.drop(columns=['cscaf','cstrand','cdist','diff']))
+    dedup_haps = pd.concat(dedup_haps, ignore_index=True)
+#
+    return dedup_haps
 
 def SetConnectablePathsInMetaScaffold(meta_scaffolds, ends, connectable):
     meta_scaffolds['connectable'] = meta_scaffolds['connectable'] | (meta_scaffolds[['new_pid','bpid']].rename(columns={'new_pid':'apid'}).merge(connectable[['apid','bpid']], on=['apid','bpid'], how='left', indicator=True)['_merge'].values == "both")
@@ -2400,13 +3858,22 @@ def GetBridgeSupport(bsupp, scaffold_paths, scaf_bridges, ploidy):
     bsupp.loc[(bsupp['pid'] != bsupp['pid'].shift(1)) | (bsupp['hap'] != bsupp['hap'].shift(1)), 'from'] = -1
     bsupp['from_side'] = np.where(bsupp['strand'].shift(1, fill_value='') == '+', 'r', 'l')
     bsupp = bsupp[bsupp['from'] >= 0].merge(scaf_bridges[['from','from_side','to','to_side','mean_dist','bcount']], on=['from','from_side','to','to_side','mean_dist'], how='left')
-    bsupp = bsupp.groupby(['group','pid','hap'])['bcount'].agg(['min','median','max']).reset_index()
+    # Sort by lowest distinct bridge support and assign a place
+    if len(bsupp):
+        bsupp.sort_values(['group','pid','hap','bcount'], inplace=True)
+        bsupp['pos'] = bsupp.groupby(['group','pid','hap']).cumcount()
+        vertical = bsupp[['group','pid','hap']].drop_duplicates()
+        for p in range(bsupp['pos'].max()+1):
+            vertical[f'bcount{p}'] = vertical[['group','pid','hap']].merge(bsupp.loc[bsupp['pos'] == p, ['group','pid','hap','bcount']], on=['group','pid','hap'], how='left')['bcount'].fillna(-1).astype(int).values
+        vertical.sort_values([f'bcount{p}' for p in range(bsupp['pos'].max()+1)], inplace=True)
+        bsupp = vertical[['group','pid','hap']].copy()
+        bsupp['bplace'] = np.arange(len(bsupp),0,-1)
 #
     return bsupp
 
-def CombinePathAccordingToMetaParts(scaffold_paths, meta_parts, conns, scaffold_graph, scaf_bridges, scaf_len, ploidy):
+def CombinePathAccordingToMetaParts(scaffold_paths, meta_parts_in, conns, scaffold_graph, scaf_bridges, scaf_len, ploidy):
     # Combine scaffold_paths from lowest to highest position in meta scaffolds
-    meta_scaffolds = meta_parts.loc[meta_parts['pos'] == 0].drop(columns=['pos'])
+    meta_scaffolds = meta_parts_in.loc[meta_parts_in['pos'] == 0].drop(columns=['pos'])
     scaffold_paths['reverse'] = scaffold_paths[['pid']].merge(meta_scaffolds[['pid','reverse']], on=['pid'], how='left')['reverse'].fillna(False).values.astype(bool)
     scaffold_paths = ReverseScaffolds(scaffold_paths, scaffold_paths['reverse'], ploidy)
     scaffold_paths.drop(columns=['reverse'], inplace=True)
@@ -2415,7 +3882,7 @@ def CombinePathAccordingToMetaParts(scaffold_paths, meta_parts, conns, scaffold_
     meta_scaffolds['apid'] = meta_scaffolds['new_pid']
     meta_scaffolds['aside'] = np.where(meta_scaffolds['reverse'], 'l', 'r')
     meta_scaffolds.drop(columns=['reverse'], inplace=True)
-    meta_parts = meta_parts[meta_parts['pos'] > 0].copy()
+    meta_parts = meta_parts_in[meta_parts_in['pos'] > 0].copy()
     pos=1
     while len(meta_parts):
         # Get next connection
@@ -2428,7 +3895,7 @@ def CombinePathAccordingToMetaParts(scaffold_paths, meta_parts, conns, scaffold_
         meta_scaffolds[['aoverlap','boverlap']] = meta_scaffolds[['apid','aside','bpid','bside']].merge(conns, on=['apid','aside','bpid','bside'], how='left')[['aoverlap','boverlap']].values
         # Check which haplotypes are connectable (we cannot take the previous checks, because the scaffolds might be longer now)
         meta_scaffolds['connectable'] = False
-        for iteration in range(5):
+        for iteration in range(4):
             nhaps = GetNumberOfHaplotypes(scaffold_paths, ploidy)
             meta_scaffolds['anhaps'] = meta_scaffolds[['new_pid']].rename(columns={'new_pid':'pid'}).merge(nhaps, on=['pid'], how='left')['nhaps'].values # apid does not exist anymore, because we merged it into new_pid
             meta_scaffolds['bnhaps'] = meta_scaffolds[['bpid']].rename(columns={'bpid':'pid'}).merge(nhaps, on=['pid'], how='left')['nhaps'].values
@@ -2454,7 +3921,12 @@ def CombinePathAccordingToMetaParts(scaffold_paths, meta_parts, conns, scaffold_
             if len(ends) == 0:
                 break
             else:
-                ends = ends[['apid','ahap','bpid','bhap']].merge(ends[['apid','ahap','bpid','bhap']].rename(columns={'apid':'bpid','ahap':'bhap','bpid':'apid','bhap':'ahap'}), on=['apid','ahap','bpid','bhap'], how='outer', indicator=True)
+                ends['samedir'] = True
+                ends = FindInvalidOverlaps(ends, scaffold_paths, ploidy)
+                ends = ends[['apid','ahap','bpid','bhap','valid_overlap','dup_hap']].merge(ends[['apid','ahap','bpid','bhap','valid_overlap','dup_hap']].rename(columns={'apid':'bpid','ahap':'bhap','bpid':'apid','bhap':'ahap'}), on=['apid','ahap','bpid','bhap'], how='outer', indicator=True)
+                ends['valid_overlap'] = np.where(ends['valid_overlap_x'].isnull(), ends['valid_overlap_y'], ends['valid_overlap_x']) & np.where(ends['valid_overlap_y'].isnull(), ends['valid_overlap_x'], ends['valid_overlap_y'])
+                ends['dup_hap'] = np.where(ends['dup_hap_x'].isnull(), ends['dup_hap_y'], ends['dup_hap_x']) & np.where(ends['dup_hap_y'].isnull(), ends['dup_hap_x'], ends['dup_hap_y'])
+                ends.drop(columns=['valid_overlap_x','valid_overlap_y','dup_hap_x','dup_hap_y'], inplace=True)
                 ends = ends.merge(meta_scaffolds[['new_pid','bpid']].rename(columns={'new_pid':'apid'}), on=['apid','bpid'], how='inner')
 #
                 for p in ['a','b']:
@@ -2462,15 +3934,15 @@ def CombinePathAccordingToMetaParts(scaffold_paths, meta_parts, conns, scaffold_
                 ends['nhaps'] = np.maximum(ends['anhaps'], ends['bnhaps'])
                  # When all haplotypes either match to the corresponding haplotype or, if the corresponding haplotype does not exist, to the main, scaffolds are connectable
                 connectable = ends[ends['_merge'] == "both"].drop(columns=['_merge'])
-                connectable = connectable[(connectable['ahap'] == connectable['bhap']) | ((connectable['ahap'] == 0) & (connectable['bhap'] >= connectable['anhaps'])) | 
-                                                                                         ((connectable['bhap'] == 0) & (connectable['ahap'] >= connectable['bnhaps']))].copy()
+                connectable = connectable[((connectable['ahap'] == connectable['bhap']) & (connectable['valid_overlap'] | connectable['dup_hap'])) | 
+                                          ((connectable['ahap'] == 0) & (connectable['bhap'] >= connectable['anhaps'])) | ((connectable['bhap'] == 0) & (connectable['ahap'] >= connectable['bnhaps']))].drop(columns=['valid_overlap','dup_hap'])
                 connectable = connectable.groupby(['apid','bpid','nhaps']).size().reset_index(name='matches')
                 connectable = connectable[connectable['nhaps'] == connectable['matches']].copy()
                 meta_scaffolds, ends = SetConnectablePathsInMetaScaffold(meta_scaffolds, ends, connectable)
                 if 0 == iteration:
                     # The first step is to bring everything that is valid from both sides to the lower haplotypes
                     for p1, p2 in zip(['a','b'],['b','a']):
-                        connectable = ends[(ends['_merge'] == "both") & (ends[f'{p1}nhaps'] > ends[f'{p2}nhaps'])].drop(columns=['_merge'])
+                        connectable = ends[(ends['_merge'] == "both") & ends['valid_overlap'] & (ends[f'{p1}nhaps'] > ends[f'{p2}nhaps'])].drop(columns=['_merge','valid_overlap','dup_hap'])
                         connectable.sort_values(['apid','bpid',f'{p1}hap',f'{p2}hap'], inplace=True)
                         connectable['fixed'] = False
                         while np.sum(connectable['fixed'] == False):
@@ -2493,69 +3965,73 @@ def CombinePathAccordingToMetaParts(scaffold_paths, meta_parts, conns, scaffold_
                 elif 1 == iteration or 3 == iteration:
                     # When all haplotypes either match to the corresponding haplotype or, if the corresponding haplotype does not exist, to another haplotype, scaffolds can be made connectable by duplicating haplotypes on the paths with less haplotypes(p1)
                     for p1, p2 in zip(['a','b'],['b','a']):
-                        connectable = ends[ends['_merge'] == "both"].drop(columns=['_merge'])
+                        connectable = ends[ends['_merge'] == "both"].drop(columns=['_merge','valid_overlap','dup_hap'])
                         connectable = connectable[ (connectable[f'{p2}hap'] >= connectable[f'{p1}nhaps']) ].copy()
                         connectable.sort_values(['apid','bpid',f'{p2}hap',f'{p1}hap'], inplace=True)
                         connectable = connectable.groupby(['apid','bpid',f'{p2}hap']).first().reset_index() # Take the lowest haplotype that can be duplicated to fill the missing one
                         connectable = connectable.loc[connectable[f'{p1}hap'] > 0, [f'{p1}pid',f'{p1}hap',f'{p2}hap']].rename(columns={f'{p1}pid':'pid', f'{p1}hap':'hap1', f'{p2}hap':'hap2'}) # If the lowest is the main, we do not need to do anything
                         scaffold_paths = DuplicateHaplotypes(scaffold_paths, connectable, ploidy)
                     # Switching haplotypes might also help to make paths connectable
-                    connectable = ends[ends['_merge'] == "both"].drop(columns=['_merge'])
+                    connectable = ends[(ends['_merge'] == "both") & (ends['valid_overlap'] | ends['dup_hap']) ].drop(columns=['_merge','valid_overlap','dup_hap'])
+                    connectable['switchcol'] = np.where(connectable[['bpid','bhap']].merge(ends.groupby(['bpid','bhap'])['dup_hap'].min().reset_index(), on=['bpid','bhap'], how='left')['dup_hap'], 'a', 'b')
                     connectable['nhaps'] = np.minimum(connectable['anhaps'], connectable['bnhaps'])
                     connectable = connectable[(connectable['ahap'] < connectable['nhaps']) & (connectable['bhap'] < connectable['nhaps'])].drop(columns=['anhaps','bnhaps'])
                     connectable['nmatches'] = connectable[['apid','bpid']].merge(connectable[connectable['ahap'] == connectable['bhap']].groupby(['apid','bpid']).size().reset_index(name='matches'), on=['apid','bpid'], how='left')['matches'].fillna(0).values.astype(int)
                     connectable = connectable[connectable['nmatches'] < connectable['nhaps']].copy()
+                    connectable['new_ahap'] = connectable['ahap']
                     connectable['new_bhap'] = connectable['bhap']
                     while len(connectable):
-                        connectable['match'] = connectable['ahap'] == connectable['new_bhap']
-                        connectable['amatch'] = connectable[['apid','bpid','ahap']].merge(connectable.groupby(['apid','bpid','ahap'])['match'].max().reset_index(), on=['apid','bpid','ahap'], how='left')['match'].values
+                        connectable['match'] = connectable['new_ahap'] == connectable['new_bhap']
+                        connectable['amatch'] = connectable[['apid','bpid','new_ahap']].merge(connectable.groupby(['apid','bpid','new_ahap'])['match'].max().reset_index(), on=['apid','bpid','new_ahap'], how='left')['match'].values
                         connectable['bmatch'] = connectable[['apid','bpid','new_bhap']].merge(connectable.groupby(['apid','bpid','new_bhap'])['match'].max().reset_index(), on=['apid','bpid','new_bhap'], how='left')['match'].values
-                        connectable['switchable'] = connectable[['apid','bpid','ahap','new_bhap']].merge( connectable[['apid','bpid','ahap','new_bhap']].rename(columns={'ahap':'new_bhap','new_bhap':'ahap'}), on=['apid','bpid','ahap','new_bhap'], how='left', indicator=True)['_merge'].values == "both"
-                        switches = connectable.loc[(connectable['amatch'] == False) & ((connectable['bmatch'] == False) | connectable['switchable']), ['apid','ahap','bpid','new_bhap']].copy()
-                        switches = switches.groupby(['apid','bpid']).first().reset_index() # Only one switch per meta_paths per round to avoid conflicts
-                        switches.rename(columns={'new_bhap':'bhap','ahap':'new_bhap'}, inplace=True)
-                        switches = pd.concat([switches.rename(columns={'new_bhap':'bhap','bhap':'new_bhap'}), switches], ignore_index=True)
-                        switches = connectable[['apid','bpid','new_bhap']].rename(columns={'new_bhap':'bhap'}).merge(switches, on=['apid','bpid','bhap'], how='left')['new_bhap'].values
-                        connectable['new_bhap'] = np.where(np.isnan(switches), connectable['new_bhap'], switches).astype(int)
+                        connectable['switchable'] = connectable[['apid','bpid','new_ahap','new_bhap']].merge( connectable[['apid','bpid','new_ahap','new_bhap']].rename(columns={'new_ahap':'new_bhap','new_bhap':'new_ahap'}), on=['apid','bpid','new_ahap','new_bhap'], how='left', indicator=True)['_merge'].values == "both"
+                        for p1, p2 in zip(['a','b'],['b','a']):
+                            switches = connectable.loc[(connectable[f'{p1}match'] == False) & (connectable['switchcol'] == p2) & ((connectable[f'{p2}match'] == False) | connectable['switchable']), ['apid','new_ahap','bpid','new_bhap','switchcol']].copy()
+                            switches = switches.groupby(['apid','bpid']).first().reset_index() # Only one switch per meta_paths per round to avoid conflicts
+                            switches.rename(columns={f'new_{p2}hap':f'{p2}hap',f'new_{p1}hap':f'new_{p2}hap'}, inplace=True)
+                            switches = pd.concat([switches.rename(columns={f'new_{p2}hap':f'{p2}hap',f'{p2}hap':f'new_{p2}hap'}), switches], ignore_index=True)
+                            switches = connectable[['apid','bpid',f'new_{p2}hap']].rename(columns={f'new_{p2}hap':f'{p2}hap'}).merge(switches, on=['apid','bpid',f'{p2}hap'], how='left')[f'new_{p2}hap'].values
+                            connectable[f'new_{p2}hap'] = np.where(np.isnan(switches), connectable[f'new_{p2}hap'], switches).astype(int)
                         connectable['old_nmatches'] = connectable['nmatches']
-                        connectable['nmatches'] = connectable[['apid','bpid']].merge(connectable[connectable['ahap'] == connectable['new_bhap']].groupby(['apid','bpid']).size().reset_index(name='matches'), on=['apid','bpid'], how='left')['matches'].fillna(0).values.astype(int)
+                        connectable['nmatches'] = connectable[['apid','bpid']].merge(connectable[connectable['new_ahap'] == connectable['new_bhap']].groupby(['apid','bpid']).size().reset_index(name='matches'), on=['apid','bpid'], how='left')['matches'].fillna(0).values.astype(int)
                         improvable = (connectable['old_nmatches'] < connectable['nmatches']) & (connectable['nmatches'] < connectable['nhaps'])
-                        switches = connectable.loc[(improvable == False) & (connectable['bhap'] != connectable['new_bhap']), ['bpid','bhap','new_bhap']].drop_duplicates()
-                        switches.rename(columns={'bpid':'pid','bhap':'hap1','new_bhap':'hap2'}, inplace=True)
-                        scaffold_paths = SwitchHaplotypes(scaffold_paths, switches, ploidy)
+                        for p in ['a','b']:
+                            switches = connectable.loc[(improvable == False) & (connectable[f'{p}hap'] != connectable[f'new_{p}hap']), [f'{p}pid',f'{p}hap',f'new_{p}hap']].drop_duplicates()
+                            switches.rename(columns={f'{p}pid':'pid',f'{p}hap':'hap1',f'new_{p}hap':'hap2'}, inplace=True)
+                            scaffold_paths = SwitchHaplotypes(scaffold_paths, switches, ploidy)
                         connectable = connectable[improvable].copy()
-                elif 2 == iteration or 4 == iteration:
-                    # If all haplotype of the path with fewer haplotypes are continued in the one with more haplotypes and the non-continued from the one with more haplotypes do not reach the unqiue part of the other path and can be incorporated as new haplotype in the other path, the connection is also valid
-                    ends['aconsistent'] = ends['_merge'] == "left_only"
-                    ends['bconsistent'] = ends['_merge'] == "right_only"
-                    ends.loc[ends['_merge'] == "both", ['aconsistent','bconsistent']] = True
-                    for p in ['a','b']:
-                        ends[f'{p}hascon'] = ends[['apid','bpid',f'{p}hap']].merge(ends.groupby(['apid','bpid',f'{p}hap'])[f'{p}consistent'].max().reset_index(), on=['apid','bpid',f'{p}hap'], how='left')[f'{p}consistent'].values
-                        ends[f'{p}ncon'] = ends[['apid','bpid']].merge(ends[['apid','bpid',f'{p}hap',f'{p}hascon']].drop_duplicates().groupby(['apid','bpid'])[f'{p}hascon'].sum().reset_index(), on=['apid','bpid'], how='left')[f'{p}hascon'].values
-                    connectable = ends[(ends['anhaps'] == ends['ancon']) & (ends['bnhaps'] == ends['bncon'])].copy()
-                    connectable = connectable[ ((connectable['ahap'] == connectable['bhap']) & (connectable['_merge'] == "both")) | # Because we require both sides to be consistent for everything with existing haplotypes, we cannot proceed exactly like in the case, where we only considered the both case, because adding the haplotypes invalidades this and next round they would be sorted out
-                                               ((connectable['bhap'] >= connectable['anhaps']) & connectable['bconsistent']) | 
-                                               ((connectable['ahap'] >= connectable['bnhaps']) & connectable['aconsistent']) ].copy()
-                    # Keep only lowest possible haplotypes in other path to match haplotypes that exceed the number of haplotypes in the other path
-                    for p1, p2 in zip(['a','b'],['b','a']):
-                        connectable.sort_values(['apid','bpid',f'{p2}hap',f'{p1}hap'], inplace=True)
-                        connectable = connectable[(connectable[f'{p1}nhaps'] >= connectable[f'{p2}nhaps']) | (connectable['apid'] != connectable['apid'].shift(1)) | (connectable[f'{p2}hap'] != connectable[f'{p2}hap'].shift(1))].copy()
-                    # Check that all haplotypes have a match
-                    connectable['matches'] = connectable[['apid','bpid']].merge(connectable.groupby(['apid','bpid']).size().reset_index(name='matches'), on=['apid','bpid'], how='left')['matches'].values
-                    connectable = connectable[connectable['nhaps'] == connectable['matches']].copy()
-                    # Copy missing haplotypes in scaffold_paths
-                    for p1, p2 in zip(['a','b'],['b','a']):
-                        duplicate = connectable.loc[(connectable[f'{p2}hap'] >= connectable[f'{p1}nhaps']) & (connectable[f'{p1}hap'] > 0), [f'{p1}pid',f'{p1}hap',f'{p2}hap']].rename(columns={f'{p1}pid':'pid', f'{p1}hap':'hap1', f'{p2}hap':'hap2'})
-                        scaffold_paths = DuplicateHaplotypes(scaffold_paths, duplicate, ploidy)
-                    # Register valid connections
-                    meta_scaffolds, ends = SetConnectablePathsInMetaScaffold(meta_scaffolds, ends, connectable[['apid','bpid']].drop_duplicates())
-                    if 2 == iteration:
+                elif 2 == iteration: #or 4 == iteration:
+#                    # If all haplotype of the path with fewer haplotypes are continued in the one with more haplotypes and the non-continued from the one with more haplotypes do not reach the unqiue part of the other path and can be incorporated as new haplotype in the other path, the connection is also valid
+#                    ends['aconsistent'] = ends['_merge'] == "left_only"
+#                    ends['bconsistent'] = ends['_merge'] == "right_only"
+#                    ends.loc[ends['_merge'] == "both", ['aconsistent','bconsistent']] = True
+#                    for p in ['a','b']:
+#                        ends[f'{p}hascon'] = ends[['apid','bpid',f'{p}hap']].merge(ends.groupby(['apid','bpid',f'{p}hap'])[f'{p}consistent'].max().reset_index(), on=['apid','bpid',f'{p}hap'], how='left')[f'{p}consistent'].values
+#                        ends[f'{p}ncon'] = ends[['apid','bpid']].merge(ends[['apid','bpid',f'{p}hap',f'{p}hascon']].drop_duplicates().groupby(['apid','bpid'])[f'{p}hascon'].sum().reset_index(), on=['apid','bpid'], how='left')[f'{p}hascon'].values
+#                    connectable = ends[(ends['anhaps'] == ends['ancon']) & (ends['bnhaps'] == ends['bncon'])].copy()
+#                    connectable = connectable[ ((connectable['ahap'] == connectable['bhap']) & (connectable['_merge'] == "both")) | # Because we require both sides to be consistent for everything with existing haplotypes, we cannot proceed exactly like in the case, where we only considered the both case, because adding the haplotypes invalidades this and next round they would be sorted out
+#                                               ((connectable['bhap'] >= connectable['anhaps']) & connectable['bconsistent']) | 
+#                                               ((connectable['ahap'] >= connectable['bnhaps']) & connectable['aconsistent']) ].copy()
+#                    # Keep only lowest possible haplotypes in other path to match haplotypes that exceed the number of haplotypes in the other path
+#                    for p1, p2 in zip(['a','b'],['b','a']):
+#                        connectable.sort_values(['apid','bpid',f'{p2}hap',f'{p1}hap'], inplace=True)
+#                        connectable = connectable[(connectable[f'{p1}nhaps'] >= connectable[f'{p2}nhaps']) | (connectable['apid'] != connectable['apid'].shift(1)) | (connectable[f'{p2}hap'] != connectable[f'{p2}hap'].shift(1))].copy()
+#                    # Check that all haplotypes have a match
+#                    connectable['matches'] = connectable[['apid','bpid']].merge(connectable.groupby(['apid','bpid']).size().reset_index(name='matches'), on=['apid','bpid'], how='left')['matches'].values
+#                    connectable = connectable[connectable['nhaps'] == connectable['matches']].copy()
+#                    # Copy missing haplotypes in scaffold_paths
+#                    for p1, p2 in zip(['a','b'],['b','a']):
+#                        duplicate = connectable.loc[(connectable[f'{p2}hap'] >= connectable[f'{p1}nhaps']) & (connectable[f'{p1}hap'] > 0), [f'{p1}pid',f'{p1}hap',f'{p2}hap']].rename(columns={f'{p1}pid':'pid', f'{p1}hap':'hap1', f'{p2}hap':'hap2'})
+#                        scaffold_paths = DuplicateHaplotypes(scaffold_paths, duplicate, ploidy)
+#                    # Register valid connections
+#                    meta_scaffolds, ends = SetConnectablePathsInMetaScaffold(meta_scaffolds, ends, connectable[['apid','bpid']].drop_duplicates())
+#                    if 2 == iteration:
                         # Remove haplotypes that block a connection if they differ only by distance from a valid haplotype
                         delete_haps = []
                         connectable_pids = []
                         for p in ['a','b']:
                             dist_diff_only = GetHaplotypesThatDifferOnlyByDistance(scaffold_paths, ends[f'{p}pid'].drop_duplicates().values, ploidy)
-                            valid_haps = ends.loc[ends['_merge'] == "both", [f'{p}pid',f'{p}hap']].drop_duplicates()
+                            valid_haps = ends.loc[(ends['_merge'] == "both") & ends['valid_overlap'], [f'{p}pid',f'{p}hap']].drop_duplicates()
                             valid_haps.rename(columns={f'{p}pid':'pid',f'{p}hap':'hap'}, inplace=True)
                             dist_diff_only = dist_diff_only.merge(valid_haps.rename(columns={'hap':'hap1'}), on=['pid','hap1'], how='inner')
                             invalid_haps = ends[[f'{p}pid',f'{p}nhaps']].drop_duplicates()
@@ -2577,13 +4053,45 @@ def CombinePathAccordingToMetaParts(scaffold_paths, meta_parts, conns, scaffold_
                         delete_haps = pd.concat(delete_haps, ignore_index=True)
                         scaffold_paths = RemoveHaplotypes(scaffold_paths, delete_haps, ploidy)
                         scaffold_paths = ShiftHaplotypesToLowestPossible(scaffold_paths, ploidy)
+        meta_scaffolds.drop(columns=['bside'], inplace=True)
 #
+        # Since all the existing haplotypes must match take the paths with more haplotypes in the overlapping region (only relevant starting at the second position, since the first cannot have a variant or they would not have been merged)
+        long_overlaps = meta_scaffolds.loc[meta_scaffolds['connectable'] & (np.maximum(meta_scaffolds['aoverlap'],meta_scaffolds['boverlap']) > 1), ['new_pid','bpid','aoverlap','boverlap','start_pos']].reset_index()
+        overhaps = long_overlaps[['new_pid','aoverlap','start_pos','index']].rename(columns={'new_pid':'pid','aoverlap':'min_pos','start_pos':'max_pos'})
+        overhaps['min_pos'] = overhaps['max_pos'] - overhaps['min_pos']
+        overhaps['max_pos'] -= 1
+        overhaps['path'] = 'a'
+        overhaps = [overhaps]
+        overhaps.append(long_overlaps[['bpid','boverlap','index']].rename(columns={'bpid':'pid','boverlap':'max_pos'}))
+        overhaps[-1]['min_pos'] = 0
+        overhaps[-1]['max_pos'] -= 1
+        overhaps[-1]['path'] = 'b'
+        overhaps = pd.concat(overhaps, ignore_index=True)
+        overhaps['len'] = overhaps['max_pos'] - overhaps['min_pos'] + 1
+        overhaps.sort_values(['index','path'], inplace=True)
+        overhaps = overhaps.loc[np.repeat(overhaps.index.values, overhaps['len'].values), ['index','path','pid','min_pos']].reset_index(drop=True)
+        #overhaps.rename(columns={'min_pos':'pos'}, inplace=True)
+        overhaps['pos'] = overhaps['min_pos'] + overhaps.groupby(['index','path'], sort=False).cumcount()
+        overhaps[[f'hap{h}' for h in range(ploidy)]] = overhaps[['pid','pos']].merge(scaffold_paths[['pid','pos']+[f'phase{h}' for h in range(ploidy)]], on=['pid','pos'], how='left')[[f'phase{h}' for h in range(ploidy)]] >= 0
+        for h in range(1,ploidy):
+            # Distance variants at the first position do not matter
+            overhaps.loc[(overhaps['min_pos'] == overhaps['pos']), f'hap{h}'] = overhaps.loc[(overhaps['min_pos'] == overhaps['pos']), f'hap{h}'].values & (overhaps.loc[(overhaps['min_pos'] == overhaps['pos']), ['pid','pos']].merge(scaffold_paths[['pid','pos']+[f'scaf{h}',f'strand{h}']], on=['pid','pos'], how='left')[[f'scaf{h}',f'strand{h}']].values != overhaps.loc[(overhaps['min_pos'] == overhaps['pos']), ['pid','pos']].merge(scaffold_paths[['pid','pos']+['scaf0','strand0']], on=['pid','pos'], how='left')[['scaf0','strand0']].values).any(axis=1)
+        overhaps = overhaps.groupby(['index','path'], sort=False)[[f'hap{h}' for h in range(ploidy)]].max().reset_index()
+        overhaps['nhaps'] = overhaps[[f'hap{h}' for h in range(ploidy)]].sum(axis=1)
+        meta_scaffolds[['ahaps','bhaps']] = 0
+        for p in ['a','b']:
+            meta_scaffolds.loc[ overhaps.loc[overhaps['path'] == p, 'index'].values, f'{p}haps'] = overhaps.loc[overhaps['path'] == p, 'nhaps'].values
+        meta_scaffolds.loc[meta_scaffolds['ahaps'] < meta_scaffolds['bhaps'], 'boverlap'] = 1 # The first scaffold in pathb will also be removed, because it cannot have an alternative and does not contain the distance information
+        meta_scaffolds.loc[meta_scaffolds['ahaps'] < meta_scaffolds['bhaps'], 'start_pos'] -= meta_scaffolds.loc[meta_scaffolds['ahaps'] < meta_scaffolds['bhaps'], 'aoverlap'] - 1
+        meta_scaffolds.drop(columns=['aoverlap','ahaps','bhaps'], inplace=True)
         # Connect scaffolds
         scaffold_paths[['overlap','shift']] = scaffold_paths[['pid']].merge( meta_scaffolds.loc[meta_scaffolds['connectable'], ['bpid','boverlap','start_pos']].rename(columns={'bpid':'pid'}), on=['pid'], how='left')[['boverlap','start_pos']].fillna(0).values.astype(int)
         scaffold_paths['shift'] -= scaffold_paths['overlap']
         scaffold_paths = scaffold_paths[ scaffold_paths['pos'] >= scaffold_paths['overlap'] ].drop(columns=['overlap'])
         scaffold_paths['pos'] += scaffold_paths['shift']
         scaffold_paths.drop(columns=['shift'], inplace=True)
+        scaffold_paths['trim'] = scaffold_paths[['pid']].merge( meta_scaffolds.loc[meta_scaffolds['connectable'], ['new_pid','start_pos']].rename(columns={'new_pid':'pid'}), on=['pid'], how='left')['start_pos'].fillna(sys.maxsize*0.9).values.astype(int) # sys.maxsize*0.9 to avoid variable overrun due to type conversion
+        scaffold_paths = scaffold_paths[scaffold_paths['pos'] < scaffold_paths['trim']].drop(columns=['trim'])
         scaffold_paths['new_pid'] = scaffold_paths[['pid']].merge( meta_scaffolds.loc[meta_scaffolds['connectable'], ['bpid','new_pid']].rename(columns={'bpid':'pid'}), on=['pid'], how='left')['new_pid'].values
         scaffold_paths.loc[np.isnan(scaffold_paths['new_pid']) == False, 'pid'] = scaffold_paths.loc[np.isnan(scaffold_paths['new_pid']) == False, 'new_pid'].astype(int)
         scaffold_paths.drop(columns=['new_pid'], inplace=True)
@@ -2592,9 +4100,13 @@ def CombinePathAccordingToMetaParts(scaffold_paths, meta_parts, conns, scaffold_
         # The unconnectable paths in meta_scaffolds might have had haplotypes duplicated in an attempt to make them connectable. Remove those duplications
         for h1 in range(1, ploidy):
             for h2 in range(h1+1, ploidy):
-                remove =  ( (np.sign(scaffold_paths[f'phase{h1}']) == np.sign(scaffold_paths[f'phase{h2}'])) & (scaffold_paths[f'scaf{h1}'] == scaffold_paths[f'scaf{h2}']) &
-                            (scaffold_paths[f'strand{h1}'] == scaffold_paths[f'strand{h2}']) & (scaffold_paths[f'dist{h1}'] == scaffold_paths[f'dist{h2}']) )
-                scaffold_paths = RemoveHaplotype(scaffold_paths, remove, h2)
+                scaffold_paths['remove'] =  ( (np.sign(scaffold_paths[f'phase{h1}']) == np.sign(scaffold_paths[f'phase{h2}'])) & (scaffold_paths[f'scaf{h1}'] == scaffold_paths[f'scaf{h2}']) &
+                                              (scaffold_paths[f'strand{h1}'] == scaffold_paths[f'strand{h2}']) & (scaffold_paths[f'dist{h1}'] == scaffold_paths[f'dist{h2}']) )
+                remove = scaffold_paths.groupby(['pid'])['remove'].min().reset_index()
+                remove = remove.loc[remove['remove'], 'pid'].values
+                scaffold_paths['remove'] = np.isin(scaffold_paths['pid'], remove)
+                scaffold_paths = RemoveHaplotype(scaffold_paths, scaffold_paths['remove'], h2)
+                scaffold_paths.drop(columns=['remove'], inplace=True)
 #
         # Make sure the haplotypes are still sorted by highest support for bridges
         bsupp = pd.concat([ meta_scaffolds[['new_pid']].rename(columns={'new_pid':'pid'}), meta_scaffolds.loc[meta_scaffolds['connectable'] == False, ['bpid']].rename(columns={'bpid':'pid'})], ignore_index=True)
@@ -2607,24 +4119,33 @@ def CombinePathAccordingToMetaParts(scaffold_paths, meta_parts, conns, scaffold_
         bsupp['hap'] = bsupp.groupby(['pid'], sort=False).cumcount()
         bsupp['group'] = 0
         bsupp = GetBridgeSupport(bsupp, scaffold_paths, scaf_bridges, ploidy)
-        bsupp.drop(columns=['group'], inplace=True)
-        bsupp.sort_values(['pid','min','median','max'], ascending=[True,False,False,False], inplace=True)
-        bsupp['new_hap'] = bsupp.groupby(['pid']).cumcount()
-        bsupp = bsupp.loc[bsupp['hap'] != bsupp['new_hap'], ['pid','hap','new_hap']].rename(columns={'hap':'hap1','new_hap':'hap2'})
-        scaffold_paths = SwitchHaplotypes(scaffold_paths, bsupp, ploidy)
-        scaffold_paths = ShiftHaplotypesToLowestPossible(scaffold_paths, ploidy)
+        if len(bsupp):
+            bsupp.drop(columns=['group'], inplace=True)
+            bsupp.sort_values(['pid','bplace'], inplace=True)
+            bsupp['new_hap'] = bsupp.groupby(['pid']).cumcount()
+            bsupp = bsupp.loc[bsupp['hap'] != bsupp['new_hap'], ['pid','hap','new_hap']].rename(columns={'hap':'hap1','new_hap':'hap2'})
+            scaffold_paths = SwitchHaplotypes(scaffold_paths, bsupp, ploidy)
+            scaffold_paths = ShiftHaplotypesToLowestPossible(scaffold_paths, ploidy)
 #
         # Break unconnectable meta_scaffolds
         meta_scaffolds.loc[meta_scaffolds['connectable'] == False, 'new_pid'] = meta_scaffolds.loc[meta_scaffolds['connectable'] == False, 'bpid']
-        meta_scaffolds.loc[meta_scaffolds['connectable'] == False, 'start_pos'] = 0
+        meta_scaffolds.loc[meta_scaffolds['connectable'] == False, ['start_pos','boverlap']] = 0
 #
         # Prepare next round
-        meta_scaffolds['start_pos'] += meta_scaffolds[['bpid']].rename(columns={'bpid':'pid'}).merge(scaf_len, on=['pid'], how='left')['pos'].values + 1
+        meta_scaffolds['start_pos'] += meta_scaffolds[['bpid']].rename(columns={'bpid':'pid'}).merge(scaf_len, on=['pid'], how='left')['pos'].values + 1 - meta_scaffolds['boverlap']
         meta_scaffolds['apid'] = meta_scaffolds['bpid']
         meta_scaffolds['aside'] = np.where(meta_scaffolds['reverse'], 'l', 'r')
-        meta_scaffolds.drop(columns=['bpid','reverse','bside','aoverlap','boverlap'], inplace=True)
+        meta_scaffolds.drop(columns=['bpid','reverse','boverlap'], inplace=True)
         meta_parts = meta_parts[meta_parts['pos'] > pos].copy()
         pos += 1
+#
+    # Check that positions are consistent in scaffold_paths
+    inconsistent = scaffold_paths[(scaffold_paths['pos'] < 0) |
+                                  ((scaffold_paths['pos'] == 0) & (scaffold_paths['pid'] == scaffold_paths['pid'].shift(1))) |
+                                  ((scaffold_paths['pos'] > 0) & ((scaffold_paths['pid'] != scaffold_paths['pid'].shift(1)) | (scaffold_paths['pos'] != scaffold_paths['pos'].shift(1)+1)))].copy()
+    if len(inconsistent):
+        print("Warning: Scaffold paths is inconsistent after CombinePathAccordingToMetaParts.")
+        print(inconsistent)
 #
     return scaffold_paths
 
@@ -2652,14 +4173,27 @@ def CombinePathOnUniqueOverlap(scaffold_paths, scaffold_graph, scaf_bridges, plo
     conns['tiebreakhaps'] = np.where(conns['apid'] < conns['bpid'], conns['anhaps'], conns['bnhaps'])
     conns['tiebreakoverlap'] = np.where(conns['apid'] < conns['bpid'], conns['aoverlap'], conns['boverlap'])
     conns.sort_values(['apid','aside','bpid','bside','minhaps','maxhaps','maxoverlap','minoverlap','tiebreakhaps','tiebreakoverlap'], ascending=[True,True,True,True,False,False,True,True,False,True], inplace=True)
+    #print(conns[np.isin(conns['apid'], test_pids) | np.isin(conns['bpid'], test_pids)])
     conns = conns.groupby(['apid','aside','bpid','bside']).first().reset_index()
     conns.drop(columns=['minhaps','maxhaps','maxoverlap','minoverlap','tiebreakhaps','tiebreakoverlap'], inplace=True)
+    # Get number of different haplotypes that are actually compared (because they differ close enough to the checked end) to not give an advantage to paths with more haplotypes in the upcoming filtering
+    dedup_haps = GetDeduplicatedHaplotypesAtPathEnds(ends[['apid','aside','matches']].drop_duplicates().rename(columns={'apid':'pid','aside':'side'}), scaffold_paths, scaffold_graph, ploidy)
+    dedup_haps = ends[['apid','aside','ahap','bpid','bside','bhap','matches']].merge(dedup_haps.rename(columns={col:f'a{col}' for col in dedup_haps.columns if col != 'matches'}), on=['apid','aside','matches','ahap'], how='inner')\
+                                                                              .merge(dedup_haps.rename(columns={col:f'b{col}' for col in dedup_haps.columns if col != 'matches'}), on=['bpid','bside','matches','bhap'], how='inner')
+    dedup_haps.drop(columns=['matches'], inplace=True)
+    for p in ['a','b']:
+        conns[f'{p}nhaps'] = conns[['apid','aside','bpid','bside']].merge(dedup_haps[['apid','aside','bpid','bside',f'{p}hap']].drop_duplicates().groupby(['apid','aside','bpid','bside']).size().reset_index(name='nhaps'), on=['apid','aside','bpid','bside'], how='left')['nhaps'].astype(int).values
+    conns['minhaps'] = np.minimum(conns['anhaps'], conns['bnhaps'])
+    conns['maxhaps'] = np.maximum(conns['anhaps'], conns['bnhaps'])
     # Count alternatives and take only unique connections with preferences giving to more haplotypes and matches
     for p in ['a','b']:
-        conns.sort_values([f'{p}pid',f'{p}side',f'{p}nhaps','max_matches'], ascending=[True,True,False,False], inplace=True) # Do not use minhaps/maxhaps here, because they are between different scaffolds and this would give an advantage to scaffolds with more haplotypes
+        sort_cols = [f'{p}pid',f'{p}side','minhaps','maxhaps',f'{p}nhaps','max_matches']
+        conns.sort_values(sort_cols, ascending=[True,True,False,False,False,False], inplace=True) # Do not use minhaps/maxhaps here, because they are between different scaffolds and this would give an advantage to scaffolds with more haplotypes
         conns[f'{p}alts'] = conns.groupby([f'{p}pid',f'{p}side'], sort=False).cumcount()+1
-        equivalent = conns.groupby([f'{p}pid',f'{p}side',f'{p}nhaps','max_matches'], sort=False)[f'{p}alts'].agg(['max','size'])
+        #conns.sort_values(sort_cols, inplace=True)
+        equivalent = conns.groupby(sort_cols, sort=False)[f'{p}alts'].agg(['max','size'])
         conns[f'{p}alts'] = np.repeat(equivalent['max'].values, equivalent['size'].values)
+    #print(conns[np.isin(conns['apid'], test_pids) | np.isin(conns['bpid'], test_pids)])
     conns = conns.loc[(conns['aalts'] == 1) & (conns['balts'] == 1), ['apid','aside','bpid','bside','aoverlap','boverlap']].copy()
 #
     # Assign all connected paths to a meta scaffold to define connection order
@@ -2774,67 +4308,144 @@ def RequireContinuousDirectionForDuplications(duplications):
     duplications.sort_values(['apid','ahap','bpid','bhap','apos','bpos'], inplace=True)
     duplications.loc[duplications['samedir'] == False, 'bpos'] *= -1
     duplications['did'] = ((duplications['apid'] != duplications['apid'].shift(1)) | (duplications['ahap'] != duplications['ahap'].shift(1)) | (duplications['bpid'] != duplications['bpid'].shift(1)) | (duplications['bhap'] != duplications['bhap'].shift(1))).cumsum()
-    duplications.reset_index(drop=True, inplace=True)
-    # Store the duplications to try alternative mappings later
-    alt_duplications = duplications.copy() 
-    # Remove conflicts
-    duplications = SolveDuplicationConflicts(duplications)
-    dup_count = duplications.groupby(['did']).size().reset_index(name='full')
-    # Try to shorten the sequence at duplicated starts/ends to improve mapping
+    # Find conflicts
+    duplications.reset_index(drop=True, inplace=True) # Make sure the index is continuous with no missing numbers
+    s = 1
+    conflicts = []
+    while True:
+        duplications['dist'] = duplications['bpos'].shift(-s) - duplications['bpos']
+        conflict_found = ((duplications['did'] == duplications['did'].shift(-s)) & ((duplications['apos'] == duplications['apos'].shift(-s)) | (duplications['dist'] == 0) | ((duplications['dist'] < 0) == duplications['samedir'])))
+        conflicts.append(pd.DataFrame({'index1':duplications[conflict_found].index.values, 'index2':duplications[conflict_found].index.values + s}))
+        s += 1
+        if len(conflicts[-1]) == 0:
+            break
+    duplications.drop(columns=['dist'], inplace=True)
+    conflicts = pd.concat(conflicts, ignore_index=True)
+    conflicts['did'] = duplications.loc[conflicts['index1'].values, 'did'].values
+    conflicts.sort_values(['did','index1','index2'], inplace=True)
+    # Assign conflict id to group conflicts that handle the same indexes
+    conflicts['cid'] = conflicts['index1'].values
+    while True:
+        new_cid = pd.concat([conflicts[['index1','cid']].rename(columns={'index1':'index'}), conflicts[['index2','cid']].rename(columns={'index2':'index'})], ignore_index=True).groupby(['index'])['cid'].min().reset_index()
+        conflicts['new_cid'] = np.minimum(conflicts[['index1']].rename(columns={'index1':'index'}).merge(new_cid, on=['index'], how='left')['cid'].values, conflicts[['index2']].rename(columns={'index2':'index'}).merge(new_cid, on=['index'], how='left')['cid'].values)
+        if np.sum(conflicts['new_cid'] != conflicts['cid']) == 0:
+            break
+        else:
+            conflicts['cid'] = conflicts['new_cid']
+    conflicts.drop(columns=['new_cid'], inplace=True)
+    # Assign the cid to duplications and automatically keep the ones without, since they are not involved in any conflict
+    duplications['cid'] = -1
+    cids = pd.concat([conflicts[['index1','cid']].rename(columns={'index1':'index'}), conflicts[['index2','cid']].rename(columns={'index2':'index'})], ignore_index=True).drop_duplicates()
+    duplications.loc[cids['index'].values, 'cid'] = cids['cid'].values
+    valid_dups = duplications[duplications['cid'] == -1].drop(columns=['cid'])
+    # Merge adjacent cids (not separated by a duplication without conflict) to get proper lengths measures later and prevent double counting of space in between
+    while True:
+        duplications['new_cid'] = np.where(duplications['did'] != duplications['did'].shift(1), -1, duplications['cid'].shift(1, fill_value=-1))
+        new_cids = duplications.loc[(duplications['new_cid'] != duplications['cid']) & (duplications['new_cid'] >= 0) & (duplications['cid'] >= 0), ['cid','new_cid']].copy()
+        if len(new_cids) == 0:
+            break
+        else:
+            duplications['new_cid'] = duplications[['cid']].merge(new_cids, on=['cid'], how='left')['new_cid'].values
+            duplications.loc[np.isnan(duplications['new_cid']) == False, 'cid'] = duplications.loc[np.isnan(duplications['new_cid']) == False, 'new_cid'].astype(int).values
+            conflicts['new_cid'] = conflicts[['cid']].merge(new_cids, on=['cid'], how='left')['new_cid'].values
+            conflicts.loc[np.isnan(conflicts['new_cid']) == False, 'cid'] = conflicts.loc[np.isnan(conflicts['new_cid']) == False, 'new_cid'].astype(int).values
+            conflicts.drop(columns=['new_cid'], inplace=True)
+    duplications.drop(columns=['new_cid'], inplace=True)
+    # Check for later how much unreducible buffer we have on each side due to an adjacent non-conflicting duplication
     for p in ['a','b']:
-        for d in ['e','s']: # Start with trimming at the end
-            while True:
-                ## See which ones to keep for this and the next rounds and how much to trim in this round
-                # p='b', d='s' (we do it in reverse order of the loop to overwrite 'trim', but still keep 'keep')
-                alt_duplications['trim'] = alt_duplications[['did']].merge(alt_duplications.loc[(alt_duplications['did'] == alt_duplications['did'].shift(1)) & (alt_duplications['apos'] == alt_duplications['apos'].shift(1)), ['did','bpos']].groupby(['did']).min().reset_index(), on=['did'], how='left')['bpos'].values
-                alt_duplications['keep'] = np.isnan(alt_duplications['trim']) == False
-                if p == 'a' or d == 'e':
-                    # p='b', d='e'
-                    alt_duplications['trim'] = alt_duplications[['did']].merge(alt_duplications.loc[(alt_duplications['did'] == alt_duplications['did'].shift(-1)) & (alt_duplications['apos'] == alt_duplications['apos'].shift(-1)), ['did','bpos']].groupby(['did']).max().reset_index(), on=['did'], how='left')['bpos'].values
-                    alt_duplications['keep'] = alt_duplications['keep'] | (np.isnan(alt_duplications['trim']) == False)
-                if p == 'a':
-                    # p='a', d='s'
-                    alt_duplications['capos'] = alt_duplications[['did','bpos']].merge(alt_duplications.groupby(['did','bpos'])['apos'].min().reset_index(), on=['did','bpos'], how='left')['apos'].values
-                    alt_duplications['trim'] = alt_duplications[['did']].merge(alt_duplications.loc[alt_duplications['apos'] != alt_duplications['capos'], ['did','apos']].groupby(['did']).min().reset_index(), on=['did'], how='left')['apos'].values
-                    alt_duplications['keep'] = alt_duplications['keep'] | (np.isnan(alt_duplications['trim']) == False)
-                    if d == 'e':
-                        # p='a', d='e'
-                        alt_duplications['capos'] = alt_duplications[['did','bpos']].merge(alt_duplications.groupby(['did','bpos'])['apos'].max().reset_index(), on=['did','bpos'], how='left')['apos'].values
-                        alt_duplications['trim'] = alt_duplications[['did']].merge(alt_duplications.loc[alt_duplications['apos'] != alt_duplications['capos'], ['did','apos']].groupby(['did']).max().reset_index(), on=['did'], how='left')['apos'].values
-                        alt_duplications['keep'] = alt_duplications['keep'] | (np.isnan(alt_duplications['trim']) == False)
-                alt_duplications = alt_duplications[alt_duplications['keep']].copy()
-                ## See if the trimmed version can keep the same number of duplications
-                test_dups = alt_duplications[(np.isnan(alt_duplications['trim']) == False)].drop(columns=['keep','capos'])
-                if p=='b':
-                    if d=='s':
-                        test_dups = test_dups[test_dups['bpos'] >= test_dups['trim']].copy()
-                    else:
-                        test_dups = test_dups[test_dups['bpos'] <= test_dups['trim']].copy()
-                else:
-                    if d=='s':
-                        test_dups = test_dups[test_dups['apos'] >= test_dups['trim']].copy()
-                    else:
-                        test_dups = test_dups[test_dups['apos'] <= test_dups['trim']].copy()
-                test_dups = SolveDuplicationConflicts(test_dups)
-                test_count = dup_count.merge(test_dups.groupby(['did']).size().reset_index(name='test'), on=['did'], how='inner')
-                accepted = test_count.loc[test_count['test'] == test_count['full'], 'did'].values
-                if len(accepted):
-                    duplications = pd.concat([ duplications[np.isin(duplications['did'], accepted) == False], test_dups[np.isin(test_dups['did'], accepted)].drop(columns=['trim']) ])
-                    if p=='b':
-                        if d=='s':
-                            alt_duplications = alt_duplications[(alt_duplications['bpos'] >= alt_duplications['trim']) | (np.isin(alt_duplications['did'], accepted) == False)].copy()
-                        else:
-                            alt_duplications = alt_duplications[(alt_duplications['bpos'] <= alt_duplications['trim']) | (np.isin(alt_duplications['did'], accepted) == False)].copy()
-                    else:
-                        if d=='s':
-                            alt_duplications = alt_duplications[(alt_duplications['apos'] >= alt_duplications['trim']) | (np.isin(alt_duplications['did'], accepted) == False)].copy()
-                        else:
-                            alt_duplications = alt_duplications[(alt_duplications['apos'] <= alt_duplications['trim']) | (np.isin(alt_duplications['did'], accepted) == False)].copy()
-                else:
-                    break
+        # Flip min/max to get the default (which is no buffer)
+        duplications[[f'{p}max',f'{p}min']] = duplications[['cid']].merge(duplications.groupby(['cid'])[f'{p}pos'].agg(['min','max']).reset_index(), on=['cid'], how='left')[['min','max']].values
+    duplications['left'] = (duplications['did'] == duplications['did'].shift(1)) & (duplications['cid'] != duplications['cid'].shift(1))
+    duplications['amin'] = np.where(duplications['left'], duplications['apos'].shift(1, fill_value=-1), duplications['amin'])
+    duplications['bmin'] = np.where(duplications['left'] & duplications['samedir'], duplications['bpos'].shift(1, fill_value=-1), duplications['bmin'])
+    duplications['bmax'] = np.where(duplications['left'] & (duplications['samedir'] == False), duplications['bpos'].shift(1, fill_value=-1), duplications['bmax'])
+    duplications['right'] =  (duplications['did'] == duplications['did'].shift(-1)) & (duplications['cid'] != duplications['cid'].shift(-1))
+    duplications['amax'] = np.where(duplications['right'], duplications['apos'].shift(-1, fill_value=-1), duplications['amax'])
+    duplications['bmax'] = np.where(duplications['right'] & duplications['samedir'], duplications['bpos'].shift(-1, fill_value=-1), duplications['bmax'])
+    duplications['bmin'] = np.where(duplications['right'] & (duplications['samedir'] == False), duplications['bpos'].shift(-1, fill_value=-1), duplications['bmin'])
+    duplications = duplications[duplications['cid'] >= 0].copy()
+    duplications[['amin','bmin']] = duplications[['cid']].merge(duplications.groupby(['cid'])[['amin','bmin']].min().reset_index(), on=['cid'], how='left')[['amin','bmin']].values
+    duplications[['amax','bmax','left','right']] = duplications[['cid']].merge(duplications.groupby(['cid'])[['amax','bmax','left','right']].max().reset_index(), on=['cid'], how='left')[['amax','bmax','left','right']].values
+#
+    # Get longest(most matches) valid index combinations for every conflict pool (cid)
+    ext = duplications[['cid']].reset_index()
+    alternatives = []
+    if len(ext):
+        cur_alts = ext.rename(columns={'index':'i0'})
+        ext = ext.rename(columns={'index':'index1'}).merge(ext.rename(columns={'index':'index2'}), on=['cid'], how='left')
+        ext = ext[ext['index1'] < ext['index2']].copy() # Only allow increasing index to avoid duplications, because the order is arbitrary
+        ext = ext[ ext[['cid','index1','index2']].merge(conflicts[['cid','index1','index2']], on=['cid','index1','index2'], how='left', indicator=True)['_merge'].values == "left_only" ].copy()
+        s=1
+        while len(cur_alts):
+            new_alts = cur_alts.merge(ext.rename(columns={'index1':f'i{s-1}','index2':f'i{s}'}), on=['cid',f'i{s-1}'], how='inner')
+            # Remove conflicts
+            for s2 in range(s-1):
+                new_alts = new_alts[ new_alts[['cid',f'i{s2}',f'i{s}']].rename(columns={f'i{s2}':'index1',f'i{s}':'index2'}).merge(conflicts[['cid','index1','index2']], on=['cid','index1','index2'], how='left', indicator=True)['_merge'].values == "left_only" ].copy()
+            alternatives.append( cur_alts[np.isin(cur_alts['cid'].values, np.unique(new_alts['cid'].values)) == False].copy() )
+            alternatives[-1]['len'] = s
+            cur_alts = new_alts
+            s += 1
+        alternatives = pd.concat(alternatives, ignore_index=True)
+    if len(alternatives):
+        # Get shortest merged path length
+        alternatives['mlen'] = np.maximum( np.maximum(0, duplications.loc[alternatives['i0'].values, 'apos'].values - duplications.loc[alternatives['i0'].values, 'amin'].values),
+                                           np.maximum(0, np.where(duplications.loc[alternatives['i0'].values, 'samedir'].values, duplications.loc[alternatives['i0'].values, 'bpos'].values - duplications.loc[alternatives['i0'].values, 'bmin'].values, duplications.loc[alternatives['i0'].values, 'bmax'].values - duplications.loc[alternatives['i0'].values, 'bpos'].values) ) )
+        alternatives['li'] = alternatives['i0'].values
+        for s in range(1,alternatives['len'].max()):
+            cur = alternatives['len'] > s
+            alternatives.loc[cur, 'mlen'] += np.maximum( np.abs(duplications.loc[alternatives.loc[cur, f'i{s}'].values, 'apos'].values - duplications.loc[alternatives.loc[cur, f'i{s-1}'].values, 'apos'].values),
+                                                         np.abs(duplications.loc[alternatives.loc[cur, f'i{s}'].values, 'bpos'].values - duplications.loc[alternatives.loc[cur, f'i{s-1}'].values, 'bpos'].values) )
+            alternatives.loc[alternatives['len'] == s+1, 'li'] = alternatives.loc[alternatives['len'] == s+1, f'i{s}'].astype(int).values
+        alternatives['mlen'] += np.maximum( np.maximum(0, duplications.loc[alternatives['li'].values, 'amax'].values - duplications.loc[alternatives['li'].values, 'apos'].values),
+                                            np.maximum(0, np.where(duplications.loc[alternatives['li'].values, 'samedir'].values, duplications.loc[alternatives['li'].values, 'bmax'].values - duplications.loc[alternatives['li'].values, 'bpos'].values, duplications.loc[alternatives['li'].values, 'bpos'].values - duplications.loc[alternatives['li'].values, 'bmin'].values) ) )
+        alternatives = alternatives[alternatives['mlen'].values == alternatives[['cid']].merge(alternatives.groupby(['cid'])['mlen'].min().reset_index(name='minlen'), on=['cid'], how='left')['minlen'].values].drop(columns=['mlen'])
+        duplications.drop(columns=['amin','amax','bmin','bmax'], inplace=True)
+        # Take the alternatives that cut the least amount from the ends
+        alternatives[['amin','bmin']] = duplications.loc[alternatives['i0'].values, ['apos','bpos']].values
+        alternatives[['amax','bmax']] = duplications.loc[alternatives['li'].values, ['apos','bpos']].values
+        alternatives['samedir'] = duplications.loc[alternatives['i0'].values, 'samedir'].values
+        if np.sum(alternatives['samedir'] == False):
+            alternatives.loc[alternatives['samedir'] == False, ['bmin','bmax']] = alternatives.loc[alternatives['samedir'] == False, ['bmax','bmin']].values
+        alternatives[['left','right']] = duplications.loc[alternatives['i0'].values, ['left','right']].values == False # Here we are interested if we do not have a connected duplication (and not the other way round as before)
+        alternatives['cut'] = np.where(alternatives['left'], alternatives['amin'].values - alternatives[['cid']].merge(alternatives.groupby(['cid'])[['amin']].min().reset_index(), on=['cid'], how='left')['amin'].values, 0)
+        alternatives['cut'] += np.where(alternatives['right'], alternatives[['cid']].merge(alternatives.groupby(['cid'])[['amax']].max().reset_index(), on=['cid'], how='left')['amax'].values - alternatives['amax'].values, 0)
+        if np.sum(alternatives['samedir'] == False):
+            alternatives.loc[alternatives['samedir'] == False, ['left','right']] = alternatives.loc[alternatives['samedir'] == False, ['right','left']].values
+        alternatives['cut'] += np.where(alternatives['left'], alternatives['bmin'].values - alternatives[['cid']].merge(alternatives.groupby(['cid'])[['bmin']].min().reset_index(), on=['cid'], how='left')['bmin'].values, 0)
+        alternatives['cut'] += np.where(alternatives['right'], alternatives[['cid']].merge(alternatives.groupby(['cid'])[['bmax']].max().reset_index(), on=['cid'], how='left')['bmax'].values - alternatives['bmax'].values, 0)
+        alternatives.drop(columns=['li','amin','bmin','amax','bmax','left','right'], inplace=True)
+        alternatives = alternatives[alternatives['cut'].values == alternatives[['cid']].merge(alternatives.groupby(['cid'])['cut'].min().reset_index(), on=['cid'], how='left')['cut'].values].drop(columns=['cut'])
+        duplications.drop(columns=['left','right'], inplace=True)
+        # If we have an alternative with the same direction prefer it over alternatives with different directions
+        alternatives = alternatives[alternatives['samedir'].values == alternatives[['cid']].merge(alternatives.groupby(['cid'])['samedir'].max().reset_index(name='samedir'), on=['cid'], how='left')['samedir'].values].copy()
+        # Take the lowest indexes first for the lower pid and then for the higher pid (such that it is consistent no matter which one is a and b)
+        alternatives['blower'] = (duplications.loc[alternatives['i0'].values, 'bpid'].values < duplications.loc[alternatives['i0'].values, 'apid'].values) | ((duplications.loc[alternatives['i0'].values, 'bpid'].values == duplications.loc[alternatives['i0'].values, 'apid'].values) & (duplications.loc[alternatives['i0'].values, 'bhap'].values < duplications.loc[alternatives['i0'].values, 'ahap'].values))
+        for s in range(alternatives['len'].max()):
+            cur = alternatives['len'] > s
+            alternatives.loc[cur, [f'll{s}',f'lh{s}']] = np.where(alternatives.loc[cur, ['blower','blower']].values, duplications.loc[alternatives.loc[cur, f'i{s}'].values, ['bpos','apos']].values, duplications.loc[alternatives.loc[cur, f'i{s}'].values, ['apos','bpos']].values)
+        for l in np.unique(alternatives['len']):
+            cur = (alternatives['len'] == l) & (alternatives['samedir'] == False)
+            for s in range(l//2):
+                alternatives.loc[cur & alternatives['blower'], [f'll{s}',f'll{l-1-s}']] = alternatives.loc[cur, [f'll{l-1-s}',f'll{s}']].values
+                alternatives.loc[cur & (alternatives['blower'] == False), [f'lh{s}',f'lh{l-1-s}']] = alternatives.loc[cur, [f'lh{l-1-s}',f'lh{s}']].values
+        for s in range(alternatives['len'].max()-1,-1,-1): # Start comparing at the back, where we have the highest indexes
+            for o in ['l','h']:
+                cur = alternatives['len'] > s
+                comp = alternatives.loc[cur, ['cid',f'l{o}{s}']].reset_index().merge(alternatives.loc[cur, ['cid',f'l{o}{s}']].groupby(['cid']).min().reset_index().rename(columns={f'l{o}{s}':'min'}), on=['cid'], how='left')
+                alternatives.drop(comp.loc[comp[f'l{o}{s}'] > comp['min'], 'index'].values, inplace=True)
+        # Take the duplications chosen by the remaining alternatives
+        dup_ind = []
+        for s in range(alternatives['len'].max()):
+            dup_ind.append( alternatives.loc[alternatives['len'] > s, f'i{s}'].astype(int).values )
+        dup_ind = np.concatenate(dup_ind)
+        duplications = duplications.loc[dup_ind].drop(columns=['cid'])
+        duplications = pd.concat([valid_dups, duplications], ignore_index=True)
+    else:
+        duplications = valid_dups
 #
     # We need to sort again, since we destroyed the order by concatenating (but this time we have only one bpos per apos, which makes it easier)
     duplications.sort_values(['did','apos'], inplace=True)
+    duplications.reset_index(drop=True, inplace=True)
 #
     return duplications
 
@@ -2852,61 +4463,24 @@ def GetDuplicationDifferences(duplications):
     return duplications.groupby(['group','did','apid','ahap','bpid','bhap'])[['scaf_diff','dist_diff']].sum().reset_index()
 
 def RemoveDuplicatedHaplotypesWithLowestSupport(scaffold_paths, duplications, rem_haps, bsupp, ploidy):
-    # Find haplotype with lowest support in each group
-    rem_haps = rem_haps.merge(bsupp, on=['group','pid','hap'], how='left')
-    rem_haps.sort_values(['group','min','median','max'], ascending=[True,True,True,True], inplace=True)
-    rem_haps = rem_haps.groupby(['group']).first().reset_index()
-    # Remove those haplotypes
-    for h in range(ploidy-1, -1, -1): # We need to go through in the inverse order, because we still need the main for the alternatives
-        rem_pid = np.unique(rem_haps.loc[rem_haps['hap'] == h, 'pid'].values)
-        duplications = duplications[((np.isin(duplications['apid'], rem_pid) == False) | (duplications['ahap'] != h)) & ((np.isin(duplications['bpid'], rem_pid) == False) | (duplications['bhap'] != h))].copy()
-        rem_pid = np.isin(scaffold_paths['pid'], rem_pid)
-        if h==0:
-            scaffold_paths = RemoveMainPath(scaffold_paths, rem_pid, ploidy)
-            duplications = AssignLowestHaplotypeToMain(duplications)
-        else:
-            scaffold_paths = RemoveHaplotype(scaffold_paths, rem_pid, h)
+    if len(bsupp):
+        # Find haplotype with lowest support in each group
+        rem_haps = rem_haps.merge(bsupp, on=['group','pid','hap'], how='left')
+        rem_haps.sort_values(['group','bplace'], ascending=[True,False], inplace=True)
+        rem_haps = rem_haps.groupby(['group']).first().reset_index()
+        # Remove those haplotypes
+        for h in range(ploidy-1, -1, -1): # We need to go through in the inverse order, because we still need the main for the alternatives
+            rem_pid = np.unique(rem_haps.loc[rem_haps['hap'] == h, 'pid'].values)
+            duplications = duplications[((np.isin(duplications['apid'], rem_pid) == False) | (duplications['ahap'] != h)) & ((np.isin(duplications['bpid'], rem_pid) == False) | (duplications['bhap'] != h))].copy()
+            rem_pid = np.isin(scaffold_paths['pid'], rem_pid)
+            if h==0:
+                scaffold_paths = RemoveMainPath(scaffold_paths, rem_pid, ploidy)
+                duplications = AssignLowestHaplotypeToMain(duplications)
+            else:
+                scaffold_paths = RemoveHaplotype(scaffold_paths, rem_pid, h)
     differences = GetDuplicationDifferences(duplications)
 #
     return scaffold_paths, duplications, differences
-
-def CompressPaths(scaffold_paths, ploidy):
-    # Remove positions with only deletions
-    scaffold_paths = scaffold_paths[(scaffold_paths[[f'scaf{h}' for h in range(ploidy)]] >= 0).any(axis=1)].copy()
-    scaffold_paths['pos'] = scaffold_paths.groupby(['pid'], sort=False).cumcount()
-    scaffold_paths.reset_index(drop=True, inplace=True)
-    # Compress paths where we have alternating deletions
-    while True:
-        shifts = scaffold_paths.loc[ ((np.where(scaffold_paths[[f'phase{h}' for h in range(ploidy)]].values < 0, scaffold_paths[['scaf0' for h in range(ploidy)]].values, scaffold_paths[[f'scaf{h}' for h in range(ploidy)]].values) < 0) |
-                                      (np.where(scaffold_paths[[f'phase{h}' for h in range(ploidy)]].shift(1).values < 0, scaffold_paths[['scaf0' for h in range(ploidy)]].shift(1).values, scaffold_paths[[f'scaf{h}' for h in range(ploidy)]].shift(1).values) < 0)).all(axis=1), ['pid'] ]
-        if len(shifts) == 0:
-            break
-        else:
-            shifts['index'] = shifts.index.values
-            shifts = shifts.groupby(['pid'], sort=False).first() # We can only take the first in each path, because otherwise we might block the optimal solution
-            shifts['new_index'] = shifts['index']-2
-            while True:
-                further = ((np.where(scaffold_paths.loc[shifts['index'].values, [f'phase{h}' for h in range(ploidy)]].values < 0, scaffold_paths.loc[shifts['index'].values, ['scaf0' for h in range(ploidy)]].values, scaffold_paths.loc[shifts['index'].values, [f'scaf{h}' for h in range(ploidy)]].values) < 0) |
-                           (np.where(scaffold_paths.loc[shifts['new_index'].values, [f'phase{h}' for h in range(ploidy)]].values < 0, scaffold_paths.loc[shifts['new_index'].values, ['scaf0' for h in range(ploidy)]].values, scaffold_paths.loc[shifts['new_index'].values, [f'scaf{h}' for h in range(ploidy)]].values) < 0)).all(axis=1)
-                if np.sum(further) == 0: # We do not need to worry to go into another group, because the first position in every group must be a duplication for all included haplotypes, thus blocks continuation
-                    break
-                else:
-                    shifts.loc[further, 'new_index'] -= 1
-            shifts['new_index'] += 1
-            for h in range(ploidy):
-                cur_shifts = (scaffold_paths.loc[shifts['index'].values, f'phase{h}'].values >= 0) & (scaffold_paths.loc[shifts['index'].values, f'scaf{h}'].values >= 0)
-                if np.sum(cur_shifts):
-                    scaffold_paths.loc[shifts.loc[cur_shifts, 'new_index'].values, f'phase{h}'] = np.abs(scaffold_paths.loc[shifts.loc[cur_shifts, 'index'].values, f'phase{h}'].values)
-                    scaffold_paths.loc[shifts.loc[cur_shifts, 'new_index'].values, [f'scaf{h}',f'strand{h}',f'dist{h}']] = scaffold_paths.loc[shifts.loc[cur_shifts, 'index'].values, [f'scaf{h}',f'strand{h}',f'dist{h}']].values
-                cur_shifts = (scaffold_paths.loc[shifts['index'].values, f'phase{h}'].values < 0) & (scaffold_paths.loc[shifts['index'].values, 'scaf0'].values >= 0)
-                if np.sum(cur_shifts):
-                    scaffold_paths.loc[shifts.loc[cur_shifts, 'new_index'].values, f'phase{h}'] = np.abs(scaffold_paths.loc[shifts.loc[cur_shifts, 'index'].values, f'phase{h}'].values)
-                    scaffold_paths.loc[shifts.loc[cur_shifts, 'new_index'].values, [f'scaf{h}',f'strand{h}',f'dist{h}']] = scaffold_paths.loc[shifts.loc[cur_shifts, 'index'].values, ['scaf0','strand0','dist0']].values
-            scaffold_paths.drop(shifts['index'].values, inplace=True)
-            scaffold_paths['pos'] = scaffold_paths.groupby(['pid'], sort=False).cumcount()
-            scaffold_paths.reset_index(drop=True, inplace=True)
-#
-    return scaffold_paths
 
 def MergeHaplotypes(scaffold_paths, scaf_bridges, ploidy, ends_in=[]):
     if len(ends_in):
@@ -2920,7 +4494,7 @@ def MergeHaplotypes(scaffold_paths, scaf_bridges, ploidy, ends_in=[]):
         # Reverse scaffold ends if start has higher scaffold than end such that paths with identical ends always look the same
         ends['reverse'] = (ends['sscaf'] > ends['escaf']) | ((ends['sscaf'] == ends['escaf']) & (ends['sside'] == 'r') & (ends['eside'] == 'l'))
         ends.loc[ends['reverse'], [f'{p}{n}' for p in ['s','e'] for n in ['scaf','side']]] = ends.loc[ends['reverse'], [f'{p}{n}' for p in ['e','s'] for n in ['scaf','side']]].values
-    #
+#
         # Find paths that start and end with the same scaffold
         ends.sort_values(['sscaf','sside','escaf','eside','pid'], inplace=True)
         groups = ends.groupby(['sscaf','sside','escaf','eside'], sort=False)['reverse'].agg(['sum','size'])
@@ -2936,12 +4510,7 @@ def MergeHaplotypes(scaffold_paths, scaf_bridges, ploidy, ends_in=[]):
         ends.drop(columns=['gsize','grev'], inplace=True)
 #
     # Get duplications within the groups
-    duplications = GetDuplications(scaffold_paths, ploidy)
-    duplications['agroup'] = duplications[['apid']].rename(columns={'apid':'pid'}).merge(ends[['pid','group']], on=['pid'], how='left')['group'].values
-    duplications['bgroup'] = duplications[['bpid']].rename(columns={'bpid':'pid'}).merge(ends[['pid','group']], on=['pid'], how='left')['group'].values
-    duplications = duplications[duplications['agroup'] == duplications['bgroup']].drop(columns=['bgroup'])
-    duplications.rename(columns={'agroup':'group'}, inplace=True)
-    duplications['group'] = duplications['group'].astype(int)
+    duplications = GetDuplications(scaffold_paths, ploidy, ends[['pid','group']])
     # Require same strand (easy here, because we made them the same direction earlier)
     duplications = AddStrandToDuplications(duplications, scaffold_paths, ploidy)
     duplications = duplications[duplications['astrand'] == duplications['bstrand']].drop(columns=['astrand','bstrand'])
@@ -2959,290 +4528,314 @@ def MergeHaplotypes(scaffold_paths, scaf_bridges, ploidy, ends_in=[]):
     duplications['del']  = duplications[['did']].merge(duplications.groupby(['did'])['del'].max().reset_index(), on=['did'], how='left')['del'].values
     duplications = duplications[duplications['del'] == False].drop(columns=['max_pos','del'])
     # Add the duplications between haplotypes of the same path
-    new_duplications = [duplications]
-    for h in range(1,ploidy):
-        # Only take scaffold_paths that are not exactly identical to main
-        new_dups = scaffold_paths.groupby(['pid'])[f'phase{h}'].max()
-        new_dups = new_dups[new_dups >= 0].reset_index()
-        new_dups = scaffold_paths[np.isin(scaffold_paths['pid'], new_dups['pid'])].copy()
-        for h1 in range(h):
-            # Add one direction (deletions cannot be duplications to be consistent)
-            if h1 == 0:
-                add_dups = new_dups.loc[(new_dups['scaf0'] >= 0) & ((new_dups[f'phase{h}'] < 0) | ((new_dups[f'scaf{h}'] == new_dups['scaf0']) & (new_dups[f'strand{h}'] == new_dups['strand0']))), ['pid','pos']].copy()
-            else:
-                add_dups = scaffold_paths.groupby(['pid'])[f'phase{h1}'].max()
-                add_dups = add_dups[add_dups >= 0].reset_index()
-                add_dups = new_dups[np.isin(new_dups['pid'], add_dups['pid'])].copy()
-                add_dups = add_dups.loc[((new_dups['scaf0'] >= 0) & (add_dups[f'phase{h}'] < 0) & (add_dups[f'phase{h1}'] < 0)) | ((new_dups[f'scaf{h}'] >= 0) & (add_dups[f'scaf{h}'] == add_dups[f'scaf{h1}']) & (new_dups[f'strand{h}'] == new_dups[f'strand{h1}'])) |
-                                        ((add_dups[f'phase{h}'] < 0) & (new_dups['scaf0'] >= 0) & (add_dups[f'scaf{h1}'] == add_dups['scaf0']) & (new_dups[f'strand{h1}'] == new_dups['strand0'])) |
-                                        ((add_dups[f'phase{h1}'] < 0) & (new_dups['scaf0'] >= 0) & (add_dups[f'scaf{h}'] == add_dups['scaf0']) & (new_dups[f'strand{h}'] == new_dups['strand0'])), ['pid','pos']].copy()
-            add_dups.rename(columns={'pid':'apid','pos':'apos'}, inplace=True)
-            add_dups['ahap'] = h1
-            add_dups['bpid'] = add_dups['apid'].values
-            add_dups['bpos'] = add_dups['apos'].values
-            add_dups['bhap'] = h
-            add_dups['group'] = add_dups[['apid','ahap']].merge(duplications[['apid','ahap','group']].drop_duplicates(), on=['apid','ahap'], how='left')['group'].values
-            add_dups = add_dups[np.isnan(add_dups['group']) == False].copy() # We do not need to add scaffold that do not have duplications with other scaffolds
-            add_dups['group'] = add_dups['group'].astype(int)
-            add_dups['samedir'] = True
-            if len(add_dups):
-                new_duplications.append(add_dups.copy())
-                # Add other direction
-                add_dups[['ahap','bhap']] = add_dups[['bhap','ahap']].values
+    if len(duplications):
+        new_duplications = [duplications]
+        for h in range(1,ploidy):
+            # Only take scaffold_paths that are not exactly identical to main
+            new_dups = scaffold_paths.groupby(['pid'])[f'phase{h}'].max()
+            new_dups = new_dups[new_dups >= 0].reset_index()
+            new_dups = scaffold_paths[np.isin(scaffold_paths['pid'], new_dups['pid'])].copy()
+            for h1 in range(h):
+                # Add one direction (deletions cannot be duplications to be consistent)
+                if h1 == 0:
+                    add_dups = new_dups.loc[(new_dups['scaf0'] >= 0) & ((new_dups[f'phase{h}'] < 0) | ((new_dups[f'scaf{h}'] == new_dups['scaf0']) & (new_dups[f'strand{h}'] == new_dups['strand0']))), ['pid','pos']].copy()
+                else:
+                    add_dups = scaffold_paths.groupby(['pid'])[f'phase{h1}'].max()
+                    add_dups = add_dups[add_dups >= 0].reset_index()
+                    add_dups = new_dups[np.isin(new_dups['pid'], add_dups['pid'])].copy()
+                    add_dups = add_dups.loc[((new_dups['scaf0'] >= 0) & (add_dups[f'phase{h}'] < 0) & (add_dups[f'phase{h1}'] < 0)) | ((new_dups[f'scaf{h}'] >= 0) & (add_dups[f'scaf{h}'] == add_dups[f'scaf{h1}']) & (new_dups[f'strand{h}'] == new_dups[f'strand{h1}'])) |
+                                            ((add_dups[f'phase{h}'] < 0) & (new_dups['scaf0'] >= 0) & (add_dups[f'scaf{h1}'] == add_dups['scaf0']) & (new_dups[f'strand{h1}'] == new_dups['strand0'])) |
+                                            ((add_dups[f'phase{h1}'] < 0) & (new_dups['scaf0'] >= 0) & (add_dups[f'scaf{h}'] == add_dups['scaf0']) & (new_dups[f'strand{h}'] == new_dups['strand0'])), ['pid','pos']].copy()
+                add_dups.rename(columns={'pid':'apid','pos':'apos'}, inplace=True)
+                add_dups['ahap'] = h1
+                add_dups['bpid'] = add_dups['apid'].values
+                add_dups['bpos'] = add_dups['apos'].values
+                add_dups['bhap'] = h
                 add_dups['group'] = add_dups[['apid','ahap']].merge(duplications[['apid','ahap','group']].drop_duplicates(), on=['apid','ahap'], how='left')['group'].values
-                new_duplications.append(add_dups)
-    duplications = pd.concat(new_duplications, ignore_index=True)
-    duplications.sort_values(['apid','ahap','bpid','bhap','apos'], inplace=True)
-    duplications['did'] = ((duplications['apid'] != duplications['apid'].shift(1)) | (duplications['ahap'] != duplications['ahap'].shift(1)) | (duplications['bpid'] != duplications['bpid'].shift(1)) | (duplications['bhap'] != duplications['bhap'].shift(1))).cumsum()
+                add_dups = add_dups[np.isnan(add_dups['group']) == False].copy() # We do not need to add scaffold that do not have duplications with other scaffolds
+                add_dups['group'] = add_dups['group'].astype(int)
+                add_dups['samedir'] = True
+                if len(add_dups):
+                    new_duplications.append(add_dups.copy())
+                    # Add other direction
+                    add_dups[['ahap','bhap']] = add_dups[['bhap','ahap']].values
+                    add_dups['group'] = add_dups[['apid','ahap']].merge(duplications[['apid','ahap','group']].drop_duplicates(), on=['apid','ahap'], how='left')['group'].values
+                    new_duplications.append(add_dups)
+        duplications = pd.concat(new_duplications, ignore_index=True)
+        duplications.sort_values(['apid','ahap','bpid','bhap','apos'], inplace=True)
+        duplications['did'] = ((duplications['apid'] != duplications['apid'].shift(1)) | (duplications['ahap'] != duplications['ahap'].shift(1)) | (duplications['bpid'] != duplications['bpid'].shift(1)) | (duplications['bhap'] != duplications['bhap'].shift(1))).cumsum()
     # Assign new groups after some groups might have been split when we removed the duplications where the start/end duplication got reassigned to another position (always join the group with the scaffold with most matches as long as all scaffolds match with all other scaffolds)
-    duplications['agroup'] = duplications['apid']
-    duplications['bgroup'] = duplications['bpid']
-    while True:
-        matches = duplications.groupby(['agroup','apid','ahap','bgroup','bpid','bhap']).size().reset_index(name='matches')
-        for p in ['a','b']:
-            matches[f'{p}size'] = matches[[f'{p}group']].merge(matches[[f'{p}group',f'{p}pid',f'{p}hap']].drop_duplicates().groupby([f'{p}group']).size().reset_index(name='size'), on=[f'{p}group'], how='left')['size'].values
-        matches = matches[matches['agroup'] != matches['bgroup']].copy()
-        groups = matches.groupby(['agroup','bgroup','asize','bsize'])['matches'].agg(['size','min','median','max']).reset_index()
-        delete = groups.loc[groups['size'] != groups['asize']*groups['bsize'], ['agroup','bgroup']].copy()
-        if len(delete):
-            duplications = duplications[duplications[['agroup','bgroup']].merge(delete, on=['agroup','bgroup'], how='left', indicator=True)['_merge'].values == "left_only"].copy()
-        groups = groups[groups['size'] == groups['asize']*groups['bsize']].drop(columns=['size','asize','bsize'])
-        if len(groups):
-            groups.sort_values(['agroup','min','median','max','bgroup'], ascending=[True,False,False,False,True], inplace=True)
-            groups = groups.groupby(['agroup'], sort=False).first().reset_index()
-            groups.drop(columns=['min','median','max'], inplace=True)
-            groups = groups.merge(groups.rename(columns={'agroup':'bgroup','bgroup':'agroup'}), on=['agroup','bgroup'], how='inner')
-            groups = groups[groups['agroup'] < groups['bgroup']].rename(columns={'bgroup':'group','agroup':'new_group'})
+    if len(duplications):
+        duplications['agroup'] = duplications['apid']
+        duplications['bgroup'] = duplications['bpid']
+        error_shown = False
+        while True:
+            # Count the matches(scaffold duplications) in each pid pair with duplicate
+            matches = duplications.groupby(['agroup','apid','ahap','bgroup','bpid','bhap']).size().reset_index(name='matches')
+            # Get size(number of pid pairs) of each group
             for p in ['a','b']:
-                duplications['new_group'] = duplications[[f'{p}group']].rename(columns={f'{p}group':'group'}).merge(groups, on=['group'], how='left')['new_group'].values
-                duplications.loc[np.isnan(duplications['new_group']) == False, f'{p}group'] = duplications.loc[np.isnan(duplications['new_group']) == False, 'new_group'].astype(int)
-        else:
-            break
-    duplications['group'] = duplications['agroup']
-    duplications.drop(columns=['agroup','bgroup','new_group'], inplace=True)
-#
-    # Get minimum difference to another haplotype in group
-    duplications = GetPositionsBeforeDuplication(duplications, scaffold_paths, ploidy, False)
-    duplications['scaf_diff'] = (duplications['aprev_pos'] != duplications['apos'].shift(1)) | (duplications['bprev_pos'] != duplications['bpos'].shift(1))
-    duplications['dist_diff'] = (duplications['scaf_diff'] == False) & (duplications['adist'] != duplications['bdist'])
-    duplications.loc[duplications['apos'] == 0, 'scaf_diff'] = False
-    differences = GetDuplicationDifferences(duplications)
-#
-    # Remove all except one version of haplotypes with no differences
-    no_diff = differences[(differences['scaf_diff'] == 0) & (differences['dist_diff'] == 0)].copy()
-    if len(no_diff):
-        # Remove all except the one with the lowest pid
-        for h in range(ploidy-1, -1, -1): # We need to go through in the inverse order, because we still need the main for the alternatives
-            rem_pid = np.unique(no_diff.loc[(no_diff['bpid'] > no_diff['apid']) & (no_diff['bhap'] == h), 'bpid'].values)
-            duplications = duplications[((np.isin(duplications['apid'], rem_pid) == False) | (duplications['ahap'] != h)) & ((np.isin(duplications['bpid'], rem_pid) == False) | (duplications['bhap'] != h))].copy()
-            rem_pid = np.isin(scaffold_paths['pid'], rem_pid)
-            if h==0:
-                scaffold_paths = RemoveMainPath(scaffold_paths, rem_pid, ploidy)
-                duplications = AssignLowestHaplotypeToMain(duplications)
+                matches[f'{p}size'] = matches[[f'{p}group']].merge(matches[[f'{p}group',f'{p}pid',f'{p}hap']].drop_duplicates().groupby([f'{p}group']).size().reset_index(name='size'), on=[f'{p}group'], how='left')['size'].values
+            # Get min, median, max number of matches between groups
+            matches = matches[matches['agroup'] != matches['bgroup']].copy()
+            groups = matches.groupby(['agroup','bgroup','asize','bsize'])['matches'].agg(['size','min','median','max']).reset_index()
+            # Delete duplications between groups, where not all pids match all pids of the other group
+            delete = groups.loc[groups['size'] != groups['asize']*groups['bsize'], ['agroup','bgroup']].copy()
+            if len(delete):
+                duplications = duplications[duplications[['agroup','bgroup']].merge(delete, on=['agroup','bgroup'], how='left', indicator=True)['_merge'].values == "left_only"].copy()
+            groups = groups[groups['size'] == groups['asize']*groups['bsize']].drop(columns=['size','asize','bsize'])
+            if len(groups):
+                # Merge the groups with the most min, median, max matches between them
+                groups.sort_values(['agroup','min','median','max','bgroup'], ascending=[True,False,False,False,True], inplace=True)
+                groups = groups.groupby(['agroup'], sort=False).first().reset_index()
+                groups.drop(columns=['min','median','max'], inplace=True)
+                groups = groups.merge(groups.rename(columns={'agroup':'bgroup','bgroup':'agroup'}), on=['agroup','bgroup'], how='inner')
+                groups = groups[groups['agroup'] < groups['bgroup']].rename(columns={'bgroup':'group','agroup':'new_group'})
+                if len(groups) == 0 and error_shown == False:
+                    print("Error: Stuck in an endless loop while regrouping in MergeHaplotypes.")
+                for p in ['a','b']:
+                    duplications['new_group'] = duplications[[f'{p}group']].rename(columns={f'{p}group':'group'}).merge(groups, on=['group'], how='left')['new_group'].values
+                    duplications.loc[np.isnan(duplications['new_group']) == False, f'{p}group'] = duplications.loc[np.isnan(duplications['new_group']) == False, 'new_group'].astype(int)
             else:
-                scaffold_paths = RemoveHaplotype(scaffold_paths, rem_pid, h)
+                break
+        duplications['group'] = duplications['agroup']
+        duplications.drop(columns=['agroup','bgroup','new_group'], inplace=True)
+#
+    if len(duplications):
+        # Get minimum difference to another haplotype in group
+        duplications = GetPositionsBeforeDuplication(duplications, scaffold_paths, ploidy, False)
+        duplications['scaf_diff'] = (duplications['aprev_pos'] != duplications['apos'].shift(1)) | (duplications['bprev_pos'] != duplications['bpos'].shift(1))
+        duplications['dist_diff'] = (duplications['scaf_diff'] == False) & (duplications['adist'] != duplications['bdist'])
+        duplications.loc[duplications['apos'] == 0, 'scaf_diff'] = False
         differences = GetDuplicationDifferences(duplications)
 #
-    # Get bridge counts for different path/haplotypes to base decisions on it
-    bsupp = duplications[['group','apid','ahap']].drop_duplicates()
-    bsupp.rename(columns={'apid':'pid','ahap':'hap'}, inplace=True)
-    bsupp = GetBridgeSupport(bsupp, scaffold_paths, scaf_bridges, ploidy)
+        # Remove all except one version of haplotypes with no differences
+        if len(differences):
+            no_diff = differences[(differences['scaf_diff'] == 0) & (differences['dist_diff'] == 0)].copy()
+            if len(no_diff):
+                # Remove all except the one with the lowest pid
+                for h in range(ploidy-1, -1, -1): # We need to go through in the inverse order, because we still need the main for the alternatives
+                    rem_pid = np.unique(no_diff.loc[(no_diff['bpid'] > no_diff['apid']) & (no_diff['bhap'] == h), 'bpid'].values)
+                    duplications = duplications[((np.isin(duplications['apid'], rem_pid) == False) | (duplications['ahap'] != h)) & ((np.isin(duplications['bpid'], rem_pid) == False) | (duplications['bhap'] != h))].copy()
+                    rem_pid = np.isin(scaffold_paths['pid'], rem_pid)
+                    if h==0:
+                        scaffold_paths = RemoveMainPath(scaffold_paths, rem_pid, ploidy)
+                        duplications = AssignLowestHaplotypeToMain(duplications)
+                    else:
+                        scaffold_paths = RemoveHaplotype(scaffold_paths, rem_pid, h)
+                differences = GetDuplicationDifferences(duplications)
 #
-    # Remove distance only variants with worst bridge support as long as we are above ploidy haplotypes
-    while True:
-        groups = duplications.groupby(['group','apid','ahap']).size().groupby(['group']).size().reset_index(name='nhaps')
-        rem_groups = groups[groups['nhaps'] > ploidy].copy()
-        if len(rem_groups) == 0:
-            break
-        else:
-            # For each group find the path/haplotype with the lowest bridge support and remove it
-            rem_dups = duplications[np.isin(duplications['did'], differences.loc[np.isin(differences['group'], rem_groups['group'].values) & (differences['scaf_diff'] == 0), 'did'].values)].copy()
-            if len(rem_dups) == 0:
-                break
-            else:
-                rem_haps = rem_dups[['group','apid','ahap']].drop_duplicates()
-                rem_haps.rename(columns={'apid':'pid','ahap':'hap'}, inplace=True)
-                scaffold_paths, duplications, differences = RemoveDuplicatedHaplotypesWithLowestSupport(scaffold_paths, duplications, rem_haps, bsupp, ploidy)
+    if len(duplications):
+        # Get bridge counts for different path/haplotypes to base decisions on it
+        bsupp = duplications[['group','apid','ahap']].drop_duplicates()
+        bsupp.rename(columns={'apid':'pid','ahap':'hap'}, inplace=True)
+        bsupp = GetBridgeSupport(bsupp, scaffold_paths, scaf_bridges, ploidy)
 #
-    # Remove variants that are identical to other haplotypes except of deletions(missing scaffolds) and distances as long as we are above ploidy haplotypes
-    while True:
-        groups = duplications.groupby(['group','apid','ahap']).size().groupby(['group']).size().reset_index(name='nhaps')
-        rem_groups = groups[groups['nhaps'] > ploidy].copy()
-        if len(rem_groups) == 0:
-            break
-        else:
-            # For each group find the path/haplotype with the lowest bridge support and remove it
-            rem_dups = duplications[np.isin(duplications['group'], rem_groups['group'].values)].copy()
-            rem_dups['complete'] = (rem_dups['apos'].shift(1) == rem_dups['aprev_pos']) | (rem_dups['aprev_pos'] < 0)
-            rem_dups['complete'] = rem_dups[['did']].merge(rem_dups.groupby(['did'])['complete'].min().reset_index(), on=['did'], how='left')['complete'].values
-            rem_dups = rem_dups[rem_dups['complete']].copy()
-            if len(rem_dups) == 0:
-                break
-            else:
-                rem_haps = rem_dups[['group','apid','ahap']].drop_duplicates()
-                rem_haps.rename(columns={'apid':'pid','ahap':'hap'}, inplace=True)
-                scaffold_paths, duplications, differences = RemoveDuplicatedHaplotypesWithLowestSupport(scaffold_paths, duplications, rem_haps, bsupp, ploidy)
-#
-    # Merge all groups that do not have more than ploidy haplotypes
-    groups = duplications.groupby(['group','apid','ahap']).size().groupby(['group']).size().reset_index(name='nhaps')
-    groups = groups[groups['nhaps'] <= ploidy].copy()
-    duplications = duplications[np.isin(duplications['group'], groups['group'].values)].copy()
-    # Define insertion order by amount of bridge support (highest support == lowest new haplotype)
-    bsupp = bsupp.merge(duplications[['group','apid','ahap']].drop_duplicates().rename(columns={'apid':'pid','ahap':'hap'}), on=['group','pid','hap'], how='inner')
-    bsupp.sort_values(['group','min','median','max'], ascending=[True,True,True,True], inplace=True)
-    for h in range(ploidy):
-        groups[[f'pid{h}',f'hap{h}']] = groups[['group']].merge( bsupp.groupby(['group'])[['pid','hap']].last().reset_index(), on=['group'], how='left')[['pid','hap']].fillna(-1).values.astype(int)
-        bsupp = bsupp[bsupp['group'].shift(-1) == bsupp['group']].copy()
-    # Separate the individual haplotypes and update positions in duplications after removal of deletions
-    haps = duplications[['group','apid','ahap']].drop_duplicates()
-    haps.rename(columns={'apid':'pid','ahap':'hap'}, inplace=True)
-    haps = GetHaplotypes(haps, scaffold_paths, ploidy)
-    haps.sort_values(['group','pid','hap','pos'], inplace=True)
-    haps['new_pos'] = haps.groupby(['group','pid','hap'], sort=False).cumcount()
-    duplications['apos'] = duplications[['apid','apos','ahap']].rename(columns={'apid':'pid','apos':'pos','ahap':'hap'}).merge(haps[['pid','pos','hap','new_pos']], on=['pid','pos','hap'], how='left')['new_pos'].values
-    duplications['bpos'] = duplications[['bpid','bpos','bhap']].rename(columns={'bpid':'pid','bpos':'pos','bhap':'hap'}).merge(haps[['pid','pos','hap','new_pos']], on=['pid','pos','hap'], how='left')['new_pos'].values
-    duplications.drop(columns=['samedir','aprev_pos','adist','bprev_pos','bdist','scaf_diff','dist_diff'], inplace=True)
-    haps['pos'] = haps['new_pos']
-    haps.drop(columns={'new_pos'}, inplace=True)
-    # Create new merged paths with most supported haplotype (so far only with the positions in haps)
-    new_paths = groups[['group','pid0','hap0']].rename(columns={'pid0':'pid','hap0':'hap'})
-    new_paths = new_paths.merge(haps[['pid','hap','pos']], on=['pid','hap'], how='left')
-    new_paths.drop(columns=['hap'], inplace=True)
-    plen = new_paths.groupby(['group'], sort=False).size().values
-    new_paths['pid'] = np.repeat( np.arange(len(plen)) + scaffold_paths['pid'].max() + 1, plen )
-    new_paths['pos0'] = new_paths['pos']
-    for hadd in range(1, ploidy):
-        new_paths[f'pos{hadd}'] = -1 # fill everything by default as a deletion and later replace the duplicated scaffolds with the correct position
-        for hcomp in range(hadd):
-            # Get all duplications relevant for this combination
-            dups = groups[['group',f'pid{hcomp}',f'hap{hcomp}',f'pid{hadd}',f'hap{hadd}']].rename(columns={f'pid{hcomp}':'apid',f'hap{hcomp}':'ahap',f'pid{hadd}':'bpid',f'hap{hadd}':'bhap'}).merge( duplications, on=['group','apid','ahap','bpid','bhap'], how='left' )
-            dups.drop(columns=['apid','ahap','bpid','bhap','did'], inplace=True)
-            # Assing duplications to the place they belong (they might be different for different hcomp, but then we just take the last. For the polyploid case a better algorithm would be helpful, but the most important is that we do not introduce bugs, because a non-optimal alignment for the merging only increases path size, but no errors)
-            new_paths[f'pos{hadd}'] = new_paths[['group',f'pos{hcomp}']].rename(columns={f'pos{hcomp}':'apos'}).merge(dups, on=['group','apos'], how='left')['bpos'].fillna(-1).values.astype(int)
-        # If the order of the added positions is inverted, see if we can fix it
+        # Remove distance only variants with worst bridge support as long as we are above ploidy haplotypes
         while True:
-            # Find conflicts
-            new_paths['posmax'] =  new_paths.groupby(['group'])[f'pos{hadd}'].cummax()
-            new_paths['conflict'] = (new_paths['posmax'] > new_paths[f'pos{hadd}']) & (0 <= new_paths[f'pos{hadd}'])
-            if np.sum(new_paths['conflict']) == 0:
+            if len(duplications):
+                groups = duplications.groupby(['group','apid','ahap']).size().groupby(['group']).size().reset_index(name='nhaps')
+                rem_groups = groups[groups['nhaps'] > ploidy].copy()
+            else:
+                rem_groups = []
+            if len(rem_groups) == 0:
                 break
             else:
-                # Check if we can fix the problem
-                conflicts = new_paths.loc[new_paths['conflict'], ['group','pos',f'pos{hadd}']].rename(columns={f'pos{hadd}':'conpos'})
-                conflicts['oindex'] = conflicts.index.values
-                conflicts['cindex'] = conflicts.index.values-1
-                conflicts['nbefore'] = 0
-                conflicts[[f'in{h}' for h in range(hadd)]] = new_paths.loc[new_paths['conflict'], [f'pos{h}' for h in range(hadd)]].values >= 0
-                conflicts['done'] = False
-                conflicts['fixable'] = True
-                while np.sum(conflicts['done'] == False):
-                    cons = new_paths.loc[conflicts['cindex'].values].copy()
-                    cons['in'] = ((cons[[f'pos{h}' for h in range(hadd)]] >= 0) & (conflicts[[f'in{h}' for h in range(hadd)]].values)).any(axis=1)
-                    conflicts.loc[cons['in'].values, 'nbefore'] += 1
-                    conflicts.loc[cons['in'].values, [f'in{h}' for h in range(hadd)]] = conflicts.loc[cons['in'].values, [f'in{h}' for h in range(hadd)]] | (cons.loc[cons['in'], [f'pos{h}' for h in range(hadd)]] >= 0)
-                    conflicts.loc[cons[f'pos{hadd}'].values >= 0, 'done'] = True
-                    conflicts.loc[conflicts['done'] & cons['in'].values, 'fixable'] = False # The ordering in the previous haplotypes prevents a switch
-                    conflicts.loc[conflicts['done'] & (cons[f'pos{hadd}'].values <= conflicts['conpos']), 'fixable'] = False # If the previous position is not the reason for the conflict, we need to fix that position first
-                    conflicts = conflicts[conflicts['fixable']].copy()
-                    conflicts.loc[conflicts['done'] == False, 'cindex'] -= 1
-                conflicts['newpos'] = new_paths.loc[conflicts['cindex'].values, 'pos'].values
-                # Remove conflicts that overlap with a previous conflict
-                conflicts = conflicts[ (conflicts['group'] != conflicts['group'].shift(1)) | (conflicts['newpos'] > conflicts['pos'].shift(1)) ].drop(columns=['conpos','done','fixable'])
-                # Fix the fixable conflicts
-                if len(conflicts) == 0:
+                # For each group find the path/haplotype with the lowest bridge support and remove it
+                rem_dups = duplications[np.isin(duplications['did'], differences.loc[np.isin(differences['group'], rem_groups['group'].values) & (differences['scaf_diff'] == 0), 'did'].values)].copy()
+                if len(rem_dups) == 0:
                     break
                 else:
-                    conflicts.rename(columns={'cindex':'sindex','oindex':'cindex','newpos':'pos_before','pos':'pos_after'}, inplace=True)
-                    conflicts['pos_before'] += conflicts['nbefore']
+                    rem_haps = rem_dups[['group','apid','ahap']].drop_duplicates()
+                    rem_haps.rename(columns={'apid':'pid','ahap':'hap'}, inplace=True)
+                    scaffold_paths, duplications, differences = RemoveDuplicatedHaplotypesWithLowestSupport(scaffold_paths, duplications, rem_haps, bsupp, ploidy)
+#
+        # Remove variants that are identical to other haplotypes except of deletions(missing scaffolds) and distances as long as we are above ploidy haplotypes
+        while True:
+            if len(duplications):
+                groups = duplications.groupby(['group','apid','ahap']).size().groupby(['group']).size().reset_index(name='nhaps')
+                rem_groups = groups[groups['nhaps'] > ploidy].copy()
+            else:
+                rem_groups = []
+            if len(rem_groups) == 0:
+                break
+            else:
+                # For each group find the path/haplotype with the lowest bridge support and remove it
+                rem_dups = duplications[np.isin(duplications['group'], rem_groups['group'].values)].copy()
+                rem_dups['complete'] = (rem_dups['apos'].shift(1) == rem_dups['aprev_pos']) | (rem_dups['aprev_pos'] < 0)
+                rem_dups['complete'] = rem_dups[['did']].merge(rem_dups.groupby(['did'])['complete'].min().reset_index(), on=['did'], how='left')['complete'].values
+                rem_dups = rem_dups[rem_dups['complete']].copy()
+                if len(rem_dups) == 0:
+                    break
+                else:
+                    rem_haps = rem_dups[['group','apid','ahap']].drop_duplicates()
+                    rem_haps.rename(columns={'apid':'pid','ahap':'hap'}, inplace=True)
+                    scaffold_paths, duplications, differences = RemoveDuplicatedHaplotypesWithLowestSupport(scaffold_paths, duplications, rem_haps, bsupp, ploidy)
+#
+    if len(duplications) == 0:
+        group_info = []
+    else:
+        # Merge all groups that do not have more than ploidy haplotypes
+        groups = duplications.groupby(['group','apid','ahap']).size().groupby(['group']).size().reset_index(name='nhaps')
+        groups = groups[groups['nhaps'] <= ploidy].copy()
+        duplications = duplications[np.isin(duplications['group'], groups['group'].values)].copy()
+        # Define insertion order by amount of bridge support (highest support == lowest new haplotype)
+        if len(bsupp):
+            bsupp = bsupp.merge(duplications[['group','apid','ahap']].drop_duplicates().rename(columns={'apid':'pid','ahap':'hap'}), on=['group','pid','hap'], how='inner')
+            bsupp.sort_values(['group','bplace'], ascending=[True,False], inplace=True)
+            for h in range(ploidy):
+                groups[[f'pid{h}',f'hap{h}']] = groups[['group']].merge( bsupp.groupby(['group'])[['pid','hap']].last().reset_index(), on=['group'], how='left')[['pid','hap']].fillna(-1).values.astype(int)
+                bsupp = bsupp[bsupp['group'].shift(-1) == bsupp['group']].copy()
+        # Separate the individual haplotypes and update positions in duplications after removal of deletions
+        haps = duplications[['group','apid','ahap']].drop_duplicates()
+        haps.rename(columns={'apid':'pid','ahap':'hap'}, inplace=True)
+        haps = GetHaplotypes(haps, scaffold_paths, ploidy)
+        haps.sort_values(['group','pid','hap','pos'], inplace=True)
+        haps['new_pos'] = haps.groupby(['group','pid','hap'], sort=False).cumcount()
+        duplications['apos'] = duplications[['apid','apos','ahap']].rename(columns={'apid':'pid','apos':'pos','ahap':'hap'}).merge(haps[['pid','pos','hap','new_pos']], on=['pid','pos','hap'], how='left')['new_pos'].values
+        duplications['bpos'] = duplications[['bpid','bpos','bhap']].rename(columns={'bpid':'pid','bpos':'pos','bhap':'hap'}).merge(haps[['pid','pos','hap','new_pos']], on=['pid','pos','hap'], how='left')['new_pos'].values
+        duplications.drop(columns=['samedir','aprev_pos','adist','bprev_pos','bdist','scaf_diff','dist_diff'], inplace=True)
+        haps['pos'] = haps['new_pos']
+        haps.drop(columns={'new_pos'}, inplace=True)
+        # Create new merged paths with most supported haplotype (so far only with the positions in haps)
+        new_paths = groups[['group','pid0','hap0']].rename(columns={'pid0':'pid','hap0':'hap'})
+        new_paths = new_paths.merge(haps[['pid','hap','pos']], on=['pid','hap'], how='left')
+        new_paths.drop(columns=['hap'], inplace=True)
+        plen = new_paths.groupby(['group'], sort=False).size().values
+        new_paths['pid'] = np.repeat( np.arange(len(plen)) + scaffold_paths['pid'].max() + 1, plen )
+        new_paths['pos0'] = new_paths['pos']
+        for hadd in range(1, ploidy):
+            new_paths[f'pos{hadd}'] = -1 # fill everything by default as a deletion and later replace the duplicated scaffolds with the correct position
+            for hcomp in range(hadd):
+                # Get all duplications relevant for this combination
+                dups = groups[['group',f'pid{hcomp}',f'hap{hcomp}',f'pid{hadd}',f'hap{hadd}']].rename(columns={f'pid{hcomp}':'apid',f'hap{hcomp}':'ahap',f'pid{hadd}':'bpid',f'hap{hadd}':'bhap'}).merge( duplications, on=['group','apid','ahap','bpid','bhap'], how='left' )
+                dups.drop(columns=['apid','ahap','bpid','bhap','did'], inplace=True)
+                # Assing duplications to the place they belong (they might be different for different hcomp, but then we just take the last. For the polyploid case a better algorithm would be helpful, but the most important is that we do not introduce bugs, because a non-optimal alignment for the merging only increases path size, but no errors)
+                new_paths[f'pos{hadd}'] = new_paths[['group',f'pos{hcomp}']].rename(columns={f'pos{hcomp}':'apos'}).merge(dups, on=['group','apos'], how='left')['bpos'].fillna(-1).values.astype(int)
+            # If the order of the added positions is inverted, see if we can fix it
+            while True:
+                # Find conflicts
+                new_paths['posmax'] =  new_paths.groupby(['group'])[f'pos{hadd}'].cummax()
+                new_paths['conflict'] = (new_paths['posmax'] > new_paths[f'pos{hadd}']) & (0 <= new_paths[f'pos{hadd}'])
+                if np.sum(new_paths['conflict']) == 0:
+                    break
+                else:
+                    # Check if we can fix the problem
+                    conflicts = new_paths.loc[new_paths['conflict'], ['group','pos',f'pos{hadd}']].rename(columns={f'pos{hadd}':'conpos'})
+                    conflicts['oindex'] = conflicts.index.values
+                    conflicts['cindex'] = conflicts.index.values-1
+                    conflicts['nbefore'] = 0
                     conflicts[[f'in{h}' for h in range(hadd)]] = new_paths.loc[new_paths['conflict'], [f'pos{h}' for h in range(hadd)]].values >= 0
-                    while len(conflicts):
+                    conflicts['done'] = False
+                    conflicts['fixable'] = True
+                    while np.sum(conflicts['done'] == False):
                         cons = new_paths.loc[conflicts['cindex'].values].copy()
                         cons['in'] = ((cons[[f'pos{h}' for h in range(hadd)]] >= 0) & (conflicts[[f'in{h}' for h in range(hadd)]].values)).any(axis=1)
-                        new_paths.loc[conflicts.loc[cons['in'].values, 'cindex'].values, 'pos'] = conflicts.loc[cons['in'].values, 'pos_before'].values
-                        conflicts.loc[cons['in'].values, 'pos_before'] -= 1
-                        new_paths.loc[conflicts.loc[cons['in'].values == False, 'cindex'].values, 'pos'] = conflicts.loc[cons['in'].values == False, 'pos_after'].values
-                        conflicts.loc[cons['in'].values == False, 'pos_before'] -= 1
-                        conflicts = conflicts[conflicts['cindex'] > conflicts['sindex']].copy()
-                        conflicts['cindex'] -= 1
-                    new_paths.sort_values(['group','pos'], inplace=True)
-                    new_paths.reset_index(drop=True, inplace=True)
-        # Remove the new positions that cannot be fixed
-        while True:
-            # Find conflicts (this time equal positions are also conflicts, they cannot be fixed by swapping, thus were ignored before)
-            new_paths['posmax'] = new_paths.groupby(['group'])[f'pos{hadd}'].cummax().shift(1, fill_value=-1)
-            new_paths.loc[new_paths['group'] != new_paths['group'].shift(1), 'posmax'] = -1
-            new_paths['conflict'] = (new_paths['posmax'] >= new_paths[f'pos{hadd}']) & (0 <= new_paths[f'pos{hadd}'])
-            if np.sum(new_paths['conflict']) == 0:
-                break
-            else:
-                # Remove first conflict in each group
-                new_paths.loc[new_paths[['group', 'pos']].merge( new_paths.loc[new_paths['conflict'], ['group','pos']].groupby(['group'], sort=False).first().reset_index(), on=['group', 'pos'], how='left', indicator=True)['_merge'].values == "both", f'pos{hadd}'] = -1
-        new_paths.drop(columns=['conflict'], inplace=True)
-        # Add missing positions
-        new_paths['posmax'] = new_paths.groupby(['group'])[f'pos{hadd}'].cummax().shift(1, fill_value=-1)
-        new_paths.loc[new_paths['group'] != new_paths['group'].shift(1), 'posmax'] = -1
-        new_paths['index'] = new_paths.index.values
-        new_paths['repeat'] = new_paths[f'pos{hadd}'] - new_paths['posmax']
-        new_paths.loc[new_paths[f'pos{hadd}'] < 0, 'repeat'] = 1
-        new_paths.drop(columns=['posmax'], inplace=True)
-        new_paths = new_paths.loc[np.repeat(new_paths.index.values, new_paths['repeat'].values)].copy()
-        new_paths['ipos'] = new_paths.groupby(['index'], sort=False).cumcount()+1
-        new_paths.loc[new_paths['ipos'] != new_paths['repeat'], [f'pos{h}' for h in range(hadd)]] = -1
-        new_paths[f'pos{hadd}'] += new_paths['ipos'] - new_paths['repeat']
-        new_paths['pos'] = new_paths.groupby(['group'], sort=False).cumcount()
-        new_paths.reset_index(drop=True, inplace=True)
-        new_paths.drop(columns=['index','repeat','ipos'], inplace=True)
-    # Compress path by filling deletions
-    while True:
-        shifts = new_paths.loc[ ((new_paths[[f'pos{h}' for h in range(ploidy)]].values < 0) | (new_paths[[f'pos{h}' for h in range(ploidy)]].shift(1).values < 0)).all(axis=1) ].drop(columns=['pid','pos'])
-        if len(shifts) == 0:
-            break
-        else:
-            shifts['index'] = shifts.index.values
-            shifts = shifts.groupby(['group'], sort=False).first() # We can only take the first in each group, because otherwise we might block the optimal solution
-            shifts['new_index'] = shifts['index']-2
+                        conflicts.loc[cons['in'].values, 'nbefore'] += 1
+                        conflicts.loc[cons['in'].values, [f'in{h}' for h in range(hadd)]] = conflicts.loc[cons['in'].values, [f'in{h}' for h in range(hadd)]] | (cons.loc[cons['in'], [f'pos{h}' for h in range(hadd)]] >= 0)
+                        conflicts.loc[cons[f'pos{hadd}'].values >= 0, 'done'] = True
+                        conflicts.loc[conflicts['done'] & cons['in'].values, 'fixable'] = False # The ordering in the previous haplotypes prevents a switch
+                        conflicts.loc[conflicts['done'] & (cons[f'pos{hadd}'].values <= conflicts['conpos']), 'fixable'] = False # If the previous position is not the reason for the conflict, we need to fix that position first
+                        conflicts = conflicts[conflicts['fixable']].copy()
+                        conflicts.loc[conflicts['done'] == False, 'cindex'] -= 1
+                    conflicts['newpos'] = new_paths.loc[conflicts['cindex'].values, 'pos'].values
+                    # Remove conflicts that overlap with a previous conflict
+                    conflicts = conflicts[ (conflicts['group'] != conflicts['group'].shift(1)) | (conflicts['newpos'] > conflicts['pos'].shift(1)) ].drop(columns=['conpos','done','fixable'])
+                    # Fix the fixable conflicts
+                    if len(conflicts) == 0:
+                        break
+                    else:
+                        conflicts.rename(columns={'cindex':'sindex','oindex':'cindex','newpos':'pos_before','pos':'pos_after'}, inplace=True)
+                        conflicts['pos_before'] += conflicts['nbefore']
+                        conflicts[[f'in{h}' for h in range(hadd)]] = new_paths.loc[new_paths['conflict'], [f'pos{h}' for h in range(hadd)]].values >= 0
+                        while len(conflicts):
+                            cons = new_paths.loc[conflicts['cindex'].values].copy()
+                            cons['in'] = ((cons[[f'pos{h}' for h in range(hadd)]] >= 0) & (conflicts[[f'in{h}' for h in range(hadd)]].values)).any(axis=1)
+                            new_paths.loc[conflicts.loc[cons['in'].values, 'cindex'].values, 'pos'] = conflicts.loc[cons['in'].values, 'pos_before'].values
+                            conflicts.loc[cons['in'].values, 'pos_before'] -= 1
+                            new_paths.loc[conflicts.loc[cons['in'].values == False, 'cindex'].values, 'pos'] = conflicts.loc[cons['in'].values == False, 'pos_after'].values
+                            conflicts.loc[cons['in'].values == False, 'pos_before'] -= 1
+                            conflicts = conflicts[conflicts['cindex'] > conflicts['sindex']].copy()
+                            conflicts['cindex'] -= 1
+                        new_paths.sort_values(['group','pos'], inplace=True)
+                        new_paths.reset_index(drop=True, inplace=True)
+            # Remove the new positions that cannot be fixed
             while True:
-                further = ((new_paths.loc[shifts['index'].values, [f'pos{h}' for h in range(ploidy)]].values < 0) | (new_paths.loc[shifts['new_index'].values, [f'pos{h}' for h in range(ploidy)]].values < 0)).all(axis=1)
-                if np.sum(further) == 0: # We do not need to worry to go into another group, because the first position in every group must be a duplication for all included haplotypes, thus blocks continuation
+                # Find conflicts (this time equal positions are also conflicts, they cannot be fixed by swapping, thus were ignored before)
+                new_paths['posmax'] = new_paths.groupby(['group'])[f'pos{hadd}'].cummax().shift(1, fill_value=-1)
+                new_paths.loc[new_paths['group'] != new_paths['group'].shift(1), 'posmax'] = -1
+                new_paths['conflict'] = (new_paths['posmax'] >= new_paths[f'pos{hadd}']) & (0 <= new_paths[f'pos{hadd}'])
+                if np.sum(new_paths['conflict']) == 0:
                     break
                 else:
-                    shifts.loc[further, 'new_index'] -= 1
-            shifts['new_index'] += 1
-            for h in range(ploidy):
-                cur_shifts = new_paths.loc[shifts['index'].values, f'pos{h}'].values >= 0
-                new_paths.loc[shifts.loc[cur_shifts, 'new_index'].values, f'pos{h}'] = new_paths.loc[shifts.loc[cur_shifts, 'index'].values, f'pos{h}'].values
-            new_paths.drop(shifts['index'].values, inplace=True)
+                    # Remove first conflict in each group
+                    new_paths.loc[new_paths[['group', 'pos']].merge( new_paths.loc[new_paths['conflict'], ['group','pos']].groupby(['group'], sort=False).first().reset_index(), on=['group', 'pos'], how='left', indicator=True)['_merge'].values == "both", f'pos{hadd}'] = -1
+            new_paths.drop(columns=['conflict'], inplace=True)
+            # Add missing positions
+            new_paths['posmax'] = new_paths.groupby(['group'])[f'pos{hadd}'].cummax().shift(1, fill_value=-1)
+            new_paths.loc[new_paths['group'] != new_paths['group'].shift(1), 'posmax'] = -1
+            new_paths['index'] = new_paths.index.values
+            new_paths['repeat'] = new_paths[f'pos{hadd}'] - new_paths['posmax']
+            new_paths.loc[new_paths[f'pos{hadd}'] < 0, 'repeat'] = 1
+            new_paths.drop(columns=['posmax'], inplace=True)
+            new_paths = new_paths.loc[np.repeat(new_paths.index.values, new_paths['repeat'].values)].copy()
+            new_paths['ipos'] = new_paths.groupby(['index'], sort=False).cumcount()+1
+            new_paths.loc[new_paths['ipos'] != new_paths['repeat'], [f'pos{h}' for h in range(hadd)]] = -1
+            new_paths[f'pos{hadd}'] += new_paths['ipos'] - new_paths['repeat']
             new_paths['pos'] = new_paths.groupby(['group'], sort=False).cumcount()
             new_paths.reset_index(drop=True, inplace=True)
-    # Insert scaffold information into new path
-    new_paths[[f'{n}{h}' for h in range(ploidy) for n in ['pid','hap']]] = new_paths[['group']].merge(groups.drop(columns=['nhaps']), on=['group'], how='left')[[f'{n}{h}' for h in range(ploidy) for n in ['pid','hap']]].values
-    group_info = new_paths.copy()
-    for h in range(ploidy):
-        new_paths[[f'phase{h}',f'scaf{h}',f'strand{h}',f'dist{h}']] = new_paths[[f'pid{h}',f'hap{h}',f'pos{h}']].rename(columns={f'{n}{h}':n for n in ['pid','hap','pos']}).merge(haps.drop(columns=['group']), on=['pid','hap','pos'], how='left')[['phase','scaf','strand','dist']].values
-        while np.sum(np.isnan(new_paths[f'phase{h}'])):
-            new_paths[f'phase{h}'] = np.where(np.isnan(new_paths[f'phase{h}']), new_paths[f'phase{h}'].shift(-1), new_paths[f'phase{h}'])
-        new_paths[[f'phase{h}']] = new_paths[[f'phase{h}']].astype(int)
-        new_paths[[f'scaf{h}']] = new_paths[[f'scaf{h}']].fillna(-1).astype(int)
-        new_paths[[f'strand{h}']] = new_paths[[f'strand{h}']].fillna('')
-        new_paths[[f'dist{h}']] = new_paths[[f'dist{h}']].fillna(0).astype(int)
-        new_paths.drop(columns=[f'pos{h}',f'pid{h}',f'hap{h}'], inplace=True)
-    new_paths.drop(columns=['group'], inplace=True)
-    new_paths = TrimAlternativesConsistentWithMain(new_paths, ploidy)
-    # Remove the old version of the merged haplotypes from scaffold_path and add the new merged path
-    haps = pd.concat([groups[[f'pid{h}',f'hap{h}']].rename(columns={f'pid{h}':'pid',f'hap{h}':'hap'}) for h in range(ploidy)], ignore_index=True)
-    for h in range(ploidy-1, -1, -1): # We need to go through in the inverse order, because we still need the main for the alternatives
-        rem_pid = np.isin(scaffold_paths['pid'], haps.loc[haps['hap'] == h, 'pid'].values)
-        if h==0:
-            scaffold_paths = RemoveMainPath(scaffold_paths, rem_pid, ploidy)
-        else:
-            scaffold_paths = RemoveHaplotype(scaffold_paths, rem_pid, h)
-    scaffold_paths = pd.concat([scaffold_paths, new_paths], ignore_index=True)
-    # Clean up at the end
-    scaffold_paths = ShiftHaplotypesToLowestPossible(scaffold_paths, ploidy) # Do not do this earlier because it invalides haplotypes stored in duplications
-    scaffold_paths = CompressPaths(scaffold_paths, ploidy)
+            new_paths.drop(columns=['index','repeat','ipos'], inplace=True)
+        # Compress path by filling deletions
+        while True:
+            shifts = new_paths.loc[ ((new_paths[[f'pos{h}' for h in range(ploidy)]].values < 0) | (new_paths[[f'pos{h}' for h in range(ploidy)]].shift(1).values < 0)).all(axis=1) ].drop(columns=['pid','pos'])
+            if len(shifts) == 0:
+                break
+            else:
+                shifts['index'] = shifts.index.values
+                shifts = shifts.groupby(['group'], sort=False).first() # We can only take the first in each group, because otherwise we might block the optimal solution
+                shifts['new_index'] = shifts['index']-2
+                while True:
+                    further = ((new_paths.loc[shifts['index'].values, [f'pos{h}' for h in range(ploidy)]].values < 0) | (new_paths.loc[shifts['new_index'].values, [f'pos{h}' for h in range(ploidy)]].values < 0)).all(axis=1)
+                    if np.sum(further) == 0: # We do not need to worry to go into another group, because the first position in every group must be a duplication for all included haplotypes, thus blocks continuation
+                        break
+                    else:
+                        shifts.loc[further, 'new_index'] -= 1
+                shifts['new_index'] += 1
+                for h in range(ploidy):
+                    cur_shifts = new_paths.loc[shifts['index'].values, f'pos{h}'].values >= 0
+                    new_paths.loc[shifts.loc[cur_shifts, 'new_index'].values, f'pos{h}'] = new_paths.loc[shifts.loc[cur_shifts, 'index'].values, f'pos{h}'].values
+                new_paths.drop(shifts['index'].values, inplace=True)
+                new_paths['pos'] = new_paths.groupby(['group'], sort=False).cumcount()
+                new_paths.reset_index(drop=True, inplace=True)
+        # Insert scaffold information into new path
+        new_paths[[f'{n}{h}' for h in range(ploidy) for n in ['pid','hap']]] = new_paths[['group']].merge(groups.drop(columns=['nhaps']), on=['group'], how='left')[[f'{n}{h}' for h in range(ploidy) for n in ['pid','hap']]].values
+        group_info = new_paths.copy()
+        for h in range(ploidy):
+            new_paths[[f'phase{h}',f'scaf{h}',f'strand{h}',f'dist{h}']] = new_paths[[f'pid{h}',f'hap{h}',f'pos{h}']].rename(columns={f'{n}{h}':n for n in ['pid','hap','pos']}).merge(haps.drop(columns=['group']), on=['pid','hap','pos'], how='left')[['phase','scaf','strand','dist']].values
+            while np.sum(np.isnan(new_paths[f'phase{h}'])):
+                new_paths[f'phase{h}'] = np.where(np.isnan(new_paths[f'phase{h}']), new_paths[f'phase{h}'].shift(-1), new_paths[f'phase{h}'])
+            new_paths[[f'phase{h}']] = new_paths[[f'phase{h}']].astype(int)
+            new_paths[[f'scaf{h}']] = new_paths[[f'scaf{h}']].fillna(-1).astype(int)
+            new_paths[[f'strand{h}']] = new_paths[[f'strand{h}']].fillna('')
+            new_paths[[f'dist{h}']] = new_paths[[f'dist{h}']].fillna(0).astype(int)
+            new_paths.drop(columns=[f'pos{h}',f'pid{h}',f'hap{h}'], inplace=True)
+        new_paths.drop(columns=['group'], inplace=True)
+        new_paths = TrimAlternativesConsistentWithMain(new_paths, ploidy)
+        # Remove the old version of the merged haplotypes from scaffold_path and add the new merged path
+        haps = pd.concat([groups[[f'pid{h}',f'hap{h}']].rename(columns={f'pid{h}':'pid',f'hap{h}':'hap'}) for h in range(ploidy)], ignore_index=True)
+        for h in range(ploidy-1, -1, -1): # We need to go through in the inverse order, because we still need the main for the alternatives
+            rem_pid = np.isin(scaffold_paths['pid'], haps.loc[haps['hap'] == h, 'pid'].values)
+            if h==0:
+                scaffold_paths = RemoveMainPath(scaffold_paths, rem_pid, ploidy)
+            else:
+                scaffold_paths = RemoveHaplotype(scaffold_paths, rem_pid, h)
+        scaffold_paths = pd.concat([scaffold_paths, new_paths], ignore_index=True)
+        # Clean up at the end
+        scaffold_paths = ShiftHaplotypesToLowestPossible(scaffold_paths, ploidy) # Do not do this earlier because it invalides haplotypes stored in duplications
+        scaffold_paths = CompressPaths(scaffold_paths, ploidy)
 #
     if len(ends_in):
-        group_info = group_info[['pid']+[f'pid{h}' for h in range(ploidy)]].drop_duplicates()
+        if len(group_info):
+            group_info = group_info[['pid']+[f'pid{h}' for h in range(ploidy)]].drop_duplicates()
         return scaffold_paths, group_info
     else:
         return scaffold_paths
@@ -3271,62 +4864,65 @@ def PlacePathAInPathB(duplications, scaffold_paths, scaffold_graph, scaf_bridges
     test_paths = test_paths[(test_paths['min'] <= test_paths['pos']) & (test_paths['pos'] <= test_paths['max'])].drop(columns=['min','max'])
     test_paths['pos'] = test_paths.groupby(['pid'], sort=False).cumcount()
     ends = pd.concat([ includes[['tpid1','group']].rename(columns={'tpid1':'pid'}), includes[['tpid2','group']].rename(columns={'tpid2':'pid'}) ], ignore_index=True)
-    test_paths, group_info = MergeHaplotypes(test_paths, scaf_bridges, ploidy, ends)
-    pids = np.unique(test_paths['pid'])
-    includes['success'] = (np.isin(includes['tpid1'], pids) == False) & (np.isin(includes['tpid2'], pids) == False) # If we still have the original pids they could not be merged
-    group_info['new_pid'] = group_info[[f'pid{h}' for h in range(ploidy)]].max(axis=1) # We get here tpid2 from includes, which is the pid we want to assign to the now merged middle part
-    test_paths['new_pid'] = test_paths[['pid']].merge(group_info[['pid','new_pid']], on=['pid'], how='left')['new_pid'].values
-    test_paths = test_paths[np.isnan(test_paths['new_pid']) == False].copy()
-    test_paths['pid'] = test_paths['new_pid'].astype(int)
-    test_paths.drop(columns=['new_pid'], inplace=True)
-    # Add part of path b before and after the merged region
-    test_paths = [test_paths]
-    spaths = scaffold_paths.merge(includes.loc[includes['success'] & (includes['min'] > 0), ['bpid','min','tpid1']].rename(columns={'bpid':'pid'}), on=['pid'], how='inner')
-    spaths = spaths[spaths['pos'] <= spaths['min']].copy() # We need an overlap of 1 for the combining function to work properly
-    spaths['pid'] = spaths['tpid1']
-    spaths.drop(columns=['min','tpid1'], inplace=True)
-    test_paths.append(spaths)
-    epaths = scaffold_paths.merge(includes.loc[includes['success'] & (includes['max'] < includes['blen']), ['bpid','max','tpid3']].rename(columns={'bpid':'pid'}), on=['pid'], how='inner')
-    epaths = epaths[epaths['pos'] >= epaths['max']].copy() # We need an overlap of 1 for the combining function to work properly
-    epaths['pid'] = epaths['tpid3']
-    epaths.drop(columns=['max','tpid3'], inplace=True)
-    test_paths.append(epaths)
-    test_paths = pd.concat(test_paths, ignore_index=True)
-    test_paths.sort_values(['pid','pos'], inplace=True)
-    test_paths.loc[test_paths['pos'] == 0, [f'dist{h}' for h in range(ploidy)]] = 0
-    test_paths = TrimAlternativesConsistentWithMain(test_paths, ploidy)
-    # Prepare additional information necessary for combining the individual parts in test_paths
-    meta_parts = [ includes.loc[includes['success'] & (includes['min'] > 0), ['tpid1','tpid1']] ]
-    meta_parts[-1].columns = ['pid','meta']
-    meta_parts[-1]['pos'] = 0
-    meta_parts.append( includes.loc[includes['success'], ['tpid2','tpid1']].rename(columns={'tpid2':'pid','tpid1':'meta'}) )
-    meta_parts[-1]['pos'] = 1
-    meta_parts.append( includes.loc[includes['success'] & (includes['max'] < includes['blen']), ['tpid3','tpid1']].rename(columns={'tpid3':'pid','tpid1':'meta'}) )
-    meta_parts[-1]['pos'] = 2
-    meta_parts = pd.concat(meta_parts, ignore_index=True)
-    meta_parts.sort_values(['pid'], inplace=True)
-    meta_parts.index = meta_parts['pid'].values
-    meta_parts = meta_parts[(meta_parts['meta'] == meta_parts['meta'].shift(-1)) | (meta_parts['meta'] == meta_parts['meta'].shift(1))].copy() # If we do not have anything to combine we do not need to add it to meta_parts
-    meta_parts['pos'] = meta_parts.groupby(['meta']).cumcount()
-    meta_parts['reverse'] = False
-    conns = meta_parts.drop(columns=['pos','reverse'])
-    conns.rename(columns={'pid':'apid'}, inplace=True)
-    conns['aside'] = 'r'
-    conns['bpid'] = conns['apid'].shift(-1, fill_value=0)
-    conns = conns[conns['meta'] == conns['meta'].shift(-1)].copy()
-    conns['bside'] = 'l'
-    conns.drop(columns=['meta'], inplace=True)
-    conns = pd.concat([ conns, conns.rename(columns={'apid':'bpid','aside':'bside','bpid':'apid','bside':'aside'})], ignore_index=True)
-    conns['aoverlap'] = 1
-    conns['boverlap'] = 1
-    scaf_len = test_paths.groupby(['pid'])['pos'].max().reset_index()
-    test_paths = CombinePathAccordingToMetaParts(test_paths, meta_parts, conns, scaffold_graph, scaf_bridges, scaf_len, ploidy)
-    pids = np.unique(test_paths['pid'])
-    includes['success'] = (np.isin(includes[['tpid1','tpid2','tpid3']], pids).sum(axis=1) == 1)
-    test_paths = test_paths.merge(pd.concat([ includes.loc[includes['success'], [f'tpid{i}','tpid3']].rename(columns={f'tpid{i}':'pid'}) for i in [1,2] ], ignore_index=True), on=['pid'], how='inner')
-    test_paths['pid'] = test_paths['tpid3']
-    test_paths.drop(columns=['tpid3'], inplace=True)
-    test_paths.sort_values(['pid','pos'], inplace=True)
+    if len(ends) == 0:
+        includes['success'] = False
+    else:
+        test_paths, group_info = MergeHaplotypes(test_paths, scaf_bridges, ploidy, ends)
+        pids = np.unique(test_paths['pid'])
+        includes['success'] = (np.isin(includes['tpid1'], pids) == False) & (np.isin(includes['tpid2'], pids) == False) # If we still have the original pids they could not be merged
+        group_info['new_pid'] = group_info[[f'pid{h}' for h in range(ploidy)]].max(axis=1) # We get here tpid2 from includes, which is the pid we want to assign to the now merged middle part
+        test_paths['new_pid'] = test_paths[['pid']].merge(group_info[['pid','new_pid']], on=['pid'], how='left')['new_pid'].values
+        test_paths = test_paths[np.isnan(test_paths['new_pid']) == False].copy()
+        test_paths['pid'] = test_paths['new_pid'].astype(int)
+        test_paths.drop(columns=['new_pid'], inplace=True)
+        # Add part of path b before and after the merged region
+        test_paths = [test_paths]
+        spaths = scaffold_paths.merge(includes.loc[includes['success'] & (includes['min'] > 0), ['bpid','min','tpid1']].rename(columns={'bpid':'pid'}), on=['pid'], how='inner')
+        spaths = spaths[spaths['pos'] <= spaths['min']].copy() # We need an overlap of 1 for the combining function to work properly
+        spaths['pid'] = spaths['tpid1']
+        spaths.drop(columns=['min','tpid1'], inplace=True)
+        test_paths.append(spaths)
+        epaths = scaffold_paths.merge(includes.loc[includes['success'] & (includes['max'] < includes['blen']), ['bpid','max','tpid3']].rename(columns={'bpid':'pid'}), on=['pid'], how='inner')
+        epaths = epaths[epaths['pos'] >= epaths['max']].copy() # We need an overlap of 1 for the combining function to work properly
+        epaths['pid'] = epaths['tpid3']
+        epaths.drop(columns=['max','tpid3'], inplace=True)
+        test_paths.append(epaths)
+        test_paths = pd.concat(test_paths, ignore_index=True)
+        test_paths.sort_values(['pid','pos'], inplace=True)
+        test_paths.loc[test_paths['pos'] == 0, [f'dist{h}' for h in range(ploidy)]] = 0
+        test_paths = TrimAlternativesConsistentWithMain(test_paths, ploidy)
+        # Prepare additional information necessary for combining the individual parts in test_paths
+        meta_parts = [ includes.loc[includes['success'] & (includes['min'] > 0), ['tpid1','tpid1']] ]
+        meta_parts[-1].columns = ['pid','meta']
+        meta_parts[-1]['pos'] = 0
+        meta_parts.append( includes.loc[includes['success'], ['tpid2','tpid1']].rename(columns={'tpid2':'pid','tpid1':'meta'}) )
+        meta_parts[-1]['pos'] = 1
+        meta_parts.append( includes.loc[includes['success'] & (includes['max'] < includes['blen']), ['tpid3','tpid1']].rename(columns={'tpid3':'pid','tpid1':'meta'}) )
+        meta_parts[-1]['pos'] = 2
+        meta_parts = pd.concat(meta_parts, ignore_index=True)
+        meta_parts.sort_values(['pid'], inplace=True)
+        meta_parts.index = meta_parts['pid'].values
+        meta_parts = meta_parts[(meta_parts['meta'] == meta_parts['meta'].shift(-1)) | (meta_parts['meta'] == meta_parts['meta'].shift(1))].copy() # If we do not have anything to combine we do not need to add it to meta_parts
+        meta_parts['pos'] = meta_parts.groupby(['meta']).cumcount()
+        meta_parts['reverse'] = False
+        conns = meta_parts.drop(columns=['pos','reverse'])
+        conns.rename(columns={'pid':'apid'}, inplace=True)
+        conns['aside'] = 'r'
+        conns['bpid'] = conns['apid'].shift(-1, fill_value=0)
+        conns = conns[conns['meta'] == conns['meta'].shift(-1)].copy()
+        conns['bside'] = 'l'
+        conns.drop(columns=['meta'], inplace=True)
+        conns = pd.concat([ conns, conns.rename(columns={'apid':'bpid','aside':'bside','bpid':'apid','bside':'aside'})], ignore_index=True)
+        conns['aoverlap'] = 1
+        conns['boverlap'] = 1
+        scaf_len = test_paths.groupby(['pid'])['pos'].max().reset_index()
+        test_paths = CombinePathAccordingToMetaParts(test_paths, meta_parts, conns, scaffold_graph, scaf_bridges, scaf_len, ploidy)
+        pids = np.unique(test_paths['pid'])
+        includes['success'] = (np.isin(includes[['tpid1','tpid2','tpid3']], pids).sum(axis=1) == 1)
+        test_paths = test_paths.merge(pd.concat([ includes.loc[includes['success'], [f'tpid{i}','tpid3']].rename(columns={f'tpid{i}':'pid'}) for i in [1,2] ], ignore_index=True), on=['pid'], how='inner')
+        test_paths['pid'] = test_paths['tpid3']
+        test_paths.drop(columns=['tpid3'], inplace=True)
+        test_paths.sort_values(['pid','pos'], inplace=True)
     includes = includes.loc[includes['success'], ['ldid','rdid','apid','bpid','tpid3']].rename(columns={'tpid3':'tpid'})
 #
     return test_paths, includes
@@ -3395,12 +4991,13 @@ def PlaceUnambigouslyPlaceablePathsAsAlternativeHaplotypes(scaffold_paths, scaff
         includes.sort_values(['bpid'], inplace=True)
         includes = includes[includes['bpid'] != includes['bpid'].shift(1)].copy()
         # Include those scaffolds
-        test_paths = test_paths.merge(includes[['tpid','bpid']].rename(columns={'tpid':'pid'}), on=['pid'], how='inner')
-        test_paths['pid'] = test_paths['bpid']
-        test_paths.drop(columns=['bpid'], inplace=True)
-        scaffold_paths = scaffold_paths[np.isin(scaffold_paths['pid'], np.concatenate([includes['apid'].values, includes['bpid'].values])) == False].copy()
-        scaffold_paths = pd.concat([scaffold_paths, test_paths], ignore_index=True)
-        scaffold_paths.sort_values(['pid','pos'], inplace=True)
+        if len(test_paths):
+            test_paths = test_paths.merge(includes[['tpid','bpid']].rename(columns={'tpid':'pid'}), on=['pid'], how='inner')
+            test_paths['pid'] = test_paths['bpid']
+            test_paths.drop(columns=['bpid'], inplace=True)
+            scaffold_paths = scaffold_paths[np.isin(scaffold_paths['pid'], np.concatenate([includes['apid'].values, includes['bpid'].values])) == False].copy()
+            scaffold_paths = pd.concat([scaffold_paths, test_paths], ignore_index=True)
+            scaffold_paths.sort_values(['pid','pos'], inplace=True)
         # Get the not yet used duplications and update them
         duplications = duplications[ duplications.merge(includes[['ldid','rdid']], on=['ldid','rdid'], how='left', indicator=True)['_merge'].values == "left_only"].copy()
         includes = duplications[['apid','bpid']].drop_duplicates()
@@ -3419,6 +5016,31 @@ def GetFullNextPositionInPathB(ends, scaffold_paths, ploidy):
     ends = GetPositionFromPaths(ends, scaffold_paths, ploidy, 'next_dist', 'dist', 'bpid', 'dist_pos', 'bhap')
 #
     return ends
+
+def SetDistanceAtFirstPositionToZero(scaffold_paths, ploidy):
+    scaffold_paths.loc[scaffold_paths['pos'] == 0, [f'dist{h}' for h in range(ploidy)]] = 0
+    # Handle first positions that are not at zero due to deletions in that haplotype
+    del_start = []
+    for h in range(ploidy):
+        del_start.append(scaffold_paths.loc[(scaffold_paths['pos'] == 0) & ( ((scaffold_paths[f'scaf{h}'] < 0) & (scaffold_paths[f'phase{h}'] > 0)) |
+                                                                             ((scaffold_paths['scaf0'] < 0) & (scaffold_paths[f'phase{h}'] < 0)) ), ['pid','pos']].copy())
+        del_start[-1]['hap'] = h
+    del_start = pd.concat(del_start, ignore_index=True)
+    del_start['pos'] = 1
+    while len(del_start):
+        new_start = []
+        for h in range(ploidy):
+            scaffold_paths['hap'] = scaffold_paths[['pid','pos']].merge(del_start[del_start['hap'] == h], on=['pid','pos'], how='left')['hap'].values
+            scaffold_paths.loc[np.isnan(scaffold_paths['hap']) == False, f'dist{h}'] = 0
+            new_start.append( scaffold_paths.loc[(np.isnan(scaffold_paths['hap']) == False) & ( ((scaffold_paths[f'scaf{h}'] < 0) & (scaffold_paths[f'phase{h}'] > 0)) |
+                                                                                                ((scaffold_paths['scaf0'] < 0) & (scaffold_paths[f'phase{h}'] < 0)) ), ['pid','pos','hap']].copy() )
+        scaffold_paths.drop(columns=['hap'], inplace=True)
+        del_start = pd.concat(new_start, ignore_index=True)
+        del_start['pos'] += 1
+    # Clean up    
+    scaffold_paths = TrimAlternativesConsistentWithMain(scaffold_paths, ploidy)
+#
+    return scaffold_paths
 
 def TrimAmbiguousOverlap(scaffold_paths, scaffold_graph, ploidy):
     ends = GetDuplicatedPathEnds(scaffold_paths, ploidy)
@@ -3480,8 +5102,7 @@ def TrimAmbiguousOverlap(scaffold_paths, scaffold_graph, ploidy):
     scaffold_paths.drop(columns=['new_pid','end'], inplace=True)
     scaffold_paths.sort_values(['pid','pos'], inplace=True)
     scaffold_paths['pos'] = scaffold_paths.groupby(['pid']).cumcount()
-    scaffold_paths.loc[scaffold_paths['pos'] == 0, [f'dist{h}' for h in range(ploidy)]] = 0
-    scaffold_paths = TrimAlternativesConsistentWithMain(scaffold_paths, ploidy)
+    scaffold_paths = SetDistanceAtFirstPositionToZero(scaffold_paths, ploidy)
     scaffold_paths = RemoveDuplicates(scaffold_paths, True, ploidy)
 #
     return scaffold_paths
@@ -3519,12 +5140,60 @@ def TrimCircularPaths(scaffold_paths, ploidy):
 #
     return scaffold_paths
 
-def TraverseScaffoldingGraph(scaffolds, scaffold_graph, scaf_bridges, ploidy):
+def CheckScaffoldPathsConsistency(scaffold_paths):
+    # Check that the first positions have zero distance
+    check = scaffold_paths[(scaffold_paths['pos'] == 0) & (scaffold_paths[[col for col in scaffold_paths.columns if col[:4] == "dist"]] != 0).any(axis=1)].copy()
+    if len(check):
+        print("Warning: First distances are not zero.")
+        print(check)
+#
+    # Check that positions are consistent in scaffold_paths
+    inconsistent = scaffold_paths[(scaffold_paths['pos'] < 0) |
+                                  ((scaffold_paths['pos'] == 0) & (scaffold_paths['pid'] == scaffold_paths['pid'].shift(1))) |
+                                  ((scaffold_paths['pos'] > 0) & ((scaffold_paths['pid'] != scaffold_paths['pid'].shift(1)) | (scaffold_paths['pos'] != scaffold_paths['pos'].shift(1)+1)))].copy()
+    if len(inconsistent):
+        print("Warning: Scaffold paths got inconsistent.")
+        print(inconsistent)
+    # Check that we do not have a phase 0, because it cannot be positive/negative as required for a phase
+    inconsistent = scaffold_paths[(scaffold_paths[[col for col in scaffold_paths.columns if col[:5] == "phase"]] == 0).any(axis=1)].copy()
+    if len(inconsistent):
+        print("Warning: Scaffold paths has a zero phase.")
+        print(inconsistent)
+
+def CheckIfScaffoldPathsFollowsValidBridges(scaffold_paths, scaf_bridges, ploidy):
+    test_paths = scaffold_paths.copy()
+    if 'phase0' not in test_paths.columns:
+        test_paths['phase0'] = 1
+    for h in range(1,ploidy):
+        test_paths.loc[test_paths[f'phase{h}'] < 0, [f'scaf{h}',f'strand{h}',f'dist{h}']] = test_paths.loc[test_paths[f'phase{h}'] < 0, ['scaf0','strand0','dist0']].values
+    test_bridges = []
+    for h in range(ploidy):
+        cur = test_paths.loc[(test_paths[f'scaf{h}'] >= 0), ['pid','pos',f'phase{h}',f'scaf{h}',f'strand{h}',f'dist{h}']].copy()
+        cur['from'] = cur[f'scaf{h}'].shift(1, fill_value=-1)
+        cur['from_side'] = np.where(cur[f'strand{h}'].shift(1, fill_value='') == '+', 'r', 'l')
+        cur = cur[(cur['pid'] == cur['pid'].shift(1)) & ((cur[f'phase{h}'] > 0) | (cur[f'phase{h}'].shift(1) > 0))].drop(columns=[f'phase{h}'])
+        cur.rename(columns={f'scaf{h}':'to',f'strand{h}':'to_side',f'dist{h}':'mean_dist'}, inplace=True)
+        cur['to_side'] = np.where(cur['to_side'] == '+', 'l', 'r')
+        cur['hap'] = h
+        test_bridges.append(cur)
+    test_bridges = pd.concat(test_bridges, ignore_index=True)
+    test_bridges = test_bridges.groupby(['pid','pos','from','from_side','to','to_side','mean_dist'])['hap'].min().reset_index()
+    test_bridges = test_bridges[ test_bridges.merge(scaf_bridges[['from','from_side','to','to_side','mean_dist']], on=['from','from_side','to','to_side','mean_dist'], how='left', indicator=True)['_merge'].values == 'left_only' ].copy()
+    if len(test_bridges):
+        print("Scaffold path contains invalid bridges.")
+        print(test_bridges[['pid','pos','hap','from','from_side','to','to_side','mean_dist']])
+
+def TestOutput(scaffold_paths, ploidy):
+    print(scaffold_paths[np.isin(scaffold_paths['pid'], np.unique(scaffold_paths.loc[(np.isin(scaffold_paths[[f'scaf{h}' for h in range(ploidy)]], [18410])).any(axis=1), 'pid'].values))])
+    return
+
+def TraverseScaffoldingGraph(scaffolds, scaffold_graph, scaf_bridges, org_scaf_conns, ploidy, max_loop_units):
     # Get phased haplotypes
     knots = UnravelKnots(scaffold_graph, scaffolds)
     scaffold_paths = FollowUniquePathsThroughGraph(knots, scaffold_graph)
-    # scaffold_paths = AddPathTroughRepeats(scaffold_paths, scaffold_graph)
-    scaffold_paths = AddUntraversedConnectedPaths(scaffold_paths, knots, scaffold_graph)
+    scaffold_paths, handled_scaf_conns = AddPathThroughLoops(scaffold_paths, scaffold_graph, scaf_bridges, org_scaf_conns, ploidy, max_loop_units)
+    scaffold_paths, handled_scaf_conns = AddPathThroughInvertedRepeats(scaffold_paths, handled_scaf_conns, scaffold_graph, scaf_bridges, ploidy)
+    scaffold_paths = AddUntraversedConnectedPaths(scaffold_paths, knots, scaffold_graph, handled_scaf_conns)
     scaffold_paths = AddUnconnectedPaths(scaffold_paths, scaffolds, scaffold_graph)
 #
     # Turn them into full path with ploidy
@@ -3534,12 +5203,12 @@ def TraverseScaffoldingGraph(scaffolds, scaffold_graph, scaf_bridges, ploidy):
         scaffold_paths[f'scaf{h}'] = -1
         scaffold_paths[f'strand{h}'] = ''
         scaffold_paths[f'dist{h}'] = 0
+    CheckIfScaffoldPathsFollowsValidBridges(scaffold_paths, scaf_bridges, ploidy)
+    TestOutput(scaffold_paths, ploidy)
 #
     # Combine paths as much as possible
     print("Start")
     print(len(np.unique(scaffold_paths['pid'].values)))
-    #scaffold_paths = RemoveDuplicates(scaffold_paths, False, ploidy)
-    #print(len(np.unique(scaffold_paths['pid'].values)))
     for i in range(3):
         old_nscaf = 0
         n = 1
@@ -3550,8 +5219,11 @@ def TraverseScaffoldingGraph(scaffolds, scaffold_graph, scaf_bridges, ploidy):
              # First Merge then Combine to not accidentially merge a haplotype, where the other haplotype of the paths is not compatible and thus joining wrong paths
             scaffold_paths = MergeHaplotypes(scaffold_paths, scaf_bridges, ploidy)
             print(len(np.unique(scaffold_paths['pid'].values)))
+            TestOutput(scaffold_paths, ploidy)
             scaffold_paths = CombinePathOnUniqueOverlap(scaffold_paths, scaffold_graph, scaf_bridges, ploidy)
             print(len(np.unique(scaffold_paths['pid'].values)))
+            TestOutput(scaffold_paths, ploidy)
+            CheckIfScaffoldPathsFollowsValidBridges(scaffold_paths, scaf_bridges, ploidy)
         if i==0:
             print("RemoveDuplicates")
             scaffold_paths = RemoveDuplicates(scaffold_paths, True, ploidy)
@@ -3559,13 +5231,285 @@ def TraverseScaffoldingGraph(scaffolds, scaffold_graph, scaf_bridges, ploidy):
             print("PlaceUnambigouslyPlaceables")
             scaffold_paths = PlaceUnambigouslyPlaceablePathsAsAlternativeHaplotypes(scaffold_paths, scaffold_graph, scaf_bridges, ploidy)
         print(len(np.unique(scaffold_paths['pid'].values)))
+        TestOutput(scaffold_paths, ploidy)
+        CheckIfScaffoldPathsFollowsValidBridges(scaffold_paths, scaf_bridges, ploidy)
     print("TrimAmbiguousOverlap")
     scaffold_paths = TrimAmbiguousOverlap(scaffold_paths, scaffold_graph, ploidy)
     print(len(np.unique(scaffold_paths['pid'].values)))
+    TestOutput(scaffold_paths, ploidy)
     print("TrimCircularPaths")
     scaffold_paths = TrimCircularPaths(scaffold_paths, ploidy)
     print(len(np.unique(scaffold_paths['pid'].values)))
+    TestOutput(scaffold_paths, ploidy)
+    CheckScaffoldPathsConsistency(scaffold_paths)
+    CheckIfScaffoldPathsFollowsValidBridges(scaffold_paths, scaf_bridges, ploidy)
 
+    return scaffold_paths
+
+def AssignNewPhases(scaffold_paths, phase_change_in, ploidy):
+    phase_change = phase_change_in.copy()
+    phase_change['new_phase'] = phase_change['from_phase']
+    while True:
+        phase_change['gphase'] = phase_change[['new_phase']].rename(columns={'new_phase':'to_phase'}).merge(phase_change[['to_phase','new_phase']], on=['to_phase'], how='left')['new_phase'].values
+        if np.sum(np.isnan(phase_change['gphase']) == False):
+            phase_change.loc[np.isnan(phase_change['gphase']) == False, 'new_phase'] = phase_change.loc[np.isnan(phase_change['gphase']) == False, 'gphase'].astype(int)
+        else:
+            break
+    phase_change.drop(columns=['from_phase','gphase'], inplace=True)
+    phase_change = pd.concat([phase_change, phase_change*-1], ignore_index=True)
+    for h in range(ploidy):
+        scaffold_paths['new_phase'] = scaffold_paths[[f'phase{h}']].rename(columns={f'phase{h}':'to_phase'}).merge(phase_change, on=['to_phase'], how='left')['new_phase'].values
+        scaffold_paths.loc[np.isnan(scaffold_paths['new_phase']) == False, f'phase{h}'] = scaffold_paths.loc[np.isnan(scaffold_paths['new_phase']) == False, 'new_phase'].astype(int).values
+    scaffold_paths.drop(columns=['new_phase'], inplace=True)
+#
+    return scaffold_paths
+
+def FindNextValidPositionOnBothSidesOfTestConnection(test_conns, scaffold_paths, ploidy):
+    for s1 in ['l','r']:
+        for s2 in ['l','r']:
+            test_conns[f'{s1}{s2}spos'] = test_conns['pos']
+            while True:
+                test_conns = GetPositionFromPaths(test_conns, scaffold_paths, ploidy, f'{s1}{s2}scaf', 'scaf', 'pid', f'{s1}{s2}spos', f'{s1}hap')
+                if np.sum(test_conns[f'{s1}{s2}scaf'] == -1):
+                    test_conns.loc[test_conns[f'{s1}{s2}scaf'] == -1, f'{s1}{s2}spos'] += -1 if s2 == 'l' else 1
+                else:
+                    break
+            # Check if we have another scaffold between the first valid one and the end of the scaffold
+            for d in [-1,+1]:
+                test_conns['test_pos'] = test_conns[f'{s1}{s2}spos'] + d
+                while True:
+                    test_conns = GetPositionFromPaths(test_conns, scaffold_paths, ploidy, 'test', 'scaf', 'pid', 'test_pos', f'{s1}hap')
+                    if np.sum(test_conns['test'] == -1):
+                        test_conns.loc[test_conns['test'] == -1, 'test_pos'] += d
+                    else:
+                        break
+                test_conns.loc[np.isnan(test_conns['test']), f'{s1}{s2}scaf'] = np.nan
+    test_conns[['invalid','lspos','rspos']] = [True,-1,-1]
+    for s1 in ['r','l']:
+        for s2 in ['r','l']:
+            valid = (test_conns[f'l{s1}scaf'] == test_conns[f'r{s2}scaf'])
+            test_conns.loc[valid, 'invalid'] = False
+            test_conns.loc[valid, ['lspos','rspos']] = test_conns.loc[valid, [f'l{s1}spos',f'r{s2}spos']].values
+    test_conns.drop(columns=['llspos','llscaf','test_pos','test','lrspos','lrscaf','rlspos','rlscaf','rrspos','rrscaf'], inplace=True)
+#
+    return test_conns
+
+def PhaseScaffolds(scaffold_paths, scaffold_graph, scaf_bridges, ploidy):
+    ## Set initial phasing by giving every polyploid positions its own phase
+    scaffold_paths['polyploid'] = (scaffold_paths[[f'phase{h}' for h in range(ploidy)]].values > 0).sum(axis=1) > 1
+    scaffold_paths['polyploid'] = scaffold_paths['polyploid'] | (scaffold_paths['polyploid'].shift(1) & (scaffold_paths['pid'] == scaffold_paths['pid'].shift(1)))
+    scaffold_paths['new_phase'] = scaffold_paths['polyploid'] | (scaffold_paths['pid'] != scaffold_paths['pid'].shift(1))
+    scaffold_paths['new_phase'] = scaffold_paths['new_phase'].cumsum() - 1
+    for h in range(ploidy):
+        scaffold_paths[f'phase{h}'] = np.sign(scaffold_paths[f'phase{h}']) * (scaffold_paths['new_phase'] * ploidy + 1 + h)
+    scaffold_paths.drop(columns=['polyploid','new_phase'], inplace=True)
+#
+    ## Combine phases where scaf_bridges leaves only one option
+    # First get all bridges combining phases (ignoring deletions)
+    test_bridges = []
+    for h2 in range(ploidy):
+        cur = scaffold_paths[['pid','pos',f'phase{h2}',f'scaf{h2}',f'strand{h2}',f'dist{h2}']].rename(columns={'pos':'to_pos',f'phase{h2}':'to_phase',f'scaf{h2}':'to',f'strand{h2}':'to_side',f'dist{h2}':'mean_dist'})
+        cur['to_side'] = np.where(cur['to_side'] == '+', 'l', 'r')
+        cur['to_hap'] = h2
+        cur['update'] = True
+        cur['from_phase'] = 0
+        cur['from'] = -1
+        cur['from_side'] = ''
+        cur['from_pos'] = -1
+        s = 1
+        while np.sum(cur['update']):
+            cur['deletion'] = False
+            for h1 in range(ploidy):
+                cur['from_hap'] = h1
+                cur['from_phase'] = np.where(scaffold_paths['pid'] == scaffold_paths['pid'].shift(s), scaffold_paths[f'phase{h1}'].shift(s, fill_value=0), 0)
+                cur['from'] = np.where(cur['from_phase'] > 0, scaffold_paths[f'scaf{h1}'].shift(s, fill_value=-2), np.where(cur['from_phase'] == 0, -2, scaffold_paths['scaf0'].shift(s, fill_value=-2)))
+                cur['from_side'] = np.where(scaffold_paths[f'strand{h1}'].shift(s, fill_value='') == '+', 'r', 'l')
+                cur['from_pos'] = cur['to_pos']-s
+                cur['deletion'] = cur['deletion'] | (cur['from'] == -1)
+                test_bridges.append( cur.loc[cur['update'] & (cur['from_phase'] > 0) & (cur['to_phase'] > 0) & (cur['to'] >= 0) & (cur['from'] >= 0) & (cur['from_phase'] != cur['to_phase']), ['pid','from_pos','from_hap','from_phase','from','from_side','to_pos','to_hap','to_phase','to','to_side','mean_dist']].copy() )
+            s += 1
+            cur['update'] = cur['deletion']
+    test_bridges = pd.concat(test_bridges, ignore_index=True)
+    # Filter to have only valid bridges
+    test_bridges = test_bridges.merge(scaf_bridges[['from','from_side','to','to_side','mean_dist']], on=['from','from_side','to','to_side','mean_dist'], how='inner')
+    test_bridges.sort_values(['pid','from_pos','from_hap','to_pos','to_hap'], inplace=True)
+    # Combine phases without alternatives
+    alt_count = test_bridges.groupby(['pid','from_pos','from_hap'], sort=False).size().values
+    test_bridges['from_alts'] = np.repeat(alt_count, alt_count)
+    test_bridges['to_alts'] = test_bridges[['pid','to_pos','to_hap']].merge(test_bridges.groupby(['pid','to_pos','to_hap']).size().reset_index(name='alts'), on=['pid','to_pos','to_hap'], how='left')['alts'].values
+    test_bridges = test_bridges.loc[(test_bridges['from_alts'] == 1) & (test_bridges['to_alts'] == 1), ['from_phase','to_phase']].copy()
+    scaffold_paths = AssignNewPhases(scaffold_paths, test_bridges, ploidy)
+    # Handle deletions by assigning them to the following phase if that phase cannot connect to an alternative to going through the deletion
+    deletions = []
+    for h in range(ploidy):
+        scaffold_paths['deletion'] = np.where(scaffold_paths[f'phase{h}'] > 0, scaffold_paths[f'scaf{h}'], scaffold_paths['scaf0']) < 0
+        scaffold_paths['add'] = (scaffold_paths['deletion'] == False) & (scaffold_paths[f'phase{h}'] > 0)
+        s = 1
+        while True:
+            scaffold_paths['add'] = scaffold_paths['add'] & scaffold_paths['deletion'].shift(s) & (scaffold_paths['pid'] == scaffold_paths['pid'].shift(s))
+            scaffold_paths['from_phase'] = np.abs(scaffold_paths[f'phase{h}'].shift(s, fill_value=0)) # We need the phase of the deletion later, not the one of the checked connection, since we are looking for no valid connections
+            if np.sum(scaffold_paths['add']):
+                for h2 in range(ploidy):
+                    if h2 != h:
+                        for s2 in range(1,s+1):
+                            scaffold_paths['from'] = scaffold_paths[f'scaf{h2}'].shift(s2, fill_value=-1)
+                            scaffold_paths['from_side'] = scaffold_paths[f'strand{h2}'].shift(s2, fill_value='')
+                            deletions.append( scaffold_paths.loc[scaffold_paths['add'] & (scaffold_paths[f'phase{h2}'].shift(s2) > 0) & (scaffold_paths['from'] >= 0), ['pid','pos','from_phase','from','from_side',f'phase{h}',f'scaf{h}',f'strand{h}',f'dist{h}']].rename(columns={f'phase{h}':'to_phase',f'scaf{h}':'to',f'strand{h}':'to_side',f'dist{h}':'mean_dist'}) )
+                s += 1
+            else:
+                break
+    scaffold_paths.drop(columns=['deletion','add','from_phase','from','from_side'], inplace=True)
+    deletions = pd.concat(deletions, ignore_index=True)
+    deletions['from_side'] = np.where(deletions['from_side'] == '+', 'r', 'l')
+    deletions['to_side'] = np.where(deletions['to_side'] == '+', 'l', 'r')
+    deletions['valid'] = deletions[['from','from_side','to','to_side','mean_dist']].merge(scaf_bridges[['from','from_side','to','to_side','mean_dist']], on=['from','from_side','to','to_side','mean_dist'], how='left', indicator=True)['_merge'].values == "both"
+    deletions.sort_values(['pid','pos','from_phase'], inplace=True)
+    valid = deletions.groupby(['pid','pos','from_phase'], sort=False)['valid'].agg(['max','size'])
+    deletions['valid'] = np.repeat(valid['max'].values, valid['size'].values)
+    deletions = deletions.loc[deletions['valid'] == False, ['from_phase','to_phase']].drop_duplicates()
+    deletions.rename(columns={'from_phase':'to_phase','to_phase':'from_phase'}, inplace=True) # We need to assign 'to_phase' to 'from_phase', because from_phase is unique, but to_phase not necessarily
+    scaffold_paths = AssignNewPhases(scaffold_paths, deletions, ploidy)
+    # Combine adjacent deletions if the previous phase has no connection into the deletion (to a position of the deletion that is not the first)
+    deletions = []
+    for h in range(ploidy):
+        scaffold_paths['deletion'] = np.where(scaffold_paths[f'phase{h}'] > 0, scaffold_paths[f'scaf{h}'], scaffold_paths['scaf0']) < 0
+        scaffold_paths['add'] = (scaffold_paths['deletion'] == False) & (scaffold_paths['deletion'].shift(-1) == True) & (scaffold_paths[f'phase{h}'] > 0)
+        scaffold_paths['from_phase'] = scaffold_paths[f'phase{h}'].shift(-1, fill_value=0)
+        s = 2
+        while True:
+            scaffold_paths['add'] = scaffold_paths['add'] & scaffold_paths['deletion'].shift(-s) & (scaffold_paths['pid'] == scaffold_paths['pid'].shift(-s))
+            scaffold_paths['to_phase'] = np.abs(scaffold_paths[f'phase{h}'].shift(-s, fill_value=0)) # We need the phase of the deletion later, not the one of the checked connection, since we are looking for no valid connections
+            if np.sum(scaffold_paths['add']):
+                for h2 in range(ploidy):
+                    if h2 != h:
+                        for s2 in range(2,s+1):
+                            scaffold_paths['to'] = scaffold_paths[f'scaf{h2}'].shift(-s2, fill_value=-1)
+                            scaffold_paths['to_side'] = scaffold_paths[f'strand{h2}'].shift(-s2, fill_value='')
+                            scaffold_paths['mean_dist'] = scaffold_paths[f'dist{h2}'].shift(-s2, fill_value=0)
+                            deletions.append( scaffold_paths.loc[scaffold_paths['add'] & (scaffold_paths[f'phase{h2}'].shift(-s2) > 0) & (scaffold_paths['to'] >= 0), ['pid','pos','from_phase',f'scaf{h}',f'strand{h}','to_phase','to','to_side','mean_dist']].rename(columns={f'scaf{h}':'from',f'strand{h}':'from_side'}) )
+                s += 1
+            else:
+                break
+    scaffold_paths.drop(columns=['deletion','add','from_phase','to_phase','to','to_side','mean_dist'], inplace=True)
+    deletions = pd.concat(deletions, ignore_index=True)
+    deletions = deletions[deletions['from_phase'] != deletions['to_phase']].copy()
+    deletions['from_side'] = np.where(deletions['from_side'] == '+', 'r', 'l')
+    deletions['to_side'] = np.where(deletions['to_side'] == '+', 'l', 'r')
+    deletions['valid'] = deletions[['from','from_side','to','to_side','mean_dist']].merge(scaf_bridges[['from','from_side','to','to_side','mean_dist']], on=['from','from_side','to','to_side','mean_dist'], how='left', indicator=True)['_merge'].values == "both"
+    deletions.sort_values(['pid','pos','from_phase','to_phase'], inplace=True)
+    valid = deletions.groupby(['pid','pos','from_phase','to_phase'], sort=False)['valid'].agg(['max','size'])
+    deletions['valid'] = np.repeat(valid['max'].values, valid['size'].values)
+    deletions = deletions.loc[deletions['valid'] == False, ['from_phase','to_phase']].drop_duplicates()
+    scaffold_paths = AssignNewPhases(scaffold_paths, deletions, ploidy)
+#
+    ## Combine phases where scaffold_graph leaves only one option
+    # Get all remaining phase_breaks
+    phase_breaks = []
+    for h in range(ploidy):
+        phase_breaks.append( scaffold_paths.loc[(scaffold_paths[f'phase{h}'] != scaffold_paths[f'phase{h}'].shift(1)) & (scaffold_paths['pid'] == scaffold_paths['pid'].shift(1)), ['pid','pos']].rename(columns={'pos':'rpos'}) )
+        phase_breaks[-1]['hap'] = h
+    phase_breaks = pd.concat(phase_breaks, ignore_index=True)
+    phase_breaks['lpos'] = phase_breaks['rpos'] - 1
+    test_conns = []
+    for h in range(ploidy):
+        test_conns.append(phase_breaks[['pid','lpos','rpos','hap']].rename(columns={'hap':'lhap'}))
+        test_conns[-1]['rhap'] = h
+        test_conns.append(phase_breaks[['pid','lpos','rpos','hap']].rename(columns={'hap':'rhap'}))
+        test_conns[-1]['lhap'] = h
+    test_conns = pd.concat(test_conns, ignore_index=True)
+    test_conns.drop_duplicates(inplace=True)
+    # Filter out phases breaks where we cannot create an overlap between left and right side, which is not at the path end (if we create an overlap at the paths end, we do not have two sides to check a connection anymore)
+    test_conns['pos'] = test_conns['lpos']
+    test_conns = FindNextValidPositionOnBothSidesOfTestConnection(test_conns, scaffold_paths, ploidy)
+    test_conns.loc[test_conns['invalid'], 'pos'] = test_conns.loc[test_conns['invalid'], 'rpos']
+    test_conns = FindNextValidPositionOnBothSidesOfTestConnection(test_conns, scaffold_paths, ploidy)
+    phase_breaks = phase_breaks[ phase_breaks[['pid','lpos','rpos']].merge(test_conns.loc[test_conns['invalid'], ['pid','lpos','rpos']].drop_duplicates(), on=['pid','lpos','rpos'], how='left', indicator=True)['_merge'].values == "left_only" ].copy()
+    test_conns.drop(columns=['invalid'], inplace=True)
+    test_conns = test_conns.merge(phase_breaks[['pid','lpos','rpos']].drop_duplicates(), on=['pid','lpos','rpos'], how='inner')
+    # Test connections
+    test_conns.sort_values(['pid','pos','lspos','rspos'], inplace=True, ignore_index=True)
+    test_conns['apid'] = (((test_conns['pid'] != test_conns['pid'].shift(1)) | (test_conns['pos'] != test_conns['pos'].shift(1)) |
+                           (test_conns['lspos'] != test_conns['lspos'].shift(1)) | (test_conns['rspos'] != test_conns['rspos'].shift(1))).cumsum() - 1 ) * 2
+    test_conns['bpid'] = test_conns['apid']+1
+    test_paths = scaffold_paths.merge(test_conns[['pid','pos','apid','bpid']].drop_duplicates().rename(columns={'pos':'split_pos'}), on=['pid'], how='inner')
+    test_paths = test_paths.loc[ np.repeat(test_paths.index.values, 1+(test_paths['pos'] == test_paths['split_pos']).values) ].reset_index()
+    test_paths['pid'] = np.where((test_paths['pos'] < test_paths['split_pos']) | (test_paths['index'] == test_paths['index'].shift(-1)), test_paths['apid'], test_paths['bpid'])
+    test_paths.drop(columns=['index','apid','bpid'], inplace=True)
+    test_paths.sort_values(['pid','pos'], inplace=True, ignore_index=True)
+    switch_pos = pd.concat( [test_conns.loc[test_conns['lspos'] != test_conns['pos'], ['apid','lspos','pid','lhap']].rename(columns={'apid':'pid','lspos':'switch_pos','pid':'opid','lhap':'hap'}), 
+                             test_conns.loc[test_conns['rspos'] != test_conns['pos'], ['bpid','rspos','pid','rhap']].rename(columns={'bpid':'pid','rspos':'switch_pos','pid':'opid','rhap':'hap'})], ignore_index=True).drop_duplicates()
+    if len(switch_pos):
+        test_paths[['switch_pos','opid','hap']] = test_paths[['pid']].merge(switch_pos, on=['pid'], how='left')[['switch_pos','opid','hap']].fillna(-1).astype(int).values
+        for h in range(ploidy):
+            if np.sum(test_paths['hap'] == h):
+                # Replace deletion with scaffold next to deletion (we need to take it from scaffold_paths, because it might be on the other side of the split)
+                cur = (test_paths['hap'] == h) & (test_paths['pos'] == test_paths['split_pos'])
+                cols = [f'scaf{h}',f'strand{h}',f'dist{h}']
+                test_paths.loc[cur, cols] = test_paths.loc[cur, ['opid','switch_pos']].rename(columns={'opid':'pid','switch_pos':'pos'}).merge(scaffold_paths[['pid','pos']+cols], on=['pid','pos'], how='left')[cols].values
+                # Make sure we do not affect the other haplotypes by changing the main path
+                cur = (test_paths['hap'] == h) & (test_paths['pos'] == test_paths['switch_pos'])
+                if h == 0:
+                    for h1 in range(1,ploidy):
+                        test_paths.loc[cur & (test_paths[f'phase{h1}'] < 0), [f'scaf{h1}',f'strand{h1}',f'dist{h1}']] = test_paths.loc[cur & (test_paths[f'phase{h1}'] < 0), ['scaf0','strand0','dist0']].values
+                # Delete the scaffold we shifted
+                test_paths.loc[cur, cols] = [-1,'',0]
+        test_paths.drop(columns=['switch_pos','opid','hap'], inplace=True)
+    test_paths.drop(columns=['split_pos'], inplace=True)  
+    test_paths['pos'] = test_paths.groupby(['pid'], sort=False).cumcount()
+    test_paths = SetDistanceAtFirstPositionToZero(test_paths, ploidy)
+    test_conns.rename(columns={'lhap':'ahap','rhap':'bhap'}, inplace=True)
+    test_conns['aside'] = 'r'
+    test_conns['bside'] = 'l'
+    test_conns['amin'] = test_conns['pos']
+    test_conns['amax'] = test_conns['pos']
+    test_conns['alen'] = test_conns['amax']
+    test_conns['bmin'] = 0
+    test_conns['bmax'] = 0
+    scaf_len = scaffold_paths.groupby(['pid'])['pos'].max().reset_index()
+    test_conns['blen'] = test_conns[['pid']].merge(scaf_len, on=['pid'], how='left')['pos'].values - test_conns['pos']
+    ends = test_conns.drop(columns=['pid','lpos','rpos','pos']).drop_duplicates()
+    cols = ['pid','hap','side','min','max','len']
+    ends = pd.concat([ends, ends.rename(columns={**{f'a{n}':f'b{n}' for n in cols},**{f'b{n}':f'a{n}' for n in cols}})], ignore_index=True)
+    ends = FilterInvalidConnections(ends, test_paths, scaffold_graph, ploidy, True)
+    ends.drop(columns=['short'], inplace=True)
+    test_conns = test_conns.merge(ends, on=list(ends.columns), how='inner')
+    test_conns = test_conns[['pid','lpos','rpos','ahap','bhap']].rename(columns={'ahap':'lhap','bhap':'rhap'})
+    # Check if we have evidence for errors in paths (same haplotype is not a valid connection)
+    phase_breaks['rhap'] = phase_breaks['hap']
+    path_errors = phase_breaks[ phase_breaks.rename(columns={'hap':'lhap'}).merge(test_conns, on=['pid','lpos','rpos','lhap','rhap'], how='left', indicator=True)['_merge'].values == "left_only" ].copy()
+    if len(path_errors):
+        print("Warning: Found scaffold_paths that violate scaffold_graph.")
+        print(path_errors)
+    # Combine phases where we do not have alternative options
+    phase_breaks = phase_breaks.merge(test_conns.rename(columns={'lhap':'hap'}), on=['pid','lpos','rpos','hap','rhap'], how='inner').drop(columns=['rhap'])
+    for s in ['l','r']:
+        cols = ['pid','lpos','rpos','hap']
+        phase_breaks[f'{s}alts'] = phase_breaks[cols].merge(test_conns.rename(columns={f'{s}hap':'hap'}).groupby(cols).size().reset_index(name='alts'), on=cols, how='left')['alts'].values
+    phase_breaks = phase_breaks[(phase_breaks['lalts'] == 1) & (phase_breaks['ralts'] == 1)].copy()
+    phase_breaks[['from_phase','to_phase']] = 1
+    for h in range(ploidy):
+        phase_breaks.loc[phase_breaks['hap'] == h, 'from_phase'] = np.abs(phase_breaks.loc[phase_breaks['hap'] == h, ['pid','lpos']].rename(columns={'lpos':'pos'}).merge(scaffold_paths[['pid','pos',f'phase{h}']], on=['pid','pos'], how='left')[f'phase{h}'].values)
+        phase_breaks.loc[phase_breaks['hap'] == h, 'to_phase'] = np.abs(phase_breaks.loc[phase_breaks['hap'] == h, ['pid','rpos']].rename(columns={'rpos':'pos'}).merge(scaffold_paths[['pid','pos',f'phase{h}']], on=['pid','pos'], how='left')[f'phase{h}'].values)
+    phase_breaks = phase_breaks[['from_phase','to_phase']].drop_duplicates()
+    scaffold_paths = AssignNewPhases(scaffold_paths, phase_breaks, ploidy)
+#
+    # Merge phases, where no other phase has a break
+    while True:
+        for h in range(ploidy):
+            scaffold_paths[f'from_phase{h}'] = np.abs(scaffold_paths[f'phase{h}'].shift(1, fill_value=0))
+            scaffold_paths[f'to_phase{h}'] = np.abs(scaffold_paths[f'phase{h}'])
+        scaffold_paths.loc[scaffold_paths['pid'] != scaffold_paths['pid'].shift(1), [f'from_phase{h}' for h in range(ploidy)]] = 0
+        merge_phase = scaffold_paths.loc[(scaffold_paths['from_phase0'] != 0) & ((scaffold_paths[[f'from_phase{h}' for h in range(ploidy)]].values != scaffold_paths[[f'to_phase{h}' for h in range(ploidy)]].values).sum(axis=1) == 1), [f'{n}_phase{h}' for h in range(ploidy) for n in ['from','to']]].copy()
+        scaffold_paths.drop(columns=[f'{n}_phase{h}' for h in range(ploidy) for n in ['from','to']], inplace=True)
+        if len(merge_phase):
+            merge_phase[['from_phase','to_phase']] = merge_phase[['from_phase0','to_phase0']].values
+            for h in range(1, ploidy):
+                merge_phase.loc[merge_phase[f'from_phase{h}'] != merge_phase[f'to_phase{h}'], ['from_phase','to_phase']] = merge_phase.loc[merge_phase[f'from_phase{h}'] != merge_phase[f'to_phase{h}'], [f'from_phase{h}',f'to_phase{h}']].values
+            merge_phase = merge_phase[['from_phase','to_phase']].drop_duplicates()
+            scaffold_paths = AssignNewPhases(scaffold_paths, merge_phase, ploidy)
+        else:
+            break
+#
     return scaffold_paths
 
 def ExpandScaffoldsWithContigs(scaffold_paths, scaffolds, scaffold_parts, ploidy):
@@ -3689,7 +5633,7 @@ def OrderByUnbrokenOriginalScaffolds(scaffold_paths, contig_parts, ploidy):
 
     return scaffold_paths
 
-def ScaffoldContigs(contig_parts, bridges, mappings, ploidy):
+def ScaffoldContigs(contig_parts, bridges, mappings, ploidy, max_loop_units):
     # Each contig starts with being its own scaffold
     scaffold_parts = pd.DataFrame({'conpart': contig_parts.index.values, 'scaffold': contig_parts.index.values, 'pos': 0, 'reverse': False})
     scaffolds = pd.DataFrame({'scaffold': contig_parts.index.values, 'left': contig_parts.index.values, 'lside':'l', 'right': contig_parts.index.values, 'rside':'r', 'lextendible':True, 'rextendible':True, 'circular':False, 'size':1})
@@ -3704,18 +5648,78 @@ def ScaffoldContigs(contig_parts, bridges, mappings, ploidy):
     scaffolds.drop(columns=['lscaf','lscaf_side','rscaf','rscaf_side'], inplace = True)
     scaffold_parts = AddDistaneInformation(scaffold_parts, bridges[(bridges['to_alt'] == 1) & (bridges['from_alt'] == 1)]) # Do not use unique_bridges, because we require 'mean_dist' column
     scaf_bridges = LiftBridgesFromContigsToScaffolds(bridges, scaffolds)
+    org_scaf_conns = GetOriginalScaffoldConnections(contig_parts, scaffolds)
 #
     # Build scaffold graph to find unique bridges over scaffolds with alternative connections
     long_range_connections = GetLongRangeConnections(bridges, mappings)
     long_range_connections = TransformContigConnectionsToScaffoldConnections(long_range_connections, scaffold_parts)
     scaffold_graph = BuildScaffoldGraph(long_range_connections, scaf_bridges)
-    scaffold_paths = TraverseScaffoldingGraph(scaffolds, scaffold_graph, scaf_bridges, ploidy)
+    scaffold_paths = TraverseScaffoldingGraph(scaffolds, scaffold_graph, scaf_bridges, org_scaf_conns, ploidy, max_loop_units)
+    scaffold_paths = PhaseScaffolds(scaffold_paths, scaffold_graph, scaf_bridges, ploidy)
     
     # Finish Scaffolding
     scaffold_paths = ExpandScaffoldsWithContigs(scaffold_paths, scaffolds, scaffold_parts, ploidy)
     scaffold_paths = OrderByUnbrokenOriginalScaffolds(scaffold_paths, contig_parts, ploidy)
 
     return scaffold_paths
+
+def PrepareScaffoldPathForMapping(scaffold_paths, bridges, ploidy):
+    # Prepare entries in scaffold_paths for mapping
+    all_scafs = []
+    for h in range(ploidy):
+        hap_paths = scaffold_paths[['scaf','pos']+[f'phase{h}',f'con{h}',f'strand{h}',f'dist{h}']].rename(columns={f'phase{h}':'phase',f'con{h}':'conpart',f'strand{h}':'scaf_strand',f'dist{h}':'ldist'})
+        if np.sum(hap_paths['phase'] < 0):
+            hap_paths.loc[hap_paths['phase'] < 0, ['conpart','scaf_strand','ldist']] = scaffold_paths.loc[hap_paths['phase'].values < 0, ['con0','strand0','dist0']].values
+        ## Get haplotype of connected contigs
+        hap_paths['lhap'] = h # If the only difference is the distance, an alternative haplotype could only be alternative on one side
+        hap_paths['rhap'] = h
+        if 0 < h:
+            hap_paths['lphase'] = hap_paths['phase'].shift(1, fill_value=-1)
+            hap_paths.loc[hap_paths['scaf'] != hap_paths['scaf'].shift(1), 'lphase'] = -1
+            hap_paths['rphase'] = hap_paths['phase'].shift(-1, fill_value=-1)
+            hap_paths.loc[hap_paths['scaf'] != hap_paths['scaf'].shift(-1), 'rphase'] = -1
+            # The important phase is the one storing the distance, but sometimes the distances to different contigs are the same and then we need the other phase
+            hap_paths['main'] = (hap_paths['conpart'] == scaffold_paths['con0'].values) & (hap_paths['scaf_strand'] == scaffold_paths['strand0'].values) # Get the alternative haplotypes identical to main
+            hap_paths['lphase'] = np.where((hap_paths['phase'] >= 0) | hap_paths['main'].shift(1, fill_value=True), hap_paths['phase'], hap_paths['lphase'])
+            hap_paths['rphase'] = np.where((hap_paths['rphase'] >= 0) | hap_paths['main'], hap_paths['rphase'], hap_paths['phase'])
+            # Get haplotypes based on phase
+            hap_paths.loc[hap_paths['lphase'] < 0, 'lhap'] = 0
+            hap_paths.loc[hap_paths['rphase'] < 0, 'rhap'] = 0
+        else:
+            hap_paths['main'] = False # While the main path is by definition identical to main, we do not want to remove it, thus set it to False
+        ## Remove deletions (we needed them to get the proper phase, but now they are only making things complicated)
+        hap_paths = hap_paths.loc[(hap_paths['conpart'] >= 0), :]
+        ## Get connected contigs with strand and distance (we already have ldist)
+        hap_paths['lcon'] = hap_paths['conpart'].shift(1, fill_value=-1)
+        hap_paths['lstrand'] = hap_paths['scaf_strand'].shift(1, fill_value='')
+        hap_paths['lpos'] = hap_paths['pos'].shift(1, fill_value=-1)
+        hap_paths.loc[hap_paths['scaf'] != hap_paths['scaf'].shift(1), ['lcon','lstrand','lpos']] = [-1,'',-1]
+        hap_paths['rcon'] = hap_paths['conpart'].shift(-1, fill_value=-1)
+        hap_paths['rstrand'] = hap_paths['scaf_strand'].shift(-1, fill_value='')
+        hap_paths['rdist'] = hap_paths['ldist'].shift(-1, fill_value=0)
+        hap_paths['rpos'] = hap_paths['pos'].shift(-1, fill_value=-1)
+        hap_paths.loc[hap_paths['scaf'] != hap_paths['scaf'].shift(-1), ['rcon','rstrand','rdist','rpos']] = [-1,'',0,-1]
+        ## Filter the ones completely identical to main
+        if 0 < h:
+            hap_paths = hap_paths.loc[(hap_paths['lhap'] > 0) | (hap_paths['rhap'] > 0), :]
+        all_scafs.append(hap_paths[['scaf','pos','conpart','scaf_strand','lpos','lhap','lcon','lstrand','ldist','rpos','rhap','rcon','rstrand','rdist','main']])
+    all_scafs = pd.concat(all_scafs, ignore_index=True)
+    # Get allowed distance range for contig bridges
+    all_scafs['from_side'] = np.where(all_scafs['scaf_strand'] == '+', 'l', 'r')
+    all_scafs['to_side'] = np.where(all_scafs['lstrand'] == '+', 'r', 'l')
+    all_scafs = all_scafs.merge(bridges[['from','from_side','to','to_side','mean_dist','min_dist','max_dist']].rename(columns={'from':'conpart','to':'lcon','mean_dist':'ldist','min_dist':'ldmin','max_dist':'ldmax'}), on=['conpart','from_side','lcon','to_side','ldist'], how='left')
+    all_scafs['from_side'] = np.where(all_scafs['scaf_strand'] == '+', 'r', 'l')
+    all_scafs['to_side'] = np.where(all_scafs['rstrand'] == '+', 'l', 'r')
+    all_scafs = all_scafs.merge(bridges[['from','from_side','to','to_side','mean_dist','min_dist','max_dist']].rename(columns={'from':'conpart','to':'rcon','mean_dist':'rdist','min_dist':'rdmin','max_dist':'rdmax'}), on=['conpart','from_side','rcon','to_side','rdist'], how='left')
+    consitency_check = all_scafs[(np.isnan(all_scafs['ldmin']) & (all_scafs['lcon'] >= 0)) | (np.isnan(all_scafs['rdmin']) & (all_scafs['rcon'] >= 0))].copy()
+    if len(consitency_check):
+        print("Error: Scaffold paths contains connections that are not supported by a bridge.")
+        print(consitency_check)
+    all_scafs[['ldmin','rdmin']] = all_scafs[['ldmin','rdmin']].fillna(-sys.maxsize*0.99).values.astype(int) # Use *0.99 to avoid overflow through type convertion from float to int (should be the lcon/rcon -1, where we do not want to set any constraints)
+    all_scafs[['ldmax','rdmax']] = all_scafs[['ldmax','rdmax']].fillna(sys.maxsize*0.99).values.astype(int)
+    all_scafs.drop(columns=['from_side','to_side'], inplace=True)
+#
+    return all_scafs
 
 def BasicMappingToScaffolds(mappings, all_scafs):
     # Mapping to matching contigs and reverse if the contig is reversed on the scaffold
@@ -3775,6 +5779,65 @@ def BasicMappingToScaffolds(mappings, all_scafs):
     mappings.loc[np.isnan(mappings['new_group']) == False, 'group'] = mappings.loc[np.isnan(mappings['new_group']) == False, 'new_group'].astype(int)
     mappings.drop(columns=['new_group'], inplace=True)
     mappings = mappings.loc[(mappings['group'] >= 0), :]
+    # If a read matches multiple haplotypes of the same read they might end up in the same group. To resolve this, duplicate the groups.
+    merged_groups = mappings.groupby(['group','read_pos']).size()
+    merged_groups = merged_groups[merged_groups > 1].reset_index()[['group']].drop_duplicates()
+    if len(merged_groups):
+        mappings['mindex'] = mappings.index.values
+        old_groups = mappings.loc[np.isin(mappings['group'].values, merged_groups['group'].values), ['group','read_pos','pos','rhap','lhap','mindex','strand','rpos','lpos']].copy()
+        # Start from the lowest read_pos in the group and expand+duplicate on valid connections
+        merged_groups = merged_groups.merge(old_groups.groupby(['group'])['read_pos'].min().reset_index(), on=['group'], how='left')
+        merged_groups['max_pos'] = merged_groups[['group']].merge(old_groups.groupby(['group'])['read_pos'].max().reset_index(), on=['group'], how='left')['read_pos'].values
+        merged_groups['new_group'] = merged_groups['group']
+        merged_groups = merged_groups.merge(old_groups, on=['group','read_pos'], how='left')
+        start_group_id = mappings['group'].max() + 1
+        split = merged_groups['new_group'] == merged_groups['new_group'].shift(1)
+        nsplit = np.sum(split)
+        if nsplit:
+            merged_groups.loc[split, 'new_group'] = np.arange(start_group_id, start_group_id+nsplit)
+            start_group_id += nsplit
+        sep_groups = merged_groups[['group','new_group','mindex']].copy()
+        merged_groups = merged_groups[merged_groups['read_pos'] < merged_groups['max_pos']].drop(columns=['mindex','strand','rpos','lpos'])
+        while len(merged_groups):
+            # Get the valid extensions for the next position
+            merged_groups['read_pos'] += 1
+            merged_groups.rename(columns={col:f'o{col}' for col in ['pos','rhap','lhap']}, inplace=True)
+            merged_groups = merged_groups.merge(old_groups, on=['group','read_pos'], how='left')
+            merged_groups = merged_groups[ (np.where(merged_groups['strand'] == '-', merged_groups['rpos'], merged_groups['lpos']) == merged_groups['opos']) &
+                                           np.where(merged_groups['strand'] == '-', merged_groups['rhap'] == merged_groups['olhap'], merged_groups['lhap'] == merged_groups['orhap']) ].drop(columns=['opos','olhap','orhap'])
+            # Split groups
+            merged_groups.sort_values(['group','new_group'], inplace=True)
+            split = merged_groups['new_group'] == merged_groups['new_group'].shift(1)
+            nsplit = np.sum(split)
+            if nsplit:
+                merged_groups['new_group2'] =  merged_groups['new_group']
+                merged_groups.loc[split, 'new_group2'] = np.arange(start_group_id, start_group_id+nsplit)
+                start_group_id += nsplit
+                sep_groups = sep_groups.merge(merged_groups[['new_group','new_group2']], on=['new_group'], how='left')
+                sep_groups.loc[np.isnan(sep_groups['new_group2']) == False, 'new_group'] = sep_groups.loc[np.isnan(sep_groups['new_group2']) == False, 'new_group2'].astype(int) # If the new_group is no longer in merged_groups (because the group finished) we get NaNs
+                sep_groups.drop(columns=['new_group2'], inplace=True)
+                merged_groups['new_group'] = merged_groups['new_group2']
+                merged_groups.drop(columns=['new_group2'], inplace=True)
+            # Check if a new groups starts here (unconnected entry at this position for the group)
+            new_groups = merged_groups[['group','read_pos','max_pos']].drop_duplicates().merge(old_groups, on=['group','read_pos'], how='left')
+            new_groups = new_groups[np.isin(new_groups['mindex'].values, merged_groups['mindex'].values) == False].copy()
+            if len(new_groups):
+                new_groups['new_group'] = np.arange(start_group_id, start_group_id+len(new_groups))
+                start_group_id += len(new_groups)
+                merged_groups = pd.concat([merged_groups, sep_groups], ignore_index=True)
+            # Store valid extensions and prepare next round
+            sep_groups = pd.concat([sep_groups, merged_groups[['group','new_group','mindex']].copy()], ignore_index=True)
+            merged_groups = merged_groups[merged_groups['read_pos'] < merged_groups['max_pos']].drop(columns=['mindex','strand','rpos','lpos'])
+        sep_groups.sort_values(['mindex','group','new_group'], inplace=True)
+        mappings = mappings.merge(sep_groups, on=['mindex','group'], how='left')
+        mappings.loc[np.isnan(mappings['new_group']) == False, 'group'] = mappings.loc[np.isnan(mappings['new_group']) == False, 'new_group'].astype(int)
+        mappings.drop(columns=['mindex','new_group'], inplace=True)
+    # Check that groups are consistent now
+    merged_groups = mappings.groupby(['group','read_pos']).size()
+    merged_groups = merged_groups[merged_groups > 1].reset_index()[['group']].drop_duplicates()
+    if len(merged_groups):
+        print("Error: Groups have duplicated positions after BasicMappingToScaffolds.")
+        print( mappings.loc[np.isin(mappings['group'].values, merged_groups['group'].values)] )
 #
     return mappings
 
@@ -3794,57 +5857,7 @@ def MapReadsToScaffolds(mappings, scaffold_paths, bridges, ploidy):
     org_mappings = mappings.copy()
 #
     while True:
-        # Prepare entries in scaffold_paths for mapping
-        all_scafs = []
-        for h in range(ploidy):
-            hap_paths = scaffold_paths[['scaf','pos']+[f'phase{h}',f'con{h}',f'strand{h}',f'dist{h}']].rename(columns={f'phase{h}':'phase',f'con{h}':'conpart',f'strand{h}':'scaf_strand',f'dist{h}':'ldist'})
-            if np.sum(hap_paths['phase'] < 0):
-                hap_paths.loc[hap_paths['phase'] < 0, ['conpart','scaf_strand','ldist']] = scaffold_paths.loc[hap_paths['phase'].values < 0, ['con0','strand0','dist0']].values
-            ## Get haplotype of connected contigs
-            hap_paths['lhap'] = h # If the only difference is the distance, an alternative haplotype could only be alternative on one side
-            hap_paths['rhap'] = h
-            if 0 < h:
-                hap_paths['lphase'] = hap_paths['phase'].shift(1, fill_value=-1)
-                hap_paths.loc[hap_paths['scaf'] != hap_paths['scaf'].shift(1), 'lphase'] = -1
-                hap_paths['rphase'] = hap_paths['phase'].shift(-1, fill_value=-1)
-                hap_paths.loc[hap_paths['scaf'] != hap_paths['scaf'].shift(-1), 'rphase'] = -1
-                # The important phase is the one storing the distance, but sometimes the distances to different contigs are the same and then we need the other phase
-                hap_paths['main'] = (hap_paths['conpart'] == scaffold_paths['con0'].values) & (hap_paths['scaf_strand'] == scaffold_paths['strand0'].values) # Get the alternative haplotypes identical to main
-                hap_paths['lphase'] = np.where((hap_paths['phase'] >= 0) | hap_paths['main'].shift(1, fill_value=True), hap_paths['phase'], hap_paths['lphase'])
-                hap_paths['rphase'] = np.where((hap_paths['rphase'] >= 0) | hap_paths['main'], hap_paths['rphase'], hap_paths['phase'])
-                # Get haplotypes based on phase
-                hap_paths.loc[hap_paths['lphase'] < 0, 'lhap'] = 0
-                hap_paths.loc[hap_paths['rphase'] < 0, 'rhap'] = 0
-            else:
-                hap_paths['main'] = False # While the main path is by definition identical to main, we do not want to remove it, thus set it to False
-            ## Remove deletions (we needed them to get the proper phase, but now they are only making things complicated)
-            hap_paths = hap_paths.loc[(hap_paths['conpart'] >= 0), :]
-            ## Get connected contigs with strand and distance (we already have ldist)
-            hap_paths['lcon'] = hap_paths['conpart'].shift(1, fill_value=-1)
-            hap_paths['lstrand'] = hap_paths['scaf_strand'].shift(1, fill_value='')
-            hap_paths['lpos'] = hap_paths['pos'].shift(1, fill_value=-1)
-            hap_paths.loc[hap_paths['scaf'] != hap_paths['scaf'].shift(1), ['lcon','lstrand','lpos']] = [-1,'',-1]
-            hap_paths['rcon'] = hap_paths['conpart'].shift(-1, fill_value=-1)
-            hap_paths['rstrand'] = hap_paths['scaf_strand'].shift(-1, fill_value='')
-            hap_paths['rdist'] = hap_paths['ldist'].shift(-1, fill_value=0)
-            hap_paths['rpos'] = hap_paths['pos'].shift(-1, fill_value=-1)
-            hap_paths.loc[hap_paths['scaf'] != hap_paths['scaf'].shift(-1), ['rcon','rstrand','rdist','rpos']] = [-1,'',0,-1]
-            ## Filter the ones completely identical to main
-            if 0 < h:
-                hap_paths = hap_paths.loc[(hap_paths['lhap'] > 0) | (hap_paths['rhap'] > 0), :]
-            all_scafs.append(hap_paths[['scaf','pos','conpart','scaf_strand','lpos','lhap','lcon','lstrand','ldist','rpos','rhap','rcon','rstrand','rdist','main']])
-        all_scafs = pd.concat(all_scafs, ignore_index=True)
-        # Get allowed distance range for contig bridges
-        all_scafs['from_side'] = np.where(all_scafs['scaf_strand'] == '+', 'l', 'r')
-        all_scafs['to_side'] = np.where(all_scafs['lstrand'] == '+', 'r', 'l')
-        all_scafs = all_scafs.merge(bridges[['from','from_side','to','to_side','mean_dist','min_dist','max_dist']].rename(columns={'from':'conpart','to':'lcon','mean_dist':'ldist','min_dist':'ldmin','max_dist':'ldmax'}), on=['conpart','from_side','lcon','to_side','ldist'], how='left')
-        all_scafs['from_side'] = np.where(all_scafs['scaf_strand'] == '+', 'r', 'l')
-        all_scafs['to_side'] = np.where(all_scafs['rstrand'] == '+', 'l', 'r')
-        all_scafs = all_scafs.merge(bridges[['from','from_side','to','to_side','mean_dist','min_dist','max_dist']].rename(columns={'from':'conpart','to':'rcon','mean_dist':'rdist','min_dist':'rdmin','max_dist':'rdmax'}), on=['conpart','from_side','rcon','to_side','rdist'], how='left')
-        all_scafs[['ldmin','rdmin']] = all_scafs[['ldmin','rdmin']].fillna(-sys.maxsize*0.99).values.astype(int) # Use *0.99 to avoid overflow through type convertion from float to int
-        all_scafs[['ldmax','rdmax']] = all_scafs[['ldmax','rdmax']].fillna(sys.maxsize*0.99).values.astype(int)
-        all_scafs.drop(columns=['from_side','to_side'], inplace=True)
-#
+        all_scafs = PrepareScaffoldPathForMapping(scaffold_paths, bridges, ploidy)
         mappings = BasicMappingToScaffolds(mappings, all_scafs)
 #
         # Get coverage for connections
@@ -3854,111 +5867,128 @@ def MapReadsToScaffolds(mappings, scaffold_paths, bridges, ploidy):
 #
         # Remove reads, where they map to multiple locations (keep them separately, so that we can restore them if it does leave a connection between contigs without reads)
         dups_maps = mappings[['read_name','read_start','read_pos','scaf','pos']].drop_duplicates().groupby(['read_name','read_start','read_pos'], sort=False).size().reset_index(name='count')
-        mappings = mappings.merge(dups_maps, on=['read_name','read_start','read_pos'], how='left')
+        mcols = ['read_name','read_start','read_pos']
+        mappings['count'] = mappings[mcols].merge(dups_maps, on=mcols, how='left')['count'].values
         dups_maps = mappings[['group','count']].groupby(['group'])['count'].min().reset_index(name='gcount')
-        mappings = mappings.drop(columns=['count']).merge(dups_maps, on=['group'], how='left')
+        mappings.rename(columns={'count':'gcount'}, inplace=True)
+        mappings['gcount'] = mappings[['group']].merge(dups_maps, on=['group'], how='left')['gcount'].values
         dups_maps = mappings[mappings['gcount'] > 1].copy()
-        mappings = mappings[mappings['gcount'] == 1].drop(columns=['gcount','group'])
+        mappings = mappings[mappings['gcount'] == 1].drop(columns=['gcount'])
+        mappings.rename(columns={'group':'mapid'}, inplace=True)
         conn_cov = conn_cov.merge(mappings.loc[(mappings['lcon'] >= 0) & (mappings['lpos'] >= 0), ['scaf','pos','lpos','lhap']].rename(columns={'pos':'rpos','lhap':'hap'}).groupby(['scaf','lpos','rpos','hap']).size().reset_index(name='ucov'), on=['scaf','lpos','rpos','hap'], how='left')
         conn_cov['ucov'] = conn_cov['ucov'].fillna(0).astype(int)
 #
         # Try to fix scaffold_paths, where no reads support the connection
         # Start by getting mappings that have both sides in them
         unsupp_conns = conn_cov[conn_cov['ucov'] == 0].copy()
-        unsupp_conns = unsupp_conns.merge(scaffold_paths[['scaf','pos']+[f'con{h}' for h in range(ploidy)]].rename(columns={'pos':'lpos','con0':'lcon'}), on=['scaf','lpos'], how='left')
-        for h in range(1,ploidy):
-            sel = (h == unsupp_conns['hap']) & (unsupp_conns[f'con{h}'] >= 0)
-            unsupp_conns.loc[sel, 'lcon'] = unsupp_conns.loc[sel, f'con{h}'] 
-        unsupp_conns.drop(columns=[f'con{h}' for h in range(1,ploidy)], inplace=True)
-        unsupp_conns = unsupp_conns.merge(scaffold_paths[['scaf','pos']+[f'con{h}' for h in range(ploidy)]].rename(columns={'pos':'rpos','con0':'rcon'}), on=['scaf','rpos'], how='left')
-        for h in range(1,ploidy):
-            sel = (h == unsupp_conns['hap']) & (unsupp_conns[f'con{h}'] >= 0)
-            unsupp_conns.loc[sel, 'rcon'] = unsupp_conns.loc[sel, f'con{h}'] 
-        unsupp_conns.drop(columns=[f'con{h}' for h in range(1,ploidy)], inplace=True)
-        lreads = unsupp_conns[['lcon']].reset_index().merge(org_mappings[['conpart','read_name']].rename(columns={'conpart':'lcon'}), on=['lcon'], how='inner')
-        rreads = unsupp_conns[['rcon']].reset_index().merge(org_mappings[['conpart','read_name']].rename(columns={'conpart':'rcon'}), on=['rcon'], how='inner')
-        supp_reads = lreads.drop(columns=['lcon']).merge(rreads.drop(columns=['rcon']), on=['index','read_name'], how='inner')[['read_name']].drop_duplicates()
-        # Remove reads that already have a valid mapping to scaffold_paths
-        supp_reads = supp_reads.loc[supp_reads.merge(mappings[['read_name']].drop_duplicates(), on=['read_name'], how='left', indicator=True)['_merge'].values == "left_only", :]
-        supp_reads = supp_reads.loc[supp_reads.merge(dups_maps[['read_name']].drop_duplicates(), on=['read_name'], how='left', indicator=True)['_merge'].values == "left_only", :]
-        supp_reads = supp_reads.merge(org_mappings, on=['read_name'], how='inner')
-        supp_reads.sort_values(['read_name','read_start','read_pos'], inplace=True)
-        # Remove the unsupported connections from all_scafs and try mapping supp_reads again
-        all_scafs.loc[all_scafs[['scaf','pos','rhap']].merge(unsupp_conns[['scaf','lpos','hap']].rename(columns={'lpos':'pos','hap':'rhap'}), on=['scaf','pos','rhap'], how='left', indicator=True)['_merge'].values == "both", ['rpos','rcon','rstrand','rdist','rdmin','rdmax']] = [-1,-1,'',0,-int(sys.maxsize*0.99),int(sys.maxsize)*0.99]
-        all_scafs.loc[all_scafs[['scaf','pos','lhap']].merge(unsupp_conns[['scaf','rpos','hap']].rename(columns={'rpos':'pos','hap':'lhap'}), on=['scaf','pos','lhap'], how='left', indicator=True)['_merge'].values == "both", ['lpos','lcon','lstrand','ldist','ldmin','ldmax']] = [-1,-1,'',0,-int(sys.maxsize*0.99),int(sys.maxsize)*0.99]
-        supp_reads = BasicMappingToScaffolds(supp_reads, all_scafs)
-        # Only keep supp_reads that still map to both sides of a the unsupported connection
-        lreads = unsupp_conns[['lcon']].reset_index().merge(supp_reads[['conpart','read_name']].rename(columns={'conpart':'lcon'}), on=['lcon'], how='inner')
-        rreads = unsupp_conns[['rcon']].reset_index().merge(supp_reads[['conpart','read_name']].rename(columns={'conpart':'rcon'}), on=['rcon'], how='inner')
-        supp_reads = lreads.drop(columns=['lcon']).merge(rreads.drop(columns=['rcon']), on=['index','read_name'], how='inner')[['read_name']].drop_duplicates().merge(supp_reads, on=['read_name'], how='inner')
-        supp_reads.sort_values(['read_name','read_start','read_pos'], inplace=True)
-        # Remove supp_reads, where read_pos have been filtered out between both sides of the unsupported connection
-        
-        # supp_reads[supp_reads['scaf'] == 214].drop(columns=['read_start','read_end','read_from','read_to','con_from','con_to','matches','lmatches','rmatches'])
-        # unsupp_conns[unsupp_conns['scaf'] == 214]
-        # scaffold_paths[scaffold_paths['scaf'] == 214].head(30).tail(10)
-        
-        # Do something about connected alternatives and read truncation
-        
-        # supp_reads[supp_reads['scaf'] == 59].drop(columns=['read_start','read_end','read_from','read_to','con_from','con_to','matches','lmatches','rmatches'])
-        # unsupp_conns[unsupp_conns['scaf'] == 59]
-        # scaffold_paths[scaffold_paths['scaf'] == 59].head(15).tail(15)
-        
-        # Do something about connected haplotypes, where only one is bad
-        
-        # supp_reads[supp_reads['scaf'] == 3043].drop(columns=['read_start','read_end','read_from','read_to','con_from','con_to','matches','lmatches','rmatches'])
-        # unsupp_conns[unsupp_conns['scaf'] == 3043]
-        # scaffold_paths[scaffold_paths['scaf'] == 3043].head(10)
-        
-        # Remove unsupp_conns, where the difference between haplotypes is only the distance and one is supported
-        
-        # supp_reads[supp_reads['scaf'] == 266].drop(columns=['read_start','read_end','read_from','read_to','con_from','con_to','matches','lmatches','rmatches'])
-        # unsupp_conns[unsupp_conns['scaf'] == 266]
-        # scaffold_paths[scaffold_paths['scaf'] == 266].head(10)
+        if len(unsupp_conns):
+            unsupp_conns = unsupp_conns.merge(scaffold_paths[['scaf','pos']+[f'con{h}' for h in range(ploidy)]].rename(columns={'pos':'lpos','con0':'lcon'}), on=['scaf','lpos'], how='left')
+            for h in range(1,ploidy):
+                sel = (h == unsupp_conns['hap']) & (unsupp_conns[f'con{h}'] >= 0)
+                unsupp_conns.loc[sel, 'lcon'] = unsupp_conns.loc[sel, f'con{h}'] 
+            unsupp_conns.drop(columns=[f'con{h}' for h in range(1,ploidy)], inplace=True)
+            unsupp_conns = unsupp_conns.merge(scaffold_paths[['scaf','pos']+[f'con{h}' for h in range(ploidy)]].rename(columns={'pos':'rpos','con0':'rcon'}), on=['scaf','rpos'], how='left')
+            for h in range(1,ploidy):
+                sel = (h == unsupp_conns['hap']) & (unsupp_conns[f'con{h}'] >= 0)
+                unsupp_conns.loc[sel, 'rcon'] = unsupp_conns.loc[sel, f'con{h}'] 
+            unsupp_conns.drop(columns=[f'con{h}' for h in range(1,ploidy)], inplace=True)
+            lreads = unsupp_conns[['lcon']].reset_index().merge(org_mappings[['conpart','read_name']].rename(columns={'conpart':'lcon'}), on=['lcon'], how='inner')
+            rreads = unsupp_conns[['rcon']].reset_index().merge(org_mappings[['conpart','read_name']].rename(columns={'conpart':'rcon'}), on=['rcon'], how='inner')
+            supp_reads = lreads.drop(columns=['lcon']).merge(rreads.drop(columns=['rcon']), on=['index','read_name'], how='inner')[['read_name']].drop_duplicates()
+            # Remove reads that already have a valid mapping to scaffold_paths
+            supp_reads = supp_reads.loc[supp_reads.merge(mappings[['read_name']].drop_duplicates(), on=['read_name'], how='left', indicator=True)['_merge'].values == "left_only", :]
+            supp_reads = supp_reads.loc[supp_reads.merge(dups_maps[['read_name']].drop_duplicates(), on=['read_name'], how='left', indicator=True)['_merge'].values == "left_only", :]
+            supp_reads = supp_reads.merge(org_mappings, on=['read_name'], how='inner')
+            supp_reads.sort_values(['read_name','read_start','read_pos'], inplace=True)
+            # Remove the unsupported connections from all_scafs and try mapping supp_reads again
+            all_scafs.loc[all_scafs[['scaf','pos','rhap']].merge(unsupp_conns[['scaf','lpos','hap']].rename(columns={'lpos':'pos','hap':'rhap'}), on=['scaf','pos','rhap'], how='left', indicator=True)['_merge'].values == "both", ['rpos','rcon','rstrand','rdist','rdmin','rdmax']] = [-1,-1,'',0,-int(sys.maxsize*0.99),int(sys.maxsize)*0.99]
+            all_scafs.loc[all_scafs[['scaf','pos','lhap']].merge(unsupp_conns[['scaf','rpos','hap']].rename(columns={'rpos':'pos','hap':'lhap'}), on=['scaf','pos','lhap'], how='left', indicator=True)['_merge'].values == "both", ['lpos','lcon','lstrand','ldist','ldmin','ldmax']] = [-1,-1,'',0,-int(sys.maxsize*0.99),int(sys.maxsize)*0.99]
+            supp_reads = BasicMappingToScaffolds(supp_reads, all_scafs)
+            # Only keep supp_reads that still map to both sides of a the unsupported connection
+            lreads = unsupp_conns[['lcon']].reset_index().merge(supp_reads[['conpart','read_name']].rename(columns={'conpart':'lcon'}), on=['lcon'], how='inner')
+            rreads = unsupp_conns[['rcon']].reset_index().merge(supp_reads[['conpart','read_name']].rename(columns={'conpart':'rcon'}), on=['rcon'], how='inner')
+            supp_reads = lreads.drop(columns=['lcon']).merge(rreads.drop(columns=['rcon']), on=['index','read_name'], how='inner')[['read_name']].drop_duplicates().merge(supp_reads, on=['read_name'], how='inner')
+            supp_reads.sort_values(['read_name','read_start','read_pos'], inplace=True)
+            # Remove supp_reads, where read_pos have been filtered out between both sides of the unsupported connection
+            
+            # supp_reads[supp_reads['scaf'] == 214].drop(columns=['read_start','read_end','read_from','read_to','con_from','con_to','matches','lmatches','rmatches'])
+            # unsupp_conns[unsupp_conns['scaf'] == 214]
+            # scaffold_paths[scaffold_paths['scaf'] == 214].head(30).tail(10)
+            
+            # Do something about connected alternatives and read truncation
+            
+            # supp_reads[supp_reads['scaf'] == 59].drop(columns=['read_start','read_end','read_from','read_to','con_from','con_to','matches','lmatches','rmatches'])
+            # unsupp_conns[unsupp_conns['scaf'] == 59]
+            # scaffold_paths[scaffold_paths['scaf'] == 59].head(15).tail(15)
+            
+            # Do something about connected haplotypes, where only one is bad
+            
+            # supp_reads[supp_reads['scaf'] == 3043].drop(columns=['read_start','read_end','read_from','read_to','con_from','con_to','matches','lmatches','rmatches'])
+            # unsupp_conns[unsupp_conns['scaf'] == 3043]
+            # scaffold_paths[scaffold_paths['scaf'] == 3043].head(10)
+            
+            # Remove unsupp_conns, where the difference between haplotypes is only the distance and one is supported
+            
+            # supp_reads[supp_reads['scaf'] == 266].drop(columns=['read_start','read_end','read_from','read_to','con_from','con_to','matches','lmatches','rmatches'])
+            # unsupp_conns[unsupp_conns['scaf'] == 266]
+            # scaffold_paths[scaffold_paths['scaf'] == 266].head(10)
         
         # Put back duplicated reads, where otherwise no read support exists for the connection
         dcons = conn_cov[(conn_cov['ucov'] == 0) & (conn_cov['cov'] > 0)].drop(columns=['cov','ucov']).reset_index(drop=True).reset_index().rename(columns={'index':'ci'})
-        dups_maps = dups_maps.merge(dcons[['scaf','rpos','hap','ci']].rename(columns={'rpos':'pos','hap':'lhap','ci':'lci'}), on=['scaf','pos','lhap'], how='left')
-        dups_maps = dups_maps.merge(dcons[['scaf','lpos','hap','ci']].rename(columns={'lpos':'pos','hap':'rhap','ci':'rci'}), on=['scaf','pos','rhap'], how='left')
-        dups_maps = dups_maps.loc[((dups_maps['lcon'] >= 0) & (np.isnan(dups_maps['lci']) == False)) | ((dups_maps['rcon'] >= 0) & (np.isnan(dups_maps['rci']) == False)), :]
-        dups_maps[['lci','rci']] = dups_maps[['lci','rci']].fillna(-1).astype(int)
+        dups_maps['lci'] = dups_maps[['scaf','pos','lhap']].merge(dcons[['scaf','rpos','hap','ci']].rename(columns={'rpos':'pos','hap':'lhap'}), on=['scaf','pos','lhap'], how='left')['ci'].fillna(-1).astype(int).values
+        dups_maps['rci'] = dups_maps[['scaf','pos','rhap']].merge(dcons[['scaf','lpos','hap','ci']].rename(columns={'lpos':'pos','hap':'rhap'}), on=['scaf','pos','rhap'], how='left')['ci'].fillna(-1).astype(int).values
         dups_maps.loc[dups_maps['lcon'] < 0, 'lci'] = -1
         dups_maps.loc[dups_maps['rcon'] < 0, 'rci'] = -1
-        # Choose the reads with the lowest amount of duplication for the connections
-        dups_maps.sort_values(['lci'], inplace=True)
-        mcount = dups_maps.groupby(['lci'], sort=False)['gcount'].agg(['min','size'])
-        dups_maps.loc[dups_maps['gcount'] > np.repeat(mcount['min'].values, mcount['size'].values), 'lci'] = -1
-        dups_maps.sort_values(['rci'], inplace=True)
-        mcount = dups_maps.groupby(['rci'], sort=False)['gcount'].agg(['min','size'])
-        dups_maps.loc[dups_maps['gcount'] > np.repeat(mcount['min'].values, mcount['size'].values), 'rci'] = -1
-        dups_maps.drop(columns=['group','gcount'], inplace=True)
+        dups_maps = dups_maps.loc[(dups_maps['lci'] >= 0) | (dups_maps['rci'] >= 0), :]
         # Duplicate entries that have a left and a right connection that can only be filled with a duplicated read
-        dups_maps.sort_values(['read_name','read_start','read_pos','scaf','pos','lhap','rhap'], inplace=True)
+        dups_maps.sort_values(['read_name','read_start','group','read_pos','scaf','pos','lhap','rhap'], inplace=True)
         dups_maps.reset_index(inplace=True)
-        dups_maps = dups_maps.loc[np.repeat(dups_maps.index.values, (dups_maps['lci'] >= 0).values.astype(int) + (dups_maps['rci'] >= 0).values.astype(int))]
+        dups_maps = dups_maps.loc[np.repeat(dups_maps.index.values, (dups_maps['lci'] >= 0).values.astype(int) + (dups_maps['rci'] >= 0).values.astype(int))].reset_index(drop=True)
         dups_maps.loc[dups_maps['index'] == dups_maps['index'].shift(1), 'lci'] = -1
         dups_maps.loc[dups_maps['index'] == dups_maps['index'].shift(-1), 'rci'] = -1
         dups_maps.drop(columns=['index'], inplace=True)
-        # Remove the unused connections and trim the length of the duplicated reads, such that we do not use them for other connections or extending
+        # Only keep the groups for a ci that covers both sides
+        dups_maps = dups_maps[ (dups_maps['lci'] < 0) | (dups_maps[['group','lci']].rename(columns={'lci':'rci'}).merge(dups_maps[['group','rci']].drop_duplicates(), on=['group','rci'], how='left', indicator=True)['_merge'].values == "both") ].copy()
+        dups_maps = dups_maps[ (dups_maps['rci'] < 0) | (dups_maps[['group','rci']].rename(columns={'rci':'lci'}).merge(dups_maps[['group','lci']].drop_duplicates(), on=['group','lci'], how='left', indicator=True)['_merge'].values == "both") ].copy()
+        # Choose the reads with the lowest amount of duplication for the connections
+        for col in ['lci','rci']:
+            dups_maps.sort_values([col], inplace=True)
+            mcount = dups_maps.groupby([col], sort=False)['gcount'].agg(['min','size'])
+            dups_maps.loc[dups_maps['gcount'] > np.repeat(mcount['min'].values, mcount['size'].values), col] = -1
+        dups_maps = dups_maps[(dups_maps['lci'] >= 0) | (dups_maps['rci'] >= 0)].drop(columns=['gcount'])
+        # Remove the unused connections, such that we do not use them for other connections
         dups_maps.loc[dups_maps['lci'] < 0, ['lcon','ldist','lmapq','lmatches']] = [-1,0,-1,-1]
         dups_maps.loc[dups_maps['rci'] < 0, ['rcon','rdist','rmapq','rmatches']] = [-1,0,-1,-1]
-        dups_maps['ci'] = dups_maps[['lci','rci']].max(axis=1)
+        # In rare cases a read can map on the forward and reverse strand, chose one of those arbitrarily
+        dups_maps['ci'] = dups_maps[['lci','rci']].max(axis=1) # Only one is != -1 at this point
         dups_maps.drop(columns=['lci','rci'], inplace=True)
-        dups_maps.sort_values(['read_name','read_start','ci'], inplace=True)
-        dups_maps = dups_maps.groupby(['read_name','read_start','read_pos','ci']).first().reset_index() # In rare cases a read can map on the forward and reverse strand, chose one of those arbitrarily
-        tmp = dups_maps.groupby(['read_name','read_start','ci'], sort=False).agg({'read_from':['min'], 'read_to':['max']})
+        dups_maps.sort_values(['read_name','read_start','group','ci'], inplace=True)
+        tmp = dups_maps.groupby(['read_name','read_start','group','ci'], sort=False).size().reset_index(name='mappings')
+        if np.sum(tmp['mappings'] != 2):
+            print("Error: A connection between two mappings of a read has more or less than two mappings associated.")
+            print(tmp[tmp['mappings'] != 2])
+        tmp = tmp.drop(columns=['mappings']).groupby(['read_name','read_start','ci'], sort=False).first().reset_index() # Take here the group with the lower id to resolve the strand conflict
+        dups_maps = dups_maps.merge(tmp, on=['read_name','read_start','group','ci'], how='inner')
+        # Trim the length of the duplicated reads, such taht we do not use them for extending
+        tmp = dups_maps.groupby(['read_name','read_start','group','ci'], sort=False).agg({'read_from':['min'], 'read_to':['max']})
         dups_maps['read_start'] = np.repeat( tmp['read_from','min'].values, 2 )
         dups_maps['read_end'] = np.repeat( tmp['read_to','max'].values, 2 )
-        dups_maps.sort_values(['read_name','read_start','read_pos'], inplace=True)
-        dups_maps['read_pos'] = dups_maps.groupby(['read_name','read_start'], sort=False).cumcount()
-        dups_maps.drop(columns=['ci'], inplace=True)
-        mappings = pd.concat([mappings, dups_maps]).sort_values(['read_name','read_start','read_pos'], ignore_index=True)
+        # Assing a map id to uniquely identify the individual mapping groups
+        dups_maps.sort_values(['group','ci'], inplace=True)
+        dups_maps['mapid'] = ((dups_maps['group'] != dups_maps['group'].shift(1)) | (dups_maps['ci'] != dups_maps['ci'].shift(1))).cumsum() + mappings['mapid'].max()
+        dups_maps.drop(columns=['group','ci'], inplace=True)
+        # Update read positions
+        dups_maps.sort_values(['read_name','read_start','mapid','read_pos'], inplace=True)
+        dups_maps['read_pos'] = dups_maps.groupby(['read_name','read_start','mapid'], sort=False).cumcount()
+        # Merge unique and duplicated mappings
+        mappings = pd.concat([mappings, dups_maps], ignore_index=True).sort_values(['read_name','read_start','mapid','read_pos'], ignore_index=True)
+        mappings['mapid'] = (mappings['mapid'] != mappings['mapid'].shift(1)).cumsum()-1
 #
         # Break connections where they are not supported by reads even with multi mapping reads and after fixing attemps(should never happen, so give a warning)
         if len(conn_cov[conn_cov['cov'] == 0]) == 0:
             break
         else:
-            #print( "Warning:", len(conn_cov[conn_cov['cov'] == 0]), "gaps were created for which no read for filling can be found. The connections will be broken up again, but this should never happen and something weird is going on.")
+            print( "Warning:", len(conn_cov[conn_cov['cov'] == 0]), "gaps were created for which no read for filling can be found. The connections will be broken up again, but this should not happen.")
             # Start with alternative paths
             for h in range(1,ploidy):
                 rem = conn_cov.loc[(conn_cov['cov'] == 0) & (conn_cov['hap'] == h), ['scaf','rpos']].rename(columns={'rpos':'pos'}).merge(scaffold_paths[['scaf','pos',f'phase{h}']], on=['scaf','pos'], how='inner')[f'phase{h}'].values
@@ -3977,12 +6007,16 @@ def MapReadsToScaffolds(mappings, scaffold_paths, bridges, ploidy):
             # Finally split contig, where we do not have any valid connection
             scaffold_paths['split'] = scaffold_paths[['scaf','pos']].merge(rem_conns[['scaf','rpos']].rename(columns={'rpos':'pos'}), on=['scaf','pos'], how='left', indicator=True)['_merge'].values == "both"
             scaffold_paths['scaf'] = ((scaffold_paths['scaf'] != scaffold_paths['scaf'].shift(1)) | scaffold_paths['split']).cumsum()-1
-            scaffold_paths['pos'] = scaffold_paths.groupby(['scaf'], sort=False).cumcount()
             scaffold_paths.drop(columns=['split'], inplace=True)
+            # Clean up
+            scaffold_paths = scaffold_paths[(scaffold_paths[[f'con{h}' for h in range(ploidy)]] == -1).all(axis=1) == False].copy()
+            scaffold_paths['pos'] = scaffold_paths.groupby(['scaf'], sort=False).cumcount()
+            scaffold_paths.loc[scaffold_paths['pos'] == 0, 'dist0'] = 0
             mappings = org_mappings.copy()
 #
     ## Handle circular scaffolds
-    mappings = mappings.merge(scaffold_paths.loc[scaffold_paths['pos'] == 0, ['scaf']+[f'con{h}' for h in range(ploidy)]+[f'strand{h}' for h in range(ploidy)]], on=['scaf'], how='left')
+    mcols = [f'con{h}' for h in range(ploidy)]+[f'strand{h}' for h in range(ploidy)]
+    mappings[mcols] = mappings[['scaf']].merge(scaffold_paths.loc[scaffold_paths['pos'] == 0, ['scaf']+mcols], on=['scaf'], how='left')[mcols].values
     mappings.loc[(mappings['rpos'] >= 0) | (mappings['rcon'] < 0), [f'con{h}' for h in range(ploidy)]] = -1
     # Check if the read continues at the beginning of the scaffold
     mappings['check_pos'] = mappings['read_pos'] + np.where(mappings['strand'] == '+', 1, -1)
@@ -3998,7 +6032,7 @@ def MapReadsToScaffolds(mappings, scaffold_paths, bridges, ploidy):
         mappings[f'rmdist{h}'] = mappings[f'rmdist{h}'].fillna(0).astype(int)
         mappings.sort_values([col for col in mappings.columns if col not in [f'con{h}',f'rmdist{h}']] + [f'con{h}',f'rmdist{h}'], inplace=True)
         mappings = mappings.groupby([col for col in mappings.columns if col not in [f'con{h}',f'rmdist{h}']], sort=False).last().reset_index()
-    mappings.sort_values(['read_name','read_start','read_pos','scaf','pos','lhap','rhap'], inplace=True)
+    mappings.sort_values(['mapid','read_pos','scaf','pos','lhap','rhap'], inplace=True)
     # Summarize the circular connections and filter
     circular = pd.concat([mappings.loc[mappings[f'con{h}'] >= 0, ['scaf','pos','rhap',f'rmdist{h}']].rename(columns={f'rmdist{h}':'rmdist'}) for h in range(ploidy)], ignore_index=True)
     circular['lhap'] = np.repeat([h for h in range(ploidy)], [np.sum(mappings[f'con{h}'] >= 0) for h in range(ploidy)])
@@ -4114,7 +6148,7 @@ def FillGapsWithReads(scaffold_paths, mappings, contig_parts, ploidy, max_dist_c
 #
     # Get the mapping information for the other side of the gap (chap is the haplotype that it connects to on the other side, for circular scaffolds it is not guaranteed to be identical with rhap)
     possible_reads['read_pos'] += np.where(possible_reads['strand'] == '+', 1, -1)
-    possible_reads = possible_reads.merge(mappings[['read_name','read_start','read_pos','scaf','pos','lpos','con_from','con_to','lhap']].rename(columns={'pos':'rpos','lpos':'pos','con_from':'rcon_from','con_to':'rcon_to','lhap':'chap'}), on=['read_name','read_start','read_pos','scaf','pos','rpos'], how='left')
+    possible_reads[['rcon_from','rcon_to','chap']] = possible_reads[['read_name','read_start','read_pos','scaf','pos','rpos']].merge(mappings[['read_name','read_start','read_pos','scaf','pos','lpos','con_from','con_to','lhap']].rename(columns={'pos':'rpos','lpos':'pos','con_from':'rcon_from','con_to':'rcon_to','lhap':'chap'}), on=['read_name','read_start','read_pos','scaf','pos','rpos'], how='left')[['rcon_from','rcon_to','chap']].values
 #
     ## Fill scaffold_paths with read and contig information
     for h in range(ploidy):
@@ -4327,11 +6361,12 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     prob_factor = 10
     min_distance_tolerance = 20
     rel_distance_tolerance = 0.2
-    ploidy = 2 
+    ploidy = 2
     org_scaffold_trust = "basic" # blind: If there is a read that supports it use the org scaffold; Do not break contigs
                                  # full: If there is no confirmed other option use the org scaffold
                                  # basic: If there is no alternative bridge use the org scaffold
                                  # no: Do not give preference to org scaffolds
+    max_loop_units = 10
 
     # Guarantee that outdir exists
     outdir = os.path.dirname(prefix)
@@ -4379,7 +6414,7 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     bridges = GetBridges(mappings, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, cov_probs, prob_factor, min_mapping_length, min_distance_tolerance, rel_distance_tolerance, pdf)
 #
     print( str(timedelta(seconds=clock())), "Scaffold the contigs")
-    scaffold_paths = ScaffoldContigs(contig_parts, bridges, mappings, ploidy)
+    scaffold_paths = ScaffoldContigs(contig_parts, bridges, mappings, ploidy, max_loop_units)
 #
     print( str(timedelta(seconds=clock())), "Fill gaps")
     mappings, scaffold_paths = MapReadsToScaffolds(mappings, scaffold_paths, bridges, ploidy) # Might break apart scaffolds again, if we cannot find a mapping read for a connection
@@ -5250,11 +7285,1378 @@ def MiniGapVisualize(region_defs, mapping_file, output, min_mapq, min_mapping_le
     # Save drawing
     img.save(output)
 
+def TestDuplicationConflictResolution():
+    # Define test cases
+    test_dups = pd.concat([
+        #abab#
+        #||  #
+        #ab--#
+        pd.DataFrame({'apid':0,'apos':[0,1,2,3],'ahap':0,'bpid':1,'bpos':[0,1,0,1],'bhap':0,'samedir':True, 'correct':[True,True,False,False]}),
+        #aab#
+        # ||#
+        #-ab#
+        pd.DataFrame({'apid':2,'apos':[0,1,2],'ahap':0,'bpid':3,'bpos':[0,0,1],'bhap':0,'samedir':True, 'correct':[False,True,True]}),
+        #abbc#
+        #||||#
+        #abbc#
+        pd.DataFrame({'apid':4,'apos':[0,1,1,2,2,3],'ahap':0,'bpid':5,'bpos':[0,1,2,1,2,3],'bhap':0,'samedir':True, 'correct':[True,True,False,False,True,True]}),
+        #aabb#
+        # || #
+        #-ab-#
+        pd.DataFrame({'apid':6,'apos':[0,1,2,3],'ahap':0,'bpid':7,'bpos':[0,0,1,1],'bhap':0,'samedir':True, 'correct':[False,True,True,False]}),
+        #abcde#
+        #| | |#
+        #adcbe#
+        pd.DataFrame({'apid':8,'apos':[0,1,2,3,4],'ahap':0,'bpid':9,'bpos':[0,3,2,1,4],'bhap':0,'samedir':True, 'correct':[True,False,True,False,True]}),
+        #afghibcde#
+        #|    |  |#
+        #a--dcb--e#
+        pd.DataFrame({'apid':10,'apos':[0,5,6,7,8],'ahap':0,'bpid':11,'bpos':[0,3,2,1,4],'bhap':0,'samedir':True, 'correct':[True,True,False,False,True]}),
+        #abcb#
+        #||| #
+        #abc-#
+        pd.DataFrame({'apid':12,'apos':[0,1,2,3],'ahap':0,'bpid':13,'bpos':[0,1,2,1],'bhap':0,'samedir':True, 'correct':[True,True,True,False]}),
+        #abcb#
+        #| ||#
+        #a-cb#
+        pd.DataFrame({'apid':14,'apos':[0,1,2,3],'ahap':0,'bpid':15,'bpos':[0,2,1,2],'bhap':0,'samedir':True, 'correct':[True,False,True,True]}),
+        #aa#
+        #||#
+        #aa#
+        pd.DataFrame({'apid':16,'apos':[0,0,1,1],'ahap':0,'bpid':17,'bpos':[0,1,0,1],'bhap':0,'samedir':True, 'correct':[True,False,False,True]}),
+        #abbac#
+        #  |||#
+        #--bac#
+        pd.DataFrame({'apid':18,'apos':[0,1,2,3,4],'ahap':0,'bpid':19,'bpos':[1,0,0,1,2],'bhap':0,'samedir':True, 'correct':[False,False,True,True,True]}),
+        #abbc#
+        #| ||#
+        #adbc#
+        pd.DataFrame({'apid':20,'apos':[0,1,2,3],'ahap':0,'bpid':21,'bpos':[0,2,2,3],'bhap':0,'samedir':True, 'correct':[True,False,True,True]}),
+        #abcadc#
+        #|  | |#
+        #adeafc#
+        pd.DataFrame({'apid':22,'apos':[0,0,3,3,5],'ahap':0,'bpid':23,'bpos':[0,3,0,3,5],'bhap':0,'samedir':True, 'correct':[True,False,False,True,True]}),
+        #ab-cdaefca#
+        #|  |||    #
+        #agecda----#
+        pd.DataFrame({'apid':24,'apos':[0,0,2,3,4,4,5,7,8,8],'ahap':0,'bpid':25,'bpos':[0,5,3,4,0,5,2,3,0,5],'bhap':0,'samedir':True, 'correct':[True,False,True,True,False,True,False,False,False,False]}),
+        #a-bcd#
+        #| | |#
+        #acb-d#
+        pd.DataFrame({'apid':26,'apos':[0,1,2,3],'ahap':0,'bpid':27,'bpos':[0,2,1,3],'bhap':0,'samedir':True, 'correct':[True,True,False,True]}),
+        #aabcdbd#
+        # || |  #
+        #-ab-d--#
+        pd.DataFrame({'apid':28,'apos':[0,1,2,4,5,6],'ahap':0,'bpid':29,'bpos':[0,0,1,2,1,2],'bhap':0,'samedir':True, 'correct':[False,True,True,True,False,False]}),
+        #abc#
+        #| |#
+        #aac#
+        pd.DataFrame({'apid':30,'apos':[0,0,2],'ahap':0,'bpid':31,'bpos':[0,1,2],'bhap':0,'samedir':True, 'correct':[True,False,True]}),
+        #abc#
+        #| |#
+        #acc#
+        pd.DataFrame({'apid':32,'apos':[0,2,2],'ahap':0,'bpid':33,'bpos':[0,1,2],'bhap':0,'samedir':True, 'correct':[True,False,True]}),
+        #abc-#
+        #| | #
+        #aacc#
+        pd.DataFrame({'apid':34,'apos':[0,0,2,2],'ahap':0,'bpid':35,'bpos':[0,1,2,3],'bhap':0,'samedir':True, 'correct':[True,False,True,False]}),
+        #abcadd#
+        #||  | #
+        #ab--d-#
+        pd.DataFrame({'apid':36,'apos':[0,1,3,4,5],'ahap':0,'bpid':37,'bpos':[0,1,0,2,2],'bhap':0,'samedir':True, 'correct':[True,True,False,True,False]})
+        ], ignore_index=True)
+#
+    # Invert the test cases to check that they are consistent for both options
+    test_dups = pd.concat([test_dups, test_dups.rename(columns={'apid':'bpid','apos':'bpos','ahap':'bhap','bpid':'apid','bpos':'apos','bhap':'ahap'})], ignore_index=True)
+#
+    # Run function
+    duplications = test_dups.drop(columns=['correct'])
+    duplications = RequireContinuousDirectionForDuplications(duplications)
+#
+    # Compare and report failed tests
+    cols = [col for col in test_dups.columns if col != 'correct']
+    test_dups['chosen'] = test_dups.merge(duplications[cols].drop_duplicates(), on=cols, how='left', indicator=True)['_merge'].values == "both"
+    test_dups = test_dups[np.isin(test_dups['apid'].values, test_dups.loc[test_dups['correct'] != test_dups['chosen'], 'apid'].values)].copy()
+#
+    if len(test_dups) == 0:
+        return False # Success
+    else:
+        print("TestDuplicationConflictResolution failed in", len(np.unique(test_dups['apid'].values)), "cases:")
+        print(test_dups)
+        return True
+
+def TestTraverseScaffoldingGraph():
+    # Define test cases
+    ploidy = 2
+    max_loop_units = 10
+    scaffolds = [] # (test==new scaffold_graph): ', '.join(np.unique(test['from']).astype(str))
+    scaffold_graph = [] # print(",\n".join([str(" "*8+"{") + ', '.join(["'{}': {:>6}".format(k,v) for k,v in zip(entry[entry.isnull() == False].index.values,[val[:-2] if val[-2:] == ".0" else (f"'{val}'" if val in ['-','+','l','r'] else val) for val in entry[entry.isnull() == False].astype(str).values])]) + "}" for entry in [scaffold_graph.loc[i, ['from','from_side','length']+[f'{n}{s}' for s in range(1,scaffold_graph['length'].max()) for n in ['scaf','strand','dist']]] for i in scaffold_graph[scaffold_graph['from'] == x].index.values]]))
+    scaf_bridges = [] # tmp = test[['from','from_side','scaf1','strand1','dist1']].rename(columns={'scaf1':'to','strand1':'to_side','dist1':'mean_dist'}); tmp['to_side'] = np.where(tmp['to_side'] == '+', 'l', 'r'); tmp=tmp.merge(scaf_bridges, on=list(tmp.columns), how='inner').drop_duplicates(); print(",\n".join([str(" "*8+"{") + ', '.join(["'{}': {:>6}".format(k,v) for k,v in zip(entry[entry.isnull() == False].index.values,["{:8.6f}".format(float(val)) if val[:2] == "0." else (f"'{val}'" if val in ['-','+','l','r'] else val) for val in entry[entry.isnull() == False].astype(str).values])]) + "}" for entry in [tmp.loc[i] for i in tmp.index.values]]))
+    org_scaf_conns = [pd.DataFrame({'from':[],'from_side':[],'to':[],'to_side':[],'distance':[]})]
+    result_paths = []
+#
+    # Test 1
+    scaffolds.append( pd.DataFrame({'case':1, 'scaffold':[44, 69, 114, 115, 372, 674, 929, 1306, 2722, 2725, 2799, 2885, 9344, 10723, 11659, 12896, 12910, 13029, 13434, 13452, 13455, 13591, 14096, 15177, 15812, 20727, 26855, 30179, 30214, 31749, 31756, 32229, 33144, 33994, 40554, 41636, 47404, 47516, 49093, 51660, 53480, 56740, 56987, 58443, 70951, 71091, 76860, 96716, 99004, 99341, 99342, 101215, 101373, 107483, 107484, 107485, 107486, 109207, 110827, 112333, 115803, 117303, 117304, 118890, 118892]}) )
+    scaffold_graph.append( pd.DataFrame([
+        {'from':     44, 'from_side':    'l', 'length':      5, 'scaf1':  99342, 'strand1':    '-', 'dist1':    -44, 'scaf2':  99341, 'strand2':    '-', 'dist2':      0, 'scaf3':   9344, 'strand3':    '+', 'dist3':      0, 'scaf4': 118890, 'strand4':    '-', 'dist4':    -13},
+        {'from':     44, 'from_side':    'r', 'length':      3, 'scaf1':   1306, 'strand1':    '-', 'dist1':    -43, 'scaf2':  71091, 'strand2':    '+', 'dist2':    -45},
+        {'from':     44, 'from_side':    'r', 'length':      2, 'scaf1':  71091, 'strand1':    '+', 'dist1':      1},
+        {'from':     69, 'from_side':    'l', 'length':      3, 'scaf1':  47404, 'strand1':    '-', 'dist1':    -43, 'scaf2':  30179, 'strand2':    '-', 'dist2':    -32},
+        {'from':     69, 'from_side':    'l', 'length':      2, 'scaf1': 110827, 'strand1':    '-', 'dist1':    -43},
+        {'from':     69, 'from_side':    'r', 'length':      5, 'scaf1':  13434, 'strand1':    '-', 'dist1':    -41, 'scaf2': 112333, 'strand2':    '+', 'dist2':     38, 'scaf3':    114, 'strand3':    '+', 'dist3':   -819, 'scaf4':    115, 'strand4':    '+', 'dist4':   1131},
+        {'from':     69, 'from_side':    'r', 'length':      5, 'scaf1':  13455, 'strand1':    '-', 'dist1':    -43, 'scaf2': 112333, 'strand2':    '+', 'dist2':    -43, 'scaf3':  41636, 'strand3':    '-', 'dist3':   -710, 'scaf4':    115, 'strand4':    '+', 'dist4':   1932},
+        {'from':    114, 'from_side':    'l', 'length':      4, 'scaf1': 112333, 'strand1':    '-', 'dist1':   -819, 'scaf2':  13434, 'strand2':    '+', 'dist2':     38, 'scaf3':     69, 'strand3':    '-', 'dist3':    -41},
+        {'from':    114, 'from_side':    'r', 'length':      3, 'scaf1':    115, 'strand1':    '+', 'dist1':   1131, 'scaf2': 115803, 'strand2':    '+', 'dist2':    885},
+        {'from':    115, 'from_side':    'l', 'length':      5, 'scaf1':    114, 'strand1':    '-', 'dist1':   1131, 'scaf2': 112333, 'strand2':    '-', 'dist2':   -819, 'scaf3':  13434, 'strand3':    '+', 'dist3':     38, 'scaf4':     69, 'strand4':    '-', 'dist4':    -41},
+        {'from':    115, 'from_side':    'l', 'length':      5, 'scaf1':  41636, 'strand1':    '+', 'dist1':   1932, 'scaf2': 112333, 'strand2':    '-', 'dist2':   -710, 'scaf3':  13455, 'strand3':    '+', 'dist3':    -43, 'scaf4':     69, 'strand4':    '-', 'dist4':    -43},
+        {'from':    115, 'from_side':    'r', 'length':      3, 'scaf1':  15177, 'strand1':    '+', 'dist1':    -42, 'scaf2': 115803, 'strand2':    '+', 'dist2':      5},
+        {'from':    115, 'from_side':    'r', 'length':      2, 'scaf1': 115803, 'strand1':    '+', 'dist1':    885},
+        {'from':    372, 'from_side':    'r', 'length':      5, 'scaf1': 107485, 'strand1':    '+', 'dist1':  -1436, 'scaf2': 107486, 'strand2':    '+', 'dist2':      0, 'scaf3': 101373, 'strand3':    '-', 'dist3':  -1922, 'scaf4':  70951, 'strand4':    '+', 'dist4':      0},
+        {'from':    674, 'from_side':    'l', 'length':      2, 'scaf1':   2799, 'strand1':    '+', 'dist1':     60},
+        {'from':    674, 'from_side':    'r', 'length':      2, 'scaf1':  20727, 'strand1':    '-', 'dist1':    -68},
+        {'from':    674, 'from_side':    'r', 'length':      2, 'scaf1':  20727, 'strand1':    '-', 'dist1':    -18},
+        {'from':    929, 'from_side':    'l', 'length':      6, 'scaf1': 117303, 'strand1':    '-', 'dist1':   2544, 'scaf2': 107484, 'strand2':    '+', 'dist2':   -888, 'scaf3': 107485, 'strand3':    '+', 'dist3':      0, 'scaf4': 107486, 'strand4':    '+', 'dist4':      0, 'scaf5':  33994, 'strand5':    '+', 'dist5':    -44},
+        {'from':    929, 'from_side':    'l', 'length':      2, 'scaf1': 117304, 'strand1':    '-', 'dist1':   2489},
+        {'from':    929, 'from_side':    'r', 'length':      2, 'scaf1':   2725, 'strand1':    '+', 'dist1':   1205},
+        {'from':    929, 'from_side':    'r', 'length':      3, 'scaf1':  14096, 'strand1':    '+', 'dist1':    -44, 'scaf2':   2725, 'strand2':    '+', 'dist2':    642},
+        {'from':   1306, 'from_side':    'l', 'length':      2, 'scaf1':  71091, 'strand1':    '+', 'dist1':    -45},
+        {'from':   1306, 'from_side':    'r', 'length':      2, 'scaf1':     44, 'strand1':    '-', 'dist1':    -43},
+        {'from':   2722, 'from_side':    'l', 'length':      3, 'scaf1':  53480, 'strand1':    '+', 'dist1':      0, 'scaf2':  40554, 'strand2':    '-', 'dist2':      0},
+        {'from':   2725, 'from_side':    'l', 'length':      2, 'scaf1':    929, 'strand1':    '-', 'dist1':   1205},
+        {'from':   2725, 'from_side':    'l', 'length':      3, 'scaf1':  14096, 'strand1':    '-', 'dist1':    642, 'scaf2':    929, 'strand2':    '-', 'dist2':    -44},
+        {'from':   2725, 'from_side':    'r', 'length':      3, 'scaf1':  11659, 'strand1':    '-', 'dist1':    136, 'scaf2':  13591, 'strand2':    '-', 'dist2':    -43},
+        {'from':   2725, 'from_side':    'r', 'length':      3, 'scaf1':  13029, 'strand1':    '+', 'dist1':    143, 'scaf2':  13591, 'strand2':    '-', 'dist2':    -43},
+        {'from':   2725, 'from_side':    'r', 'length':      2, 'scaf1':  13591, 'strand1':    '-', 'dist1':    734},
+        {'from':   2799, 'from_side':    'l', 'length':      2, 'scaf1':    674, 'strand1':    '+', 'dist1':     60},
+        {'from':   2885, 'from_side':    'l', 'length':      2, 'scaf1':  20727, 'strand1':    '+', 'dist1':    -44},
+        {'from':   2885, 'from_side':    'l', 'length':      2, 'scaf1':  20727, 'strand1':    '+', 'dist1':    245},
+        {'from':   2885, 'from_side':    'r', 'length':      3, 'scaf1':  13452, 'strand1':    '-', 'dist1':    -45, 'scaf2':  10723, 'strand2':    '-', 'dist2':    -41},
+        {'from':   2885, 'from_side':    'r', 'length':      3, 'scaf1':  15812, 'strand1':    '+', 'dist1':    -44, 'scaf2':  10723, 'strand2':    '-', 'dist2':    -43},
+        {'from':   9344, 'from_side':    'l', 'length':      4, 'scaf1':  99341, 'strand1':    '+', 'dist1':      0, 'scaf2':  99342, 'strand2':    '+', 'dist2':      0, 'scaf3':     44, 'strand3':    '+', 'dist3':    -44},
+        {'from':   9344, 'from_side':    'l', 'length':      7, 'scaf1':  99342, 'strand1':    '+', 'dist1':     73, 'scaf2': 107483, 'strand2':    '+', 'dist2':    -44, 'scaf3': 107484, 'strand3':    '+', 'dist3':      0, 'scaf4': 107485, 'strand4':    '+', 'dist4':      0, 'scaf5': 107486, 'strand5':    '+', 'dist5':      0, 'scaf6':  99004, 'strand6':    '-', 'dist6':    838},
+        {'from':   9344, 'from_side':    'r', 'length':      2, 'scaf1': 118890, 'strand1':    '-', 'dist1':    -13},
+        {'from':   9344, 'from_side':    'r', 'length':      2, 'scaf1': 118892, 'strand1':    '-', 'dist1':      8},
+        {'from':  10723, 'from_side':    'l', 'length':      3, 'scaf1':  12896, 'strand1':    '-', 'dist1':    -43, 'scaf2':  76860, 'strand2':    '-', 'dist2':    -46},
+        {'from':  10723, 'from_side':    'l', 'length':      3, 'scaf1':  12910, 'strand1':    '-', 'dist1':    -43, 'scaf2':  76860, 'strand2':    '-', 'dist2':    -42},
+        {'from':  10723, 'from_side':    'r', 'length':      3, 'scaf1':  13452, 'strand1':    '+', 'dist1':    -41, 'scaf2':   2885, 'strand2':    '-', 'dist2':    -45},
+        {'from':  10723, 'from_side':    'r', 'length':      3, 'scaf1':  15812, 'strand1':    '-', 'dist1':    -43, 'scaf2':   2885, 'strand2':    '-', 'dist2':    -44},
+        {'from':  11659, 'from_side':    'l', 'length':      2, 'scaf1':  13591, 'strand1':    '-', 'dist1':    -43},
+        {'from':  11659, 'from_side':    'r', 'length':      2, 'scaf1':   2725, 'strand1':    '-', 'dist1':    136},
+        {'from':  12896, 'from_side':    'l', 'length':      2, 'scaf1':  76860, 'strand1':    '-', 'dist1':    -46},
+        {'from':  12896, 'from_side':    'r', 'length':      2, 'scaf1':  10723, 'strand1':    '+', 'dist1':    -43},
+        {'from':  12910, 'from_side':    'l', 'length':      2, 'scaf1':  76860, 'strand1':    '-', 'dist1':    -42},
+        {'from':  12910, 'from_side':    'r', 'length':      2, 'scaf1':  10723, 'strand1':    '+', 'dist1':    -43},
+        {'from':  13029, 'from_side':    'l', 'length':      2, 'scaf1':   2725, 'strand1':    '-', 'dist1':    143},
+        {'from':  13029, 'from_side':    'r', 'length':      2, 'scaf1':  13591, 'strand1':    '-', 'dist1':    -43},
+        {'from':  13434, 'from_side':    'l', 'length':      4, 'scaf1': 112333, 'strand1':    '+', 'dist1':     38, 'scaf2':    114, 'strand2':    '+', 'dist2':   -819, 'scaf3':    115, 'strand3':    '+', 'dist3':   1131},
+        {'from':  13434, 'from_side':    'r', 'length':      2, 'scaf1':     69, 'strand1':    '-', 'dist1':    -41},
+        {'from':  13452, 'from_side':    'l', 'length':      2, 'scaf1':  10723, 'strand1':    '-', 'dist1':    -41},
+        {'from':  13452, 'from_side':    'r', 'length':      2, 'scaf1':   2885, 'strand1':    '-', 'dist1':    -45},
+        {'from':  13455, 'from_side':    'l', 'length':      4, 'scaf1': 112333, 'strand1':    '+', 'dist1':    -43, 'scaf2':  41636, 'strand2':    '-', 'dist2':   -710, 'scaf3':    115, 'strand3':    '+', 'dist3':   1932},
+        {'from':  13455, 'from_side':    'r', 'length':      2, 'scaf1':     69, 'strand1':    '-', 'dist1':    -43},
+        {'from':  13591, 'from_side':    'r', 'length':      2, 'scaf1':   2725, 'strand1':    '-', 'dist1':    734},
+        {'from':  13591, 'from_side':    'r', 'length':      3, 'scaf1':  11659, 'strand1':    '+', 'dist1':    -43, 'scaf2':   2725, 'strand2':    '-', 'dist2':    136},
+        {'from':  13591, 'from_side':    'r', 'length':      3, 'scaf1':  13029, 'strand1':    '-', 'dist1':    -43, 'scaf2':   2725, 'strand2':    '-', 'dist2':    143},
+        {'from':  14096, 'from_side':    'l', 'length':      2, 'scaf1':    929, 'strand1':    '-', 'dist1':    -44},
+        {'from':  14096, 'from_side':    'r', 'length':      2, 'scaf1':   2725, 'strand1':    '+', 'dist1':    642},
+        {'from':  15177, 'from_side':    'l', 'length':      2, 'scaf1':    115, 'strand1':    '-', 'dist1':    -42},
+        {'from':  15177, 'from_side':    'r', 'length':      2, 'scaf1': 115803, 'strand1':    '+', 'dist1':      5},
+        {'from':  15812, 'from_side':    'l', 'length':      2, 'scaf1':   2885, 'strand1':    '-', 'dist1':    -44},
+        {'from':  15812, 'from_side':    'r', 'length':      2, 'scaf1':  10723, 'strand1':    '-', 'dist1':    -43},
+        {'from':  20727, 'from_side':    'l', 'length':      2, 'scaf1':   2885, 'strand1':    '+', 'dist1':    -44},
+        {'from':  20727, 'from_side':    'l', 'length':      2, 'scaf1':   2885, 'strand1':    '+', 'dist1':    245},
+        {'from':  20727, 'from_side':    'r', 'length':      2, 'scaf1':    674, 'strand1':    '-', 'dist1':    -68},
+        {'from':  20727, 'from_side':    'r', 'length':      2, 'scaf1':    674, 'strand1':    '-', 'dist1':    -18},
+        {'from':  26855, 'from_side':    'l', 'length':      3, 'scaf1':  33144, 'strand1':    '-', 'dist1':    -40, 'scaf2':  47404, 'strand2':    '+', 'dist2':  -4062},
+        {'from':  26855, 'from_side':    'r', 'length':      2, 'scaf1': 109207, 'strand1':    '-', 'dist1':    -43},
+        {'from':  30179, 'from_side':    'l', 'length':      2, 'scaf1': 109207, 'strand1':    '-', 'dist1':    -40},
+        {'from':  30179, 'from_side':    'r', 'length':      3, 'scaf1':  47404, 'strand1':    '+', 'dist1':    -32, 'scaf2':     69, 'strand2':    '+', 'dist2':    -43},
+        {'from':  30214, 'from_side':    'l', 'length':      2, 'scaf1': 109207, 'strand1':    '+', 'dist1':     -6},
+        {'from':  30214, 'from_side':    'r', 'length':      4, 'scaf1':  49093, 'strand1':    '-', 'dist1':     17, 'scaf2':  51660, 'strand2':    '+', 'dist2':    -14, 'scaf3': 101215, 'strand3':    '+', 'dist3':      5},
+        {'from':  31749, 'from_side':    'l', 'length':      2, 'scaf1':  31756, 'strand1':    '-', 'dist1':     -1},
+        {'from':  31749, 'from_side':    'l', 'length':      3, 'scaf1':  53480, 'strand1':    '-', 'dist1':   -646, 'scaf2': 101373, 'strand2':    '-', 'dist2':  -1383},
+        {'from':  31749, 'from_side':    'r', 'length':      4, 'scaf1': 101373, 'strand1':    '+', 'dist1':   -350, 'scaf2': 107486, 'strand2':    '-', 'dist2':  -1922, 'scaf3': 107485, 'strand3':    '-', 'dist3':      0},
+        {'from':  31756, 'from_side':    'r', 'length':      3, 'scaf1':  31749, 'strand1':    '+', 'dist1':     -1, 'scaf2': 101373, 'strand2':    '+', 'dist2':   -350},
+        {'from':  32229, 'from_side':    'l', 'length':      2, 'scaf1':  76860, 'strand1':    '+', 'dist1':   -456},
+        {'from':  32229, 'from_side':    'r', 'length':      2, 'scaf1':  71091, 'strand1':    '-', 'dist1':      3},
+        {'from':  33144, 'from_side':    'l', 'length':      2, 'scaf1':  47404, 'strand1':    '+', 'dist1':  -4062},
+        {'from':  33144, 'from_side':    'r', 'length':      3, 'scaf1':  26855, 'strand1':    '+', 'dist1':    -40, 'scaf2': 109207, 'strand2':    '-', 'dist2':    -43},
+        {'from':  33994, 'from_side':    'l', 'length':      6, 'scaf1': 107486, 'strand1':    '-', 'dist1':    -44, 'scaf2': 107485, 'strand2':    '-', 'dist2':      0, 'scaf3': 107484, 'strand3':    '-', 'dist3':      0, 'scaf4': 117303, 'strand4':    '+', 'dist4':   -888, 'scaf5':    929, 'strand5':    '+', 'dist5':   2544},
+        {'from':  40554, 'from_side':    'r', 'length':      3, 'scaf1':  53480, 'strand1':    '-', 'dist1':      0, 'scaf2':   2722, 'strand2':    '+', 'dist2':      0},
+        {'from':  41636, 'from_side':    'l', 'length':      2, 'scaf1':    115, 'strand1':    '+', 'dist1':   1932},
+        {'from':  41636, 'from_side':    'r', 'length':      4, 'scaf1': 112333, 'strand1':    '-', 'dist1':   -710, 'scaf2':  13455, 'strand2':    '+', 'dist2':    -43, 'scaf3':     69, 'strand3':    '-', 'dist3':    -43},        {'from':  47404, 'from_side':    'l', 'length':      3, 'scaf1':  30179, 'strand1':    '-', 'dist1':    -32, 'scaf2': 109207, 'strand2':    '-', 'dist2':    -40},
+        {'from':  47404, 'from_side':    'l', 'length':      3, 'scaf1':  33144, 'strand1':    '+', 'dist1':  -4062, 'scaf2':  26855, 'strand2':    '+', 'dist2':    -40},
+        {'from':  47404, 'from_side':    'r', 'length':      2, 'scaf1':     69, 'strand1':    '+', 'dist1':    -43},
+        {'from':  49093, 'from_side':    'l', 'length':      3, 'scaf1':  51660, 'strand1':    '+', 'dist1':    -14, 'scaf2': 101215, 'strand2':    '+', 'dist2':      5},
+        {'from':  49093, 'from_side':    'l', 'length':      5, 'scaf1':  56987, 'strand1':    '+', 'dist1':      4, 'scaf2': 101215, 'strand2':    '+', 'dist2':    -10, 'scaf3':  56740, 'strand3':    '+', 'dist3':    469, 'scaf4':  96716, 'strand4':    '-', 'dist4':    -45},
+        {'from':  49093, 'from_side':    'r', 'length':      3, 'scaf1':  30214, 'strand1':    '-', 'dist1':     17, 'scaf2': 109207, 'strand2':    '+', 'dist2':     -6},
+        {'from':  49093, 'from_side':    'r', 'length':      2, 'scaf1': 109207, 'strand1':    '+', 'dist1':    780},
+        {'from':  47516, 'from_side':    'l', 'length':      3, 'scaf1': 101215, 'strand1':    '-', 'dist1':    453, 'scaf2':  51660, 'strand2':    '-', 'dist2':      5},
+        {'from':  47516, 'from_side':    'r', 'length':      3, 'scaf1':  96716, 'strand1':    '-', 'dist1':    -45, 'scaf2': 118892, 'strand2':    '+', 'dist2':    -38},
+        {'from':  51660, 'from_side':    'l', 'length':      4, 'scaf1':  49093, 'strand1':    '+', 'dist1':    -14, 'scaf2':  30214, 'strand2':    '-', 'dist2':     17, 'scaf3': 109207, 'strand3':    '+', 'dist3':     -6},
+        {'from':  51660, 'from_side':    'r', 'length':      5, 'scaf1': 101215, 'strand1':    '+', 'dist1':      5, 'scaf2':  47516, 'strand2':    '+', 'dist2':    453, 'scaf3':  96716, 'strand3':    '-', 'dist3':    -45, 'scaf4': 118892, 'strand4':    '+', 'dist4':    -38},
+        {'from':  53480, 'from_side':    'l', 'length':      2, 'scaf1':   2722, 'strand1':    '+', 'dist1':      0},
+        {'from':  53480, 'from_side':    'l', 'length':      2, 'scaf1': 101373, 'strand1':    '-', 'dist1':  -1383},
+        {'from':  53480, 'from_side':    'r', 'length':      3, 'scaf1':  31749, 'strand1':    '+', 'dist1':   -646, 'scaf2': 101373, 'strand2':    '+', 'dist2':   -350},
+        {'from':  53480, 'from_side':    'r', 'length':      2, 'scaf1':  40554, 'strand1':    '-', 'dist1':      0},
+        {'from':  56740, 'from_side':    'l', 'length':      5, 'scaf1': 101215, 'strand1':    '-', 'dist1':    469, 'scaf2':  56987, 'strand2':    '-', 'dist2':    -10, 'scaf3':  49093, 'strand3':    '+', 'dist3':      4, 'scaf4': 109207, 'strand4':    '+', 'dist4':    780},
+        {'from':  56740, 'from_side':    'r', 'length':      3, 'scaf1':  96716, 'strand1':    '-', 'dist1':    -45, 'scaf2': 118890, 'strand2':    '+', 'dist2':     -3},
+        {'from':  56987, 'from_side':    'l', 'length':      3, 'scaf1':  49093, 'strand1':    '+', 'dist1':      4, 'scaf2': 109207, 'strand2':    '+', 'dist2':    780},
+        {'from':  56987, 'from_side':    'r', 'length':      4, 'scaf1': 101215, 'strand1':    '+', 'dist1':    -10, 'scaf2':  56740, 'strand2':    '+', 'dist2':    469, 'scaf3':  96716, 'strand3':    '-', 'dist3':    -45},
+        {'from':  58443, 'from_side':    'r', 'length':      2, 'scaf1': 107486, 'strand1':    '+', 'dist1':    -83},
+        {'from':  70951, 'from_side':    'l', 'length':      5, 'scaf1': 101373, 'strand1':    '+', 'dist1':      0, 'scaf2': 107486, 'strand2':    '-', 'dist2':  -1922, 'scaf3': 107485, 'strand3':    '-', 'dist3':      0, 'scaf4':    372, 'strand4':    '-', 'dist4':  -1436},
+        {'from':  71091, 'from_side':    'l', 'length':      2, 'scaf1':     44, 'strand1':    '-', 'dist1':      1},
+        {'from':  71091, 'from_side':    'l', 'length':      3, 'scaf1':   1306, 'strand1':    '+', 'dist1':    -45, 'scaf2':     44, 'strand2':    '-', 'dist2':    -43},
+        {'from':  71091, 'from_side':    'r', 'length':      3, 'scaf1':  32229, 'strand1':    '-', 'dist1':      3, 'scaf2':  76860, 'strand2':    '+', 'dist2':   -456},
+        {'from':  71091, 'from_side':    'r', 'length':      2, 'scaf1':  76860, 'strand1':    '+', 'dist1':   2134},
+        {'from':  76860, 'from_side':    'l', 'length':      3, 'scaf1':  32229, 'strand1':    '+', 'dist1':   -456, 'scaf2':  71091, 'strand2':    '-', 'dist2':      3},
+        {'from':  76860, 'from_side':    'l', 'length':      2, 'scaf1':  71091, 'strand1':    '-', 'dist1':   2134},
+        {'from':  76860, 'from_side':    'r', 'length':      3, 'scaf1':  12896, 'strand1':    '+', 'dist1':    -46, 'scaf2':  10723, 'strand2':    '+', 'dist2':    -43},
+        {'from':  76860, 'from_side':    'r', 'length':      3, 'scaf1':  12910, 'strand1':    '+', 'dist1':    -42, 'scaf2':  10723, 'strand2':    '+', 'dist2':    -43},
+        {'from':  96716, 'from_side':    'l', 'length':      2, 'scaf1': 118890, 'strand1':    '+', 'dist1':     -3},
+        {'from':  96716, 'from_side':    'l', 'length':      2, 'scaf1': 118892, 'strand1':    '+', 'dist1':    -38},
+        {'from':  96716, 'from_side':    'r', 'length':      4, 'scaf1':  47516, 'strand1':    '-', 'dist1':    -45, 'scaf2': 101215, 'strand2':    '-', 'dist2':    453, 'scaf3':  51660, 'strand3':    '-', 'dist3':      5},
+        {'from':  96716, 'from_side':    'r', 'length':      5, 'scaf1':  56740, 'strand1':    '-', 'dist1':    -45, 'scaf2': 101215, 'strand2':    '-', 'dist2':    469, 'scaf3':  56987, 'strand3':    '-', 'dist3':    -10, 'scaf4':  49093, 'strand4':    '+', 'dist4':      4},
+        {'from':  99004, 'from_side':    'r', 'length':      7, 'scaf1': 107486, 'strand1':    '-', 'dist1':    838, 'scaf2': 107485, 'strand2':    '-', 'dist2':      0, 'scaf3': 107484, 'strand3':    '-', 'dist3':      0, 'scaf4': 107483, 'strand4':    '-', 'dist4':      0, 'scaf5':  99342, 'strand5':    '-', 'dist5':    -44, 'scaf6':   9344, 'strand6':    '+', 'dist6':     73},
+        {'from':  99341, 'from_side':    'l', 'length':      3, 'scaf1':   9344, 'strand1':    '+', 'dist1':      0, 'scaf2': 118890, 'strand2':    '-', 'dist2':    -13},
+        {'from':  99341, 'from_side':    'r', 'length':      3, 'scaf1':  99342, 'strand1':    '+', 'dist1':      0, 'scaf2':     44, 'strand2':    '+', 'dist2':    -44},
+        {'from':  99342, 'from_side':    'l', 'length':      2, 'scaf1':   9344, 'strand1':    '+', 'dist1':     73},
+        {'from':  99342, 'from_side':    'l', 'length':      4, 'scaf1':  99341, 'strand1':    '-', 'dist1':      0, 'scaf2':   9344, 'strand2':    '+', 'dist2':      0, 'scaf3': 118890, 'strand3':    '-', 'dist3':    -13},
+        {'from':  99342, 'from_side':    'r', 'length':      2, 'scaf1':     44, 'strand1':    '+', 'dist1':    -44},
+        {'from':  99342, 'from_side':    'r', 'length':      6, 'scaf1': 107483, 'strand1':    '+', 'dist1':    -44, 'scaf2': 107484, 'strand2':    '+', 'dist2':      0, 'scaf3': 107485, 'strand3':    '+', 'dist3':      0, 'scaf4': 107486, 'strand4':    '+', 'dist4':      0, 'scaf5':  99004, 'strand5':    '-', 'dist5':    838},
+        {'from': 101215, 'from_side':    'l', 'length':      5, 'scaf1':  51660, 'strand1':    '-', 'dist1':      5, 'scaf2':  49093, 'strand2':    '+', 'dist2':    -14, 'scaf3':  30214, 'strand3':    '-', 'dist3':     17, 'scaf4': 109207, 'strand4':    '+', 'dist4':     -6},
+        {'from': 101215, 'from_side':    'l', 'length':      4, 'scaf1':  56987, 'strand1':    '-', 'dist1':    -10, 'scaf2':  49093, 'strand2':    '+', 'dist2':      4, 'scaf3': 109207, 'strand3':    '+', 'dist3':    780},
+        {'from': 101215, 'from_side':    'r', 'length':      4, 'scaf1':  47516, 'strand1':    '+', 'dist1':    453, 'scaf2':  96716, 'strand2':    '-', 'dist2':    -45, 'scaf3': 118892, 'strand3':    '+', 'dist3':    -38},
+        {'from': 101215, 'from_side':    'r', 'length':      4, 'scaf1':  56740, 'strand1':    '+', 'dist1':    469, 'scaf2':  96716, 'strand2':    '-', 'dist2':    -45, 'scaf3': 118890, 'strand3':    '+', 'dist3':     -3},
+        {'from': 101373, 'from_side':    'l', 'length':      3, 'scaf1':  31749, 'strand1':    '-', 'dist1':   -350, 'scaf2':  31756, 'strand2':    '-', 'dist2':     -1},
+        {'from': 101373, 'from_side':    'l', 'length':      4, 'scaf1':  31749, 'strand1':    '-', 'dist1':   -350, 'scaf2':  53480, 'strand2':    '-', 'dist2':   -646, 'scaf3': 101373, 'strand3':    '-', 'dist3':  -1383},
+        {'from': 101373, 'from_side':    'l', 'length':      2, 'scaf1':  70951, 'strand1':    '+', 'dist1':      0},
+        {'from': 101373, 'from_side':    'r', 'length':      4, 'scaf1':  53480, 'strand1':    '+', 'dist1':  -1383, 'scaf2':  31749, 'strand2':    '+', 'dist2':   -646, 'scaf3': 101373, 'strand3':    '+', 'dist3':   -350},
+        {'from': 101373, 'from_side':    'r', 'length':      4, 'scaf1': 107486, 'strand1':    '-', 'dist1':  -1922, 'scaf2': 107485, 'strand2':    '-', 'dist2':      0, 'scaf3':    372, 'strand3':    '-', 'dist3':  -1436},
+        {'from': 101373, 'from_side':    'r', 'length':      5, 'scaf1': 107486, 'strand1':    '-', 'dist1':  -1922, 'scaf2': 107485, 'strand2':    '-', 'dist2':      0, 'scaf3': 107484, 'strand3':    '-', 'dist3':      0, 'scaf4': 107483, 'strand4':    '-', 'dist4':      0},
+        {'from': 107483, 'from_side':    'l', 'length':      3, 'scaf1':  99342, 'strand1':    '-', 'dist1':    -44, 'scaf2':   9344, 'strand2':    '+', 'dist2':     73},
+        {'from': 107483, 'from_side':    'r', 'length':      5, 'scaf1': 107484, 'strand1':    '+', 'dist1':      0, 'scaf2': 107485, 'strand2':    '+', 'dist2':      0, 'scaf3': 107486, 'strand3':    '+', 'dist3':      0, 'scaf4':  99004, 'strand4':    '-', 'dist4':    838},
+        {'from': 107483, 'from_side':    'r', 'length':      5, 'scaf1': 107484, 'strand1':    '+', 'dist1':      0, 'scaf2': 107485, 'strand2':    '+', 'dist2':      0, 'scaf3': 107486, 'strand3':    '+', 'dist3':      0, 'scaf4': 101373, 'strand4':    '-', 'dist4':  -1922},
+        {'from': 107484, 'from_side':    'l', 'length':      4, 'scaf1': 107483, 'strand1':    '-', 'dist1':      0, 'scaf2':  99342, 'strand2':    '-', 'dist2':    -44, 'scaf3':   9344, 'strand3':    '+', 'dist3':     73},
+        {'from': 107484, 'from_side':    'l', 'length':      3, 'scaf1': 117303, 'strand1':    '+', 'dist1':   -888, 'scaf2':    929, 'strand2':    '+', 'dist2':   2544},
+        {'from': 107484, 'from_side':    'r', 'length':      4, 'scaf1': 107485, 'strand1':    '+', 'dist1':      0, 'scaf2': 107486, 'strand2':    '+', 'dist2':      0, 'scaf3':  33994, 'strand3':    '+', 'dist3':    -44},
+        {'from': 107484, 'from_side':    'r', 'length':      4, 'scaf1': 107485, 'strand1':    '+', 'dist1':      0, 'scaf2': 107486, 'strand2':    '+', 'dist2':      0, 'scaf3':  99004, 'strand3':    '-', 'dist3':    838},
+        {'from': 107484, 'from_side':    'r', 'length':      4, 'scaf1': 107485, 'strand1':    '+', 'dist1':      0, 'scaf2': 107486, 'strand2':    '+', 'dist2':      0, 'scaf3': 101373, 'strand3':    '-', 'dist3':  -1922},
+        {'from': 107485, 'from_side':    'l', 'length':      2, 'scaf1':    372, 'strand1':    '-', 'dist1':  -1436},
+        {'from': 107485, 'from_side':    'l', 'length':      5, 'scaf1': 107484, 'strand1':    '-', 'dist1':      0, 'scaf2': 107483, 'strand2':    '-', 'dist2':      0, 'scaf3':  99342, 'strand3':    '-', 'dist3':    -44, 'scaf4':   9344, 'strand4':    '+', 'dist4':     73},
+        {'from': 107485, 'from_side':    'l', 'length':      4, 'scaf1': 107484, 'strand1':    '-', 'dist1':      0, 'scaf2': 117303, 'strand2':    '+', 'dist2':   -888, 'scaf3':    929, 'strand3':    '+', 'dist3':   2544},
+        {'from': 107485, 'from_side':    'r', 'length':      3, 'scaf1': 107486, 'strand1':    '+', 'dist1':      0, 'scaf2':  33994, 'strand2':    '+', 'dist2':    -44},
+        {'from': 107485, 'from_side':    'r', 'length':      3, 'scaf1': 107486, 'strand1':    '+', 'dist1':      0, 'scaf2':  99004, 'strand2':    '-', 'dist2':    838},
+        {'from': 107485, 'from_side':    'r', 'length':      4, 'scaf1': 107486, 'strand1':    '+', 'dist1':      0, 'scaf2': 101373, 'strand2':    '-', 'dist2':  -1922, 'scaf3':  31749, 'strand3':    '-', 'dist3':   -350},
+        {'from': 107485, 'from_side':    'r', 'length':      4, 'scaf1': 107486, 'strand1':    '+', 'dist1':      0, 'scaf2': 101373, 'strand2':    '-', 'dist2':  -1922, 'scaf3':  70951, 'strand3':    '+', 'dist3':      0},
+        {'from': 107486, 'from_side':    'l', 'length':      2, 'scaf1':  58443, 'strand1':    '-', 'dist1':    -83},
+        {'from': 107486, 'from_side':    'l', 'length':      3, 'scaf1': 107485, 'strand1':    '-', 'dist1':      0, 'scaf2':    372, 'strand2':    '-', 'dist2':  -1436},
+        {'from': 107486, 'from_side':    'l', 'length':      6, 'scaf1': 107485, 'strand1':    '-', 'dist1':      0, 'scaf2': 107484, 'strand2':    '-', 'dist2':      0, 'scaf3': 107483, 'strand3':    '-', 'dist3':      0, 'scaf4':  99342, 'strand4':    '-', 'dist4':    -44, 'scaf5':   9344, 'strand5':    '+', 'dist5':     73},
+        {'from': 107486, 'from_side':    'l', 'length':      5, 'scaf1': 107485, 'strand1':    '-', 'dist1':      0, 'scaf2': 107484, 'strand2':    '-', 'dist2':      0, 'scaf3': 117303, 'strand3':    '+', 'dist3':   -888, 'scaf4':    929, 'strand4':    '+', 'dist4':   2544},
+        {'from': 107486, 'from_side':    'r', 'length':      2, 'scaf1':  33994, 'strand1':    '+', 'dist1':    -44},
+        {'from': 107486, 'from_side':    'r', 'length':      2, 'scaf1':  99004, 'strand1':    '-', 'dist1':    838},
+        {'from': 107486, 'from_side':    'r', 'length':      3, 'scaf1': 101373, 'strand1':    '-', 'dist1':  -1922, 'scaf2':  31749, 'strand2':    '-', 'dist2':   -350},
+        {'from': 107486, 'from_side':    'r', 'length':      3, 'scaf1': 101373, 'strand1':    '-', 'dist1':  -1922, 'scaf2':  70951, 'strand2':    '+', 'dist2':      0},
+        {'from': 109207, 'from_side':    'l', 'length':      5, 'scaf1':  30214, 'strand1':    '+', 'dist1':     -6, 'scaf2':  49093, 'strand2':    '-', 'dist2':     17, 'scaf3':  51660, 'strand3':    '+', 'dist3':    -14, 'scaf4': 101215, 'strand4':    '+', 'dist4':      5},
+        {'from': 109207, 'from_side':    'l', 'length':      5, 'scaf1':  49093, 'strand1':    '-', 'dist1':    780, 'scaf2':  56987, 'strand2':    '+', 'dist2':      4, 'scaf3': 101215, 'strand3':    '+', 'dist3':    -10, 'scaf4':  56740, 'strand4':    '+', 'dist4':    469},
+        {'from': 109207, 'from_side':    'r', 'length':      3, 'scaf1':  26855, 'strand1':    '-', 'dist1':    -43, 'scaf2':  33144, 'strand2':    '-', 'dist2':    -40},
+        {'from': 109207, 'from_side':    'r', 'length':      3, 'scaf1':  30179, 'strand1':    '+', 'dist1':    -40, 'scaf2':  47404, 'strand2':    '+', 'dist2':    -32},
+        {'from': 110827, 'from_side':    'r', 'length':      2, 'scaf1':     69, 'strand1':    '+', 'dist1':    -43},
+        {'from': 112333, 'from_side':    'l', 'length':      3, 'scaf1':  13434, 'strand1':    '+', 'dist1':     38, 'scaf2':     69, 'strand2':    '-', 'dist2':    -41},
+        {'from': 112333, 'from_side':    'l', 'length':      3, 'scaf1':  13455, 'strand1':    '+', 'dist1':    -43, 'scaf2':     69, 'strand2':    '-', 'dist2':    -43},
+        {'from': 112333, 'from_side':    'r', 'length':      4, 'scaf1':    114, 'strand1':    '+', 'dist1':   -819, 'scaf2':    115, 'strand2':    '+', 'dist2':   1131, 'scaf3': 115803, 'strand3':    '+', 'dist3':    885},
+        {'from': 112333, 'from_side':    'r', 'length':      3, 'scaf1':  41636, 'strand1':    '-', 'dist1':   -710, 'scaf2':    115, 'strand2':    '+', 'dist2':   1932},
+        {'from': 115803, 'from_side':    'l', 'length':      4, 'scaf1':    115, 'strand1':    '-', 'dist1':    885, 'scaf2':    114, 'strand2':    '-', 'dist2':   1131, 'scaf3': 112333, 'strand3':    '-', 'dist3':   -819},
+        {'from': 115803, 'from_side':    'l', 'length':      3, 'scaf1':  15177, 'strand1':    '-', 'dist1':      5, 'scaf2':    115, 'strand2':    '-', 'dist2':    -42},
+        {'from': 117303, 'from_side':    'l', 'length':      5, 'scaf1': 107484, 'strand1':    '+', 'dist1':   -888, 'scaf2': 107485, 'strand2':    '+', 'dist2':      0, 'scaf3': 107486, 'strand3':    '+', 'dist3':      0, 'scaf4':  33994, 'strand4':    '+', 'dist4':    -44},
+        {'from': 117303, 'from_side':    'r', 'length':      2, 'scaf1':    929, 'strand1':    '+', 'dist1':   2544},
+        {'from': 117304, 'from_side':    'r', 'length':      2, 'scaf1':    929, 'strand1':    '+', 'dist1':   2489},
+        {'from': 118890, 'from_side':    'l', 'length':      4, 'scaf1':  96716, 'strand1':    '+', 'dist1':     -3, 'scaf2':  56740, 'strand2':    '-', 'dist2':    -45, 'scaf3': 101215, 'strand3':    '-', 'dist3':    469},
+        {'from': 118890, 'from_side':    'r', 'length':      5, 'scaf1':   9344, 'strand1':    '-', 'dist1':    -13, 'scaf2':  99341, 'strand2':    '+', 'dist2':      0, 'scaf3':  99342, 'strand3':    '+', 'dist3':      0, 'scaf4':     44, 'strand4':    '+', 'dist4':    -44},
+        {'from': 118892, 'from_side':    'l', 'length':      5, 'scaf1':  96716, 'strand1':    '+', 'dist1':    -38, 'scaf2':  47516, 'strand2':    '-', 'dist2':    -45, 'scaf3': 101215, 'strand3':    '-', 'dist3':    453, 'scaf4':  51660, 'strand4':    '-', 'dist4':      5},
+        {'from': 118892, 'from_side':    'r', 'length':      2, 'scaf1':   9344, 'strand1':    '-', 'dist1':      8}
+        ]) )
+    scaf_bridges.append( pd.DataFrame([
+        {'from':     44, 'from_side':    'l', 'to':  99342, 'to_side':    'r', 'mean_dist':    -44, 'mapq':  60060, 'bcount':     19, 'min_dist':    -49, 'max_dist':    -33, 'probability': 0.273725, 'to_alt':      2, 'from_alt':      1},
+        {'from':     44, 'from_side':    'r', 'to':   1306, 'to_side':    'r', 'mean_dist':    -43, 'mapq':  60060, 'bcount':     12, 'min_dist':    -46, 'max_dist':    -39, 'probability': 0.064232, 'to_alt':      1, 'from_alt':      2},
+        {'from':     44, 'from_side':    'r', 'to':  71091, 'to_side':    'l', 'mean_dist':      1, 'mapq':  60060, 'bcount':      5, 'min_dist':     -1, 'max_dist':      6, 'probability': 0.007368, 'to_alt':      2, 'from_alt':      2},
+        {'from':     69, 'from_side':    'l', 'to':  47404, 'to_side':    'r', 'mean_dist':    -43, 'mapq':  60060, 'bcount':     15, 'min_dist':    -49, 'max_dist':    -38, 'probability': 0.129976, 'to_alt':      1, 'from_alt':      2},
+        {'from':     69, 'from_side':    'l', 'to': 110827, 'to_side':    'r', 'mean_dist':    -43, 'mapq':  60060, 'bcount':     24, 'min_dist':    -50, 'max_dist':    -16, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      2},
+        {'from':     69, 'from_side':    'r', 'to':  13434, 'to_side':    'r', 'mean_dist':    -41, 'mapq':  60060, 'bcount':     18, 'min_dist':    -51, 'max_dist':    -31, 'probability': 0.231835, 'to_alt':      1, 'from_alt':      2},
+        {'from':     69, 'from_side':    'r', 'to':  13455, 'to_side':    'r', 'mean_dist':    -43, 'mapq':  60060, 'bcount':     27, 'min_dist':    -60, 'max_dist':    -17, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      2},
+        {'from':    114, 'from_side':    'l', 'to': 112333, 'to_side':    'r', 'mean_dist':   -819, 'mapq':  60060, 'bcount':     22, 'min_dist':   -931, 'max_dist':   -785, 'probability': 0.417654, 'to_alt':      2, 'from_alt':      1},
+        {'from':    114, 'from_side':    'r', 'to':    115, 'to_side':    'l', 'mean_dist':   1131, 'mapq':  60060, 'bcount':     21, 'min_dist':   1080, 'max_dist':   1263, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      1},
+        {'from':    115, 'from_side':    'l', 'to':    114, 'to_side':    'r', 'mean_dist':   1131, 'mapq':  60060, 'bcount':     21, 'min_dist':   1080, 'max_dist':   1263, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      2},
+        {'from':    115, 'from_side':    'l', 'to':  41636, 'to_side':    'l', 'mean_dist':   1932, 'mapq':  60060, 'bcount':     18, 'min_dist':   1811, 'max_dist':   2087, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      2},
+        {'from':    115, 'from_side':    'r', 'to':  15177, 'to_side':    'l', 'mean_dist':    -42, 'mapq':  60060, 'bcount':     14, 'min_dist':    -52, 'max_dist':    -20, 'probability': 0.104244, 'to_alt':      1, 'from_alt':      2},
+        {'from':    115, 'from_side':    'r', 'to': 115803, 'to_side':    'l', 'mean_dist':    885, 'mapq':  60060, 'bcount':     15, 'min_dist':    818, 'max_dist':   1120, 'probability': 0.209365, 'to_alt':      2, 'from_alt':      2},
+        {'from':    372, 'from_side':    'r', 'to': 107485, 'to_side':    'l', 'mean_dist':  -1436, 'mapq':  60060, 'bcount':     14, 'min_dist':  -1605, 'max_dist':  -1350, 'probability': 0.169655, 'to_alt':      2, 'from_alt':      1},
+        {'from':    674, 'from_side':    'l', 'to':   2799, 'to_side':    'l', 'mean_dist':     60, 'mapq':  60060, 'bcount':     19, 'min_dist':     43, 'max_dist':    107, 'probability': 0.273725, 'to_alt':      2, 'from_alt':      1},
+        {'from':    674, 'from_side':    'r', 'to':  20727, 'to_side':    'r', 'mean_dist':    -68, 'mapq':  60060, 'bcount':     10, 'min_dist':    -79, 'max_dist':    -63, 'probability': 0.037322, 'to_alt':      2, 'from_alt':      2},
+        {'from':    674, 'from_side':    'r', 'to':  20727, 'to_side':    'r', 'mean_dist':    -18, 'mapq':  60060, 'bcount':      8, 'min_dist':    -22, 'max_dist':    -11, 'probability': 0.020422, 'to_alt':      2, 'from_alt':      2},
+        {'from':    929, 'from_side':    'l', 'to': 117303, 'to_side':    'r', 'mean_dist':   2544, 'mapq':  60060, 'bcount':      7, 'min_dist':   2451, 'max_dist':   2631, 'probability': 0.076700, 'to_alt':      1, 'from_alt':      2},
+        {'from':    929, 'from_side':    'l', 'to': 117304, 'to_side':    'r', 'mean_dist':   2489, 'mapq':  60060, 'bcount':      2, 'min_dist':   2450, 'max_dist':   2534, 'probability': 0.008611, 'to_alt':      1, 'from_alt':      2},
+        {'from':    929, 'from_side':    'r', 'to':   2725, 'to_side':    'l', 'mean_dist':   1205, 'mapq':  60060, 'bcount':      6, 'min_dist':   1175, 'max_dist':   1229, 'probability': 0.016554, 'to_alt':      2, 'from_alt':      2},
+        {'from':    929, 'from_side':    'r', 'to':  14096, 'to_side':    'l', 'mean_dist':    -44, 'mapq':  60060, 'bcount':      9, 'min_dist':    -49, 'max_dist':    -34, 'probability': 0.027818, 'to_alt':      1, 'from_alt':      2},
+        {'from':   1306, 'from_side':    'l', 'to':  71091, 'to_side':    'l', 'mean_dist':    -45, 'mapq':  60060, 'bcount':      8, 'min_dist':    -49, 'max_dist':    -40, 'probability': 0.020422, 'to_alt':      2, 'from_alt':      1},
+        {'from':   1306, 'from_side':    'r', 'to':     44, 'to_side':    'r', 'mean_dist':    -43, 'mapq':  60060, 'bcount':     12, 'min_dist':    -46, 'max_dist':    -39, 'probability': 0.064232, 'to_alt':      2, 'from_alt':      1},
+        {'from':   2722, 'from_side':    'l', 'to':  53480, 'to_side':    'l', 'mean_dist':      0, 'mapq':  60060, 'bcount':     16, 'min_dist':      0, 'max_dist':      0, 'probability': 0.159802, 'to_alt':      2, 'from_alt':      1},
+        {'from':   2725, 'from_side':    'l', 'to':    929, 'to_side':    'r', 'mean_dist':   1205, 'mapq':  60060, 'bcount':      6, 'min_dist':   1175, 'max_dist':   1229, 'probability': 0.016554, 'to_alt':      2, 'from_alt':      2},
+        {'from':   2725, 'from_side':    'l', 'to':  14096, 'to_side':    'r', 'mean_dist':    642, 'mapq':  60060, 'bcount':      8, 'min_dist':    586, 'max_dist':    773, 'probability': 0.033108, 'to_alt':      1, 'from_alt':      2},
+        {'from':   2725, 'from_side':    'r', 'to':  11659, 'to_side':    'r', 'mean_dist':    136, 'mapq':  60060, 'bcount':      7, 'min_dist':    129, 'max_dist':    146, 'probability': 0.014765, 'to_alt':      1, 'from_alt':      3},
+        {'from':   2725, 'from_side':    'r', 'to':  13029, 'to_side':    'l', 'mean_dist':    143, 'mapq':  60060, 'bcount':      3, 'min_dist':    126, 'max_dist':    201, 'probability': 0.003454, 'to_alt':      1, 'from_alt':      3},
+        {'from':   2725, 'from_side':    'r', 'to':  13591, 'to_side':    'r', 'mean_dist':    734, 'mapq':  60060, 'bcount':      5, 'min_dist':    684, 'max_dist':    797, 'probability': 0.011373, 'to_alt':      3, 'from_alt':      3},
+        {'from':   2799, 'from_side':    'l', 'to':    674, 'to_side':    'l', 'mean_dist':     60, 'mapq':  60060, 'bcount':     19, 'min_dist':     43, 'max_dist':    107, 'probability': 0.273725, 'to_alt':      1, 'from_alt':      2},
+        {'from':   2885, 'from_side':    'l', 'to':  20727, 'to_side':    'l', 'mean_dist':    -44, 'mapq':  60060, 'bcount':     14, 'min_dist':    -55, 'max_dist':    -35, 'probability': 0.104244, 'to_alt':      2, 'from_alt':      2},
+        {'from':   2885, 'from_side':    'l', 'to':  20727, 'to_side':    'l', 'mean_dist':    245, 'mapq':  60060, 'bcount':     12, 'min_dist':    220, 'max_dist':    324, 'probability': 0.064232, 'to_alt':      2, 'from_alt':      2},
+        {'from':   2885, 'from_side':    'r', 'to':  13452, 'to_side':    'r', 'mean_dist':    -45, 'mapq':  60060, 'bcount':      6, 'min_dist':    -47, 'max_dist':    -43, 'probability': 0.010512, 'to_alt':      1, 'from_alt':      2},
+        {'from':   2885, 'from_side':    'r', 'to':  15812, 'to_side':    'l', 'mean_dist':    -44, 'mapq':  60060, 'bcount':      7, 'min_dist':    -47, 'max_dist':    -38, 'probability': 0.014765, 'to_alt':      1, 'from_alt':      2},
+        {'from':   9344, 'from_side':    'l', 'to':  99341, 'to_side':    'l', 'mean_dist':      0, 'mapq':  60060, 'bcount':     20, 'min_dist':      0, 'max_dist':      0, 'probability': 0.319050, 'to_alt':      1, 'from_alt':      2},
+        {'from':   9344, 'from_side':    'l', 'to':  99342, 'to_side':    'l', 'mean_dist':     73, 'mapq':  60060, 'bcount':     12, 'min_dist':     64, 'max_dist':     80, 'probability': 0.064232, 'to_alt':      2, 'from_alt':      2},
+        {'from':   9344, 'from_side':    'r', 'to': 118890, 'to_side':    'r', 'mean_dist':    -13, 'mapq':  60060, 'bcount':     25, 'min_dist':    -20, 'max_dist':     39, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      2},
+        {'from':   9344, 'from_side':    'r', 'to': 118892, 'to_side':    'r', 'mean_dist':      8, 'mapq':  60060, 'bcount':     20, 'min_dist':      0, 'max_dist':     35, 'probability': 0.319050, 'to_alt':      1, 'from_alt':      2},
+        {'from':  10723, 'from_side':    'l', 'to':  12896, 'to_side':    'r', 'mean_dist':    -43, 'mapq':  60060, 'bcount':      7, 'min_dist':    -47, 'max_dist':    -24, 'probability': 0.014765, 'to_alt':      1, 'from_alt':      2},
+        {'from':  10723, 'from_side':    'l', 'to':  12910, 'to_side':    'r', 'mean_dist':    -43, 'mapq':  60060, 'bcount':      7, 'min_dist':    -47, 'max_dist':    -36, 'probability': 0.014765, 'to_alt':      1, 'from_alt':      2},
+        {'from':  10723, 'from_side':    'r', 'to':  13452, 'to_side':    'l', 'mean_dist':    -41, 'mapq':  60060, 'bcount':      5, 'min_dist':    -46, 'max_dist':    -30, 'probability': 0.007368, 'to_alt':      1, 'from_alt':      2},
+        {'from':  10723, 'from_side':    'r', 'to':  15812, 'to_side':    'r', 'mean_dist':    -43, 'mapq':  60060, 'bcount':     10, 'min_dist':    -47, 'max_dist':    -33, 'probability': 0.037322, 'to_alt':      1, 'from_alt':      2},
+        {'from':  11659, 'from_side':    'l', 'to':  13591, 'to_side':    'r', 'mean_dist':    -43, 'mapq':  60060, 'bcount':      7, 'min_dist':    -47, 'max_dist':    -36, 'probability': 0.014765, 'to_alt':      3, 'from_alt':      1},
+        {'from':  11659, 'from_side':    'r', 'to':   2725, 'to_side':    'r', 'mean_dist':    136, 'mapq':  60060, 'bcount':      7, 'min_dist':    129, 'max_dist':    146, 'probability': 0.014765, 'to_alt':      3, 'from_alt':      1},
+        {'from':  12896, 'from_side':    'l', 'to':  76860, 'to_side':    'r', 'mean_dist':    -46, 'mapq':  60060, 'bcount':      6, 'min_dist':    -51, 'max_dist':    -43, 'probability': 0.010512, 'to_alt':      2, 'from_alt':      1},
+        {'from':  12896, 'from_side':    'r', 'to':  10723, 'to_side':    'l', 'mean_dist':    -43, 'mapq':  60060, 'bcount':      7, 'min_dist':    -47, 'max_dist':    -24, 'probability': 0.014765, 'to_alt':      2, 'from_alt':      1},
+        {'from':  12910, 'from_side':    'l', 'to':  76860, 'to_side':    'r', 'mean_dist':    -42, 'mapq':  60060, 'bcount':      5, 'min_dist':    -52, 'max_dist':    -30, 'probability': 0.007368, 'to_alt':      2, 'from_alt':      1},
+        {'from':  12910, 'from_side':    'r', 'to':  10723, 'to_side':    'l', 'mean_dist':    -43, 'mapq':  60060, 'bcount':      7, 'min_dist':    -47, 'max_dist':    -36, 'probability': 0.014765, 'to_alt':      2, 'from_alt':      1},
+        {'from':  13029, 'from_side':    'l', 'to':   2725, 'to_side':    'r', 'mean_dist':    143, 'mapq':  60060, 'bcount':      3, 'min_dist':    126, 'max_dist':    201, 'probability': 0.003454, 'to_alt':      3, 'from_alt':      1},
+        {'from':  13029, 'from_side':    'r', 'to':  13591, 'to_side':    'r', 'mean_dist':    -43, 'mapq':  60060, 'bcount':      3, 'min_dist':    -47, 'max_dist':    -39, 'probability': 0.003454, 'to_alt':      3, 'from_alt':      1},
+        {'from':  13434, 'from_side':    'l', 'to': 112333, 'to_side':    'l', 'mean_dist':     38, 'mapq':  60060, 'bcount':     18, 'min_dist':     32, 'max_dist':     52, 'probability': 0.231835, 'to_alt':      2, 'from_alt':      1},
+        {'from':  13434, 'from_side':    'r', 'to':     69, 'to_side':    'r', 'mean_dist':    -41, 'mapq':  60060, 'bcount':     18, 'min_dist':    -51, 'max_dist':    -31, 'probability': 0.231835, 'to_alt':      2, 'from_alt':      1},
+        {'from':  13452, 'from_side':    'l', 'to':  10723, 'to_side':    'r', 'mean_dist':    -41, 'mapq':  60060, 'bcount':      5, 'min_dist':    -46, 'max_dist':    -30, 'probability': 0.007368, 'to_alt':      2, 'from_alt':      1},
+        {'from':  13452, 'from_side':    'r', 'to':   2885, 'to_side':    'r', 'mean_dist':    -45, 'mapq':  60060, 'bcount':      6, 'min_dist':    -47, 'max_dist':    -43, 'probability': 0.010512, 'to_alt':      2, 'from_alt':      1},
+        {'from':  13455, 'from_side':    'l', 'to': 112333, 'to_side':    'l', 'mean_dist':    -43, 'mapq':  60060, 'bcount':     29, 'min_dist':    -49, 'max_dist':    -34, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      1},
+        {'from':  13455, 'from_side':    'r', 'to':     69, 'to_side':    'r', 'mean_dist':    -43, 'mapq':  60060, 'bcount':     27, 'min_dist':    -60, 'max_dist':    -17, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      1},
+        {'from':  13591, 'from_side':    'r', 'to':   2725, 'to_side':    'r', 'mean_dist':    734, 'mapq':  60060, 'bcount':      5, 'min_dist':    684, 'max_dist':    797, 'probability': 0.011373, 'to_alt':      3, 'from_alt':      3},
+        {'from':  13591, 'from_side':    'r', 'to':  11659, 'to_side':    'l', 'mean_dist':    -43, 'mapq':  60060, 'bcount':      7, 'min_dist':    -47, 'max_dist':    -36, 'probability': 0.014765, 'to_alt':      1, 'from_alt':      3},
+        {'from':  13591, 'from_side':    'r', 'to':  13029, 'to_side':    'r', 'mean_dist':    -43, 'mapq':  60060, 'bcount':      3, 'min_dist':    -47, 'max_dist':    -39, 'probability': 0.003454, 'to_alt':      1, 'from_alt':      3},
+        {'from':  14096, 'from_side':    'l', 'to':    929, 'to_side':    'r', 'mean_dist':    -44, 'mapq':  60060, 'bcount':      9, 'min_dist':    -49, 'max_dist':    -34, 'probability': 0.027818, 'to_alt':      2, 'from_alt':      1},
+        {'from':  14096, 'from_side':    'r', 'to':   2725, 'to_side':    'l', 'mean_dist':    642, 'mapq':  60060, 'bcount':      8, 'min_dist':    586, 'max_dist':    773, 'probability': 0.033108, 'to_alt':      2, 'from_alt':      1},
+        {'from':  15177, 'from_side':    'l', 'to':    115, 'to_side':    'r', 'mean_dist':    -42, 'mapq':  60060, 'bcount':     14, 'min_dist':    -52, 'max_dist':    -20, 'probability': 0.104244, 'to_alt':      2, 'from_alt':      1},
+        {'from':  15177, 'from_side':    'r', 'to': 115803, 'to_side':    'l', 'mean_dist':      5, 'mapq':  60060, 'bcount':     12, 'min_dist':      1, 'max_dist':     15, 'probability': 0.064232, 'to_alt':      2, 'from_alt':      1},
+        {'from':  15812, 'from_side':    'l', 'to':   2885, 'to_side':    'r', 'mean_dist':    -44, 'mapq':  60060, 'bcount':      7, 'min_dist':    -47, 'max_dist':    -38, 'probability': 0.014765, 'to_alt':      2, 'from_alt':      1},
+        {'from':  15812, 'from_side':    'r', 'to':  10723, 'to_side':    'r', 'mean_dist':    -43, 'mapq':  60060, 'bcount':     10, 'min_dist':    -47, 'max_dist':    -33, 'probability': 0.037322, 'to_alt':      2, 'from_alt':      1},
+        {'from':  20727, 'from_side':    'l', 'to':   2885, 'to_side':    'l', 'mean_dist':    -44, 'mapq':  60060, 'bcount':     14, 'min_dist':    -55, 'max_dist':    -35, 'probability': 0.104244, 'to_alt':      2, 'from_alt':      2},
+        {'from':  20727, 'from_side':    'l', 'to':   2885, 'to_side':    'l', 'mean_dist':    245, 'mapq':  60060, 'bcount':     12, 'min_dist':    220, 'max_dist':    324, 'probability': 0.064232, 'to_alt':      2, 'from_alt':      2},
+        {'from':  20727, 'from_side':    'r', 'to':    674, 'to_side':    'r', 'mean_dist':    -68, 'mapq':  60060, 'bcount':     10, 'min_dist':    -79, 'max_dist':    -63, 'probability': 0.037322, 'to_alt':      2, 'from_alt':      2},
+        {'from':  20727, 'from_side':    'r', 'to':    674, 'to_side':    'r', 'mean_dist':    -18, 'mapq':  60060, 'bcount':      8, 'min_dist':    -22, 'max_dist':    -11, 'probability': 0.020422, 'to_alt':      2, 'from_alt':      2},
+        {'from':  26855, 'from_side':    'l', 'to':  33144, 'to_side':    'r', 'mean_dist':    -40, 'mapq':  60060, 'bcount':      4, 'min_dist':    -46, 'max_dist':    -31, 'probability': 0.005085, 'to_alt':      1, 'from_alt':      2},
+        {'from':  26855, 'from_side':    'r', 'to': 109207, 'to_side':    'r', 'mean_dist':    -43, 'mapq':  60060, 'bcount':     13, 'min_dist':    -51, 'max_dist':    -14, 'probability': 0.082422, 'to_alt':      2, 'from_alt':      1},
+        {'from':  30179, 'from_side':    'l', 'to': 109207, 'to_side':    'r', 'mean_dist':    -40, 'mapq':  60060, 'bcount':      8, 'min_dist':    -47, 'max_dist':    -23, 'probability': 0.020422, 'to_alt':      2, 'from_alt':      1},
+        {'from':  30179, 'from_side':    'r', 'to':  47404, 'to_side':    'l', 'mean_dist':    -32, 'mapq':  60060, 'bcount':     13, 'min_dist':    -39, 'max_dist':    -18, 'probability': 0.082422, 'to_alt':      2, 'from_alt':      1},
+        {'from':  30214, 'from_side':    'l', 'to': 109207, 'to_side':    'l', 'mean_dist':     -6, 'mapq':  60060, 'bcount':     13, 'min_dist':    -10, 'max_dist':     21, 'probability': 0.082422, 'to_alt':      2, 'from_alt':      1},
+        {'from':  30214, 'from_side':    'r', 'to':  49093, 'to_side':    'r', 'mean_dist':     17, 'mapq':  60060, 'bcount':     12, 'min_dist':     13, 'max_dist':     25, 'probability': 0.064232, 'to_alt':      2, 'from_alt':      1},
+        {'from':  31749, 'from_side':    'l', 'to':  31756, 'to_side':    'r', 'mean_dist':     -1, 'mapq':  60060, 'bcount':     12, 'min_dist':     -8, 'max_dist':     26, 'probability': 0.064232, 'to_alt':      1, 'from_alt':      2},
+        {'from':  31749, 'from_side':    'l', 'to':  53480, 'to_side':    'r', 'mean_dist':   -646, 'mapq':  60060, 'bcount':     18, 'min_dist':   -716, 'max_dist':   -614, 'probability': 0.231835, 'to_alt':      2, 'from_alt':      2},
+        {'from':  31749, 'from_side':    'r', 'to': 101373, 'to_side':    'l', 'mean_dist':   -350, 'mapq':  60060, 'bcount':    109, 'min_dist':   -433, 'max_dist':   -288, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      1},
+        {'from':  31756, 'from_side':    'r', 'to':  31749, 'to_side':    'l', 'mean_dist':     -1, 'mapq':  60060, 'bcount':     12, 'min_dist':     -8, 'max_dist':     26, 'probability': 0.064232, 'to_alt':      2, 'from_alt':      1},
+        {'from':  32229, 'from_side':    'l', 'to':  76860, 'to_side':    'l', 'mean_dist':   -456, 'mapq':  60060, 'bcount':      7, 'min_dist':   -527, 'max_dist':   -412, 'probability': 0.014765, 'to_alt':      2, 'from_alt':      1},
+        {'from':  32229, 'from_side':    'r', 'to':  71091, 'to_side':    'r', 'mean_dist':      3, 'mapq':  60060, 'bcount':     12, 'min_dist':      1, 'max_dist':      7, 'probability': 0.064232, 'to_alt':      2, 'from_alt':      1},
+        {'from':  33144, 'from_side':    'l', 'to':  47404, 'to_side':    'l', 'mean_dist':  -4062, 'mapq':  60060, 'bcount':      2, 'min_dist':  -4070, 'max_dist':  -4055, 'probability': 0.008611, 'to_alt':      2, 'from_alt':      1},
+        {'from':  33144, 'from_side':    'r', 'to':  26855, 'to_side':    'l', 'mean_dist':    -40, 'mapq':  60060, 'bcount':      4, 'min_dist':    -46, 'max_dist':    -31, 'probability': 0.005085, 'to_alt':      2, 'from_alt':      1},
+        {'from':  33994, 'from_side':    'l', 'to': 107486, 'to_side':    'r', 'mean_dist':    -44, 'mapq':  60060, 'bcount':     25, 'min_dist':    -52, 'max_dist':    -15, 'probability': 0.500000, 'to_alt':      3, 'from_alt':      1},
+        {'from':  40554, 'from_side':    'r', 'to':  53480, 'to_side':    'r', 'mean_dist':      0, 'mapq':  60060, 'bcount':     19, 'min_dist':      0, 'max_dist':      0, 'probability': 0.273725, 'to_alt':      2, 'from_alt':      1},
+        {'from':  41636, 'from_side':    'l', 'to':    115, 'to_side':    'l', 'mean_dist':   1932, 'mapq':  60060, 'bcount':     18, 'min_dist':   1811, 'max_dist':   2087, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      1},
+        {'from':  41636, 'from_side':    'r', 'to': 112333, 'to_side':    'r', 'mean_dist':   -710, 'mapq':  60060, 'bcount':     20, 'min_dist':   -775, 'max_dist':   -662, 'probability': 0.319050, 'to_alt':      2, 'from_alt':      1},
+        {'from':  47404, 'from_side':    'l', 'to':  30179, 'to_side':    'r', 'mean_dist':    -32, 'mapq':  60060, 'bcount':     13, 'min_dist':    -39, 'max_dist':    -18, 'probability': 0.082422, 'to_alt':      1, 'from_alt':      2},
+        {'from':  47404, 'from_side':    'l', 'to':  33144, 'to_side':    'l', 'mean_dist':  -4062, 'mapq':  60060, 'bcount':      2, 'min_dist':  -4070, 'max_dist':  -4055, 'probability': 0.008611, 'to_alt':      1, 'from_alt':      2},
+        {'from':  47404, 'from_side':    'r', 'to':     69, 'to_side':    'l', 'mean_dist':    -43, 'mapq':  60060, 'bcount':     15, 'min_dist':    -49, 'max_dist':    -38, 'probability': 0.129976, 'to_alt':      2, 'from_alt':      1},
+        {'from':  49093, 'from_side':    'l', 'to':  51660, 'to_side':    'l', 'mean_dist':    -14, 'mapq':  60060, 'bcount':     18, 'min_dist':    -19, 'max_dist':     14, 'probability': 0.231835, 'to_alt':      1, 'from_alt':      2},
+        {'from':  49093, 'from_side':    'l', 'to':  56987, 'to_side':    'l', 'mean_dist':      4, 'mapq':  60060, 'bcount':     21, 'min_dist':      0, 'max_dist':     15, 'probability': 0.367256, 'to_alt':      1, 'from_alt':      2},
+        {'from':  49093, 'from_side':    'r', 'to':  30214, 'to_side':    'r', 'mean_dist':     17, 'mapq':  60060, 'bcount':     12, 'min_dist':     13, 'max_dist':     25, 'probability': 0.064232, 'to_alt':      1, 'from_alt':      2},
+        {'from':  49093, 'from_side':    'r', 'to': 109207, 'to_side':    'l', 'mean_dist':    780, 'mapq':  60060, 'bcount':     11, 'min_dist':    722, 'max_dist':   1043, 'probability': 0.081320, 'to_alt':      2, 'from_alt':      2},
+        {'from':  47516, 'from_side':    'l', 'to': 101215, 'to_side':    'r', 'mean_dist':    453, 'mapq':  60060, 'bcount':     13, 'min_dist':    422, 'max_dist':    595, 'probability': 0.135136, 'to_alt':      2, 'from_alt':      1},
+        {'from':  47516, 'from_side':    'r', 'to':  96716, 'to_side':    'r', 'mean_dist':    -45, 'mapq':  60060, 'bcount':     16, 'min_dist':    -49, 'max_dist':    -36, 'probability': 0.159802, 'to_alt':      2, 'from_alt':      1},
+        {'from':  51660, 'from_side':    'l', 'to':  49093, 'to_side':    'l', 'mean_dist':    -14, 'mapq':  60060, 'bcount':     18, 'min_dist':    -19, 'max_dist':     14, 'probability': 0.231835, 'to_alt':      2, 'from_alt':      1},
+        {'from':  51660, 'from_side':    'r', 'to': 101215, 'to_side':    'l', 'mean_dist':      5, 'mapq':  60060, 'bcount':     17, 'min_dist':      0, 'max_dist':     18, 'probability': 0.193782, 'to_alt':      2, 'from_alt':      1},
+        {'from':  53480, 'from_side':    'l', 'to':   2722, 'to_side':    'l', 'mean_dist':      0, 'mapq':  60060, 'bcount':     16, 'min_dist':      0, 'max_dist':      0, 'probability': 0.159802, 'to_alt':      1, 'from_alt':      2},
+        {'from':  53480, 'from_side':    'l', 'to': 101373, 'to_side':    'r', 'mean_dist':  -1383, 'mapq':  60060, 'bcount':     12, 'min_dist':  -1547, 'max_dist':  -1281, 'probability': 0.105770, 'to_alt':      2, 'from_alt':      2},
+        {'from':  53480, 'from_side':    'r', 'to':  31749, 'to_side':    'l', 'mean_dist':   -646, 'mapq':  60060, 'bcount':     18, 'min_dist':   -716, 'max_dist':   -614, 'probability': 0.231835, 'to_alt':      2, 'from_alt':      2},
+        {'from':  53480, 'from_side':    'r', 'to':  40554, 'to_side':    'r', 'mean_dist':      0, 'mapq':  60060, 'bcount':     19, 'min_dist':      0, 'max_dist':      0, 'probability': 0.273725, 'to_alt':      1, 'from_alt':      2},
+        {'from':  56740, 'from_side':    'l', 'to': 101215, 'to_side':    'r', 'mean_dist':    469, 'mapq':  60060, 'bcount':     15, 'min_dist':    418, 'max_dist':    704, 'probability': 0.209365, 'to_alt':      2, 'from_alt':      1},
+        {'from':  56740, 'from_side':    'r', 'to':  96716, 'to_side':    'r', 'mean_dist':    -45, 'mapq':  60060, 'bcount':     14, 'min_dist':    -51, 'max_dist':    -23, 'probability': 0.104244, 'to_alt':      2, 'from_alt':      1},
+        {'from':  56987, 'from_side':    'l', 'to':  49093, 'to_side':    'l', 'mean_dist':      4, 'mapq':  60060, 'bcount':     21, 'min_dist':      0, 'max_dist':     15, 'probability': 0.367256, 'to_alt':      2, 'from_alt':      1},
+        {'from':  56987, 'from_side':    'r', 'to': 101215, 'to_side':    'l', 'mean_dist':    -10, 'mapq':  60060, 'bcount':     19, 'min_dist':    -12, 'max_dist':     -7, 'probability': 0.273725, 'to_alt':      2, 'from_alt':      1},
+        {'from':  58443, 'from_side':    'r', 'to': 107486, 'to_side':    'l', 'mean_dist':    -83, 'mapq':  60060, 'bcount':     15, 'min_dist':   -103, 'max_dist':    -76, 'probability': 0.129976, 'to_alt':      2, 'from_alt':      1},
+        {'from':  70951, 'from_side':    'l', 'to': 101373, 'to_side':    'l', 'mean_dist':      0, 'mapq':  60060, 'bcount':     29, 'min_dist':      0, 'max_dist':      0, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      1},
+        {'from':  71091, 'from_side':    'l', 'to':     44, 'to_side':    'r', 'mean_dist':      1, 'mapq':  60060, 'bcount':      5, 'min_dist':     -1, 'max_dist':      6, 'probability': 0.007368, 'to_alt':      2, 'from_alt':      2},
+        {'from':  71091, 'from_side':    'l', 'to':   1306, 'to_side':    'l', 'mean_dist':    -45, 'mapq':  60060, 'bcount':      8, 'min_dist':    -49, 'max_dist':    -40, 'probability': 0.020422, 'to_alt':      1, 'from_alt':      2},
+        {'from':  71091, 'from_side':    'r', 'to':  32229, 'to_side':    'r', 'mean_dist':      3, 'mapq':  60060, 'bcount':     12, 'min_dist':      1, 'max_dist':      7, 'probability': 0.064232, 'to_alt':      1, 'from_alt':      2},
+        {'from':  71091, 'from_side':    'r', 'to':  76860, 'to_side':    'l', 'mean_dist':   2134, 'mapq':  60060, 'bcount':      4, 'min_dist':   2026, 'max_dist':   2303, 'probability': 0.012554, 'to_alt':      2, 'from_alt':      2},
+        {'from':  76860, 'from_side':    'l', 'to':  32229, 'to_side':    'l', 'mean_dist':   -456, 'mapq':  60060, 'bcount':      7, 'min_dist':   -527, 'max_dist':   -412, 'probability': 0.014765, 'to_alt':      1, 'from_alt':      2},
+        {'from':  76860, 'from_side':    'l', 'to':  71091, 'to_side':    'r', 'mean_dist':   2134, 'mapq':  60060, 'bcount':      4, 'min_dist':   2026, 'max_dist':   2303, 'probability': 0.012554, 'to_alt':      2, 'from_alt':      2},
+        {'from':  76860, 'from_side':    'r', 'to':  12896, 'to_side':    'l', 'mean_dist':    -46, 'mapq':  60060, 'bcount':      6, 'min_dist':    -51, 'max_dist':    -43, 'probability': 0.010512, 'to_alt':      1, 'from_alt':      2},
+        {'from':  76860, 'from_side':    'r', 'to':  12910, 'to_side':    'l', 'mean_dist':    -42, 'mapq':  60060, 'bcount':      5, 'min_dist':    -52, 'max_dist':    -30, 'probability': 0.007368, 'to_alt':      1, 'from_alt':      2},
+        {'from':  96716, 'from_side':    'l', 'to': 118890, 'to_side':    'l', 'mean_dist':     -3, 'mapq':  60060, 'bcount':     16, 'min_dist':     -6, 'max_dist':     16, 'probability': 0.159802, 'to_alt':      1, 'from_alt':      2},
+        {'from':  96716, 'from_side':    'l', 'to': 118892, 'to_side':    'l', 'mean_dist':    -38, 'mapq':  60060, 'bcount':     17, 'min_dist':    -43, 'max_dist':    -27, 'probability': 0.193782, 'to_alt':      1, 'from_alt':      2},
+        {'from':  96716, 'from_side':    'r', 'to':  47516, 'to_side':    'r', 'mean_dist':    -45, 'mapq':  60060, 'bcount':     16, 'min_dist':    -49, 'max_dist':    -36, 'probability': 0.159802, 'to_alt':      1, 'from_alt':      2},
+        {'from':  96716, 'from_side':    'r', 'to':  56740, 'to_side':    'r', 'mean_dist':    -45, 'mapq':  60060, 'bcount':     14, 'min_dist':    -51, 'max_dist':    -23, 'probability': 0.104244, 'to_alt':      1, 'from_alt':      2},
+        {'from':  99004, 'from_side':    'r', 'to': 107486, 'to_side':    'r', 'mean_dist':    838, 'mapq':  60060, 'bcount':     14, 'min_dist':    787, 'max_dist':    885, 'probability': 0.169655, 'to_alt':      3, 'from_alt':      1},
+        {'from':  99341, 'from_side':    'l', 'to':   9344, 'to_side':    'l', 'mean_dist':      0, 'mapq':  60060, 'bcount':     20, 'min_dist':      0, 'max_dist':      0, 'probability': 0.319050, 'to_alt':      2, 'from_alt':      1},
+        {'from':  99341, 'from_side':    'r', 'to':  99342, 'to_side':    'l', 'mean_dist':      0, 'mapq':  60060, 'bcount':     21, 'min_dist':      0, 'max_dist':      0, 'probability': 0.367256, 'to_alt':      2, 'from_alt':      1},
+        {'from':  99342, 'from_side':    'l', 'to':   9344, 'to_side':    'l', 'mean_dist':     73, 'mapq':  60060, 'bcount':     12, 'min_dist':     64, 'max_dist':     80, 'probability': 0.064232, 'to_alt':      2, 'from_alt':      2},
+        {'from':  99342, 'from_side':    'l', 'to':  99341, 'to_side':    'r', 'mean_dist':      0, 'mapq':  60060, 'bcount':     21, 'min_dist':      0, 'max_dist':      0, 'probability': 0.367256, 'to_alt':      1, 'from_alt':      2},
+        {'from':  99342, 'from_side':    'r', 'to':     44, 'to_side':    'l', 'mean_dist':    -44, 'mapq':  60060, 'bcount':     19, 'min_dist':    -49, 'max_dist':    -33, 'probability': 0.273725, 'to_alt':      1, 'from_alt':      2},
+        {'from':  99342, 'from_side':    'r', 'to': 107483, 'to_side':    'l', 'mean_dist':    -44, 'mapq':  60060, 'bcount':     11, 'min_dist':    -49, 'max_dist':    -37, 'probability': 0.049326, 'to_alt':      1, 'from_alt':      2},
+        {'from': 101215, 'from_side':    'l', 'to':  51660, 'to_side':    'r', 'mean_dist':      5, 'mapq':  60060, 'bcount':     17, 'min_dist':      0, 'max_dist':     18, 'probability': 0.193782, 'to_alt':      1, 'from_alt':      2},
+        {'from': 101215, 'from_side':    'l', 'to':  56987, 'to_side':    'r', 'mean_dist':    -10, 'mapq':  60060, 'bcount':     19, 'min_dist':    -12, 'max_dist':     -7, 'probability': 0.273725, 'to_alt':      1, 'from_alt':      2},
+        {'from': 101215, 'from_side':    'r', 'to':  47516, 'to_side':    'l', 'mean_dist':    453, 'mapq':  60060, 'bcount':     13, 'min_dist':    422, 'max_dist':    595, 'probability': 0.135136, 'to_alt':      1, 'from_alt':      2},
+        {'from': 101215, 'from_side':    'r', 'to':  56740, 'to_side':    'l', 'mean_dist':    469, 'mapq':  60060, 'bcount':     15, 'min_dist':    418, 'max_dist':    704, 'probability': 0.209365, 'to_alt':      1, 'from_alt':      2},
+        {'from': 101373, 'from_side':    'l', 'to':  31749, 'to_side':    'r', 'mean_dist':   -350, 'mapq':  60060, 'bcount':    109, 'min_dist':   -433, 'max_dist':   -288, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      2},
+        {'from': 101373, 'from_side':    'l', 'to':  70951, 'to_side':    'l', 'mean_dist':      0, 'mapq':  60060, 'bcount':     29, 'min_dist':      0, 'max_dist':      0, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      2},
+        {'from': 101373, 'from_side':    'r', 'to':  53480, 'to_side':    'l', 'mean_dist':  -1383, 'mapq':  60060, 'bcount':     12, 'min_dist':  -1547, 'max_dist':  -1281, 'probability': 0.105770, 'to_alt':      2, 'from_alt':      2},
+        {'from': 101373, 'from_side':    'r', 'to': 107486, 'to_side':    'r', 'mean_dist':  -1922, 'mapq':  60060, 'bcount':     26, 'min_dist':  -2024, 'max_dist':  -1836, 'probability': 0.500000, 'to_alt':      3, 'from_alt':      2},
+        {'from': 107483, 'from_side':    'l', 'to':  99342, 'to_side':    'r', 'mean_dist':    -44, 'mapq':  60060, 'bcount':     11, 'min_dist':    -49, 'max_dist':    -37, 'probability': 0.049326, 'to_alt':      2, 'from_alt':      1},
+        {'from': 107483, 'from_side':    'r', 'to': 107484, 'to_side':    'l', 'mean_dist':      0, 'mapq':  60060, 'bcount':     19, 'min_dist':      0, 'max_dist':      0, 'probability': 0.273725, 'to_alt':      2, 'from_alt':      1},
+        {'from': 107484, 'from_side':    'l', 'to': 107483, 'to_side':    'r', 'mean_dist':      0, 'mapq':  60060, 'bcount':     19, 'min_dist':      0, 'max_dist':      0, 'probability': 0.273725, 'to_alt':      1, 'from_alt':      2},
+        {'from': 107484, 'from_side':    'l', 'to': 117303, 'to_side':    'l', 'mean_dist':   -888, 'mapq':  60060, 'bcount':      8, 'min_dist':   -912, 'max_dist':   -865, 'probability': 0.033108, 'to_alt':      1, 'from_alt':      2},
+        {'from': 107484, 'from_side':    'r', 'to': 107485, 'to_side':    'l', 'mean_dist':      0, 'mapq':  60060, 'bcount':     49, 'min_dist':      0, 'max_dist':      0, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      1},
+        {'from': 107485, 'from_side':    'l', 'to':    372, 'to_side':    'r', 'mean_dist':  -1436, 'mapq':  60060, 'bcount':     14, 'min_dist':  -1605, 'max_dist':  -1350, 'probability': 0.169655, 'to_alt':      1, 'from_alt':      2},
+        {'from': 107485, 'from_side':    'l', 'to': 107484, 'to_side':    'r', 'mean_dist':      0, 'mapq':  60060, 'bcount':     49, 'min_dist':      0, 'max_dist':      0, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      2},
+        {'from': 107485, 'from_side':    'r', 'to': 107486, 'to_side':    'l', 'mean_dist':      0, 'mapq':  60060, 'bcount':    106, 'min_dist':      0, 'max_dist':      0, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      1},
+        {'from': 107486, 'from_side':    'l', 'to':  58443, 'to_side':    'r', 'mean_dist':    -83, 'mapq':  60060, 'bcount':     15, 'min_dist':   -103, 'max_dist':    -76, 'probability': 0.129976, 'to_alt':      1, 'from_alt':      2},
+        {'from': 107486, 'from_side':    'l', 'to': 107485, 'to_side':    'r', 'mean_dist':      0, 'mapq':  60060, 'bcount':    106, 'min_dist':      0, 'max_dist':      0, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      2},
+        {'from': 107486, 'from_side':    'r', 'to':  33994, 'to_side':    'l', 'mean_dist':    -44, 'mapq':  60060, 'bcount':     25, 'min_dist':    -52, 'max_dist':    -15, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      3},
+        {'from': 107486, 'from_side':    'r', 'to':  99004, 'to_side':    'r', 'mean_dist':    838, 'mapq':  60060, 'bcount':     14, 'min_dist':    787, 'max_dist':    885, 'probability': 0.169655, 'to_alt':      1, 'from_alt':      3},
+        {'from': 107486, 'from_side':    'r', 'to': 101373, 'to_side':    'r', 'mean_dist':  -1922, 'mapq':  60060, 'bcount':     26, 'min_dist':  -2024, 'max_dist':  -1836, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      3},
+        {'from': 109207, 'from_side':    'l', 'to':  30214, 'to_side':    'l', 'mean_dist':     -6, 'mapq':  60060, 'bcount':     13, 'min_dist':    -10, 'max_dist':     21, 'probability': 0.082422, 'to_alt':      1, 'from_alt':      2},
+        {'from': 109207, 'from_side':    'l', 'to':  49093, 'to_side':    'r', 'mean_dist':    780, 'mapq':  60060, 'bcount':     11, 'min_dist':    722, 'max_dist':   1043, 'probability': 0.081320, 'to_alt':      2, 'from_alt':      2},
+        {'from': 109207, 'from_side':    'r', 'to':  26855, 'to_side':    'r', 'mean_dist':    -43, 'mapq':  60060, 'bcount':     13, 'min_dist':    -51, 'max_dist':    -14, 'probability': 0.082422, 'to_alt':      1, 'from_alt':      2},
+        {'from': 109207, 'from_side':    'r', 'to':  30179, 'to_side':    'l', 'mean_dist':    -40, 'mapq':  60060, 'bcount':      8, 'min_dist':    -47, 'max_dist':    -23, 'probability': 0.020422, 'to_alt':      1, 'from_alt':      2},
+        {'from': 110827, 'from_side':    'r', 'to':     69, 'to_side':    'l', 'mean_dist':    -43, 'mapq':  60060, 'bcount':     24, 'min_dist':    -50, 'max_dist':    -16, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      1},
+        {'from': 112333, 'from_side':    'l', 'to':  13434, 'to_side':    'l', 'mean_dist':     38, 'mapq':  60060, 'bcount':     18, 'min_dist':     32, 'max_dist':     52, 'probability': 0.231835, 'to_alt':      1, 'from_alt':      2},
+        {'from': 112333, 'from_side':    'l', 'to':  13455, 'to_side':    'l', 'mean_dist':    -43, 'mapq':  60060, 'bcount':     29, 'min_dist':    -49, 'max_dist':    -34, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      2},
+        {'from': 112333, 'from_side':    'r', 'to':    114, 'to_side':    'l', 'mean_dist':   -819, 'mapq':  60060, 'bcount':     22, 'min_dist':   -931, 'max_dist':   -785, 'probability': 0.417654, 'to_alt':      1, 'from_alt':      2},
+        {'from': 112333, 'from_side':    'r', 'to':  41636, 'to_side':    'r', 'mean_dist':   -710, 'mapq':  60060, 'bcount':     20, 'min_dist':   -775, 'max_dist':   -662, 'probability': 0.319050, 'to_alt':      1, 'from_alt':      2},
+        {'from': 115803, 'from_side':    'l', 'to':    115, 'to_side':    'r', 'mean_dist':    885, 'mapq':  60060, 'bcount':     15, 'min_dist':    818, 'max_dist':   1120, 'probability': 0.209365, 'to_alt':      2, 'from_alt':      2},
+        {'from': 115803, 'from_side':    'l', 'to':  15177, 'to_side':    'r', 'mean_dist':      5, 'mapq':  60060, 'bcount':     12, 'min_dist':      1, 'max_dist':     15, 'probability': 0.064232, 'to_alt':      1, 'from_alt':      2},
+        {'from': 117303, 'from_side':    'l', 'to': 107484, 'to_side':    'l', 'mean_dist':   -888, 'mapq':  60060, 'bcount':      8, 'min_dist':   -912, 'max_dist':   -865, 'probability': 0.033108, 'to_alt':      2, 'from_alt':      1},
+        {'from': 117303, 'from_side':    'r', 'to':    929, 'to_side':    'l', 'mean_dist':   2544, 'mapq':  60060, 'bcount':      7, 'min_dist':   2451, 'max_dist':   2631, 'probability': 0.076700, 'to_alt':      2, 'from_alt':      1},
+        {'from': 117304, 'from_side':    'r', 'to':    929, 'to_side':    'l', 'mean_dist':   2489, 'mapq':  60060, 'bcount':      2, 'min_dist':   2450, 'max_dist':   2534, 'probability': 0.008611, 'to_alt':      2, 'from_alt':      1},
+        {'from': 118890, 'from_side':    'l', 'to':  96716, 'to_side':    'l', 'mean_dist':     -3, 'mapq':  60060, 'bcount':     16, 'min_dist':     -6, 'max_dist':     16, 'probability': 0.159802, 'to_alt':      2, 'from_alt':      1},
+        {'from': 118890, 'from_side':    'r', 'to':   9344, 'to_side':    'r', 'mean_dist':    -13, 'mapq':  60060, 'bcount':     25, 'min_dist':    -20, 'max_dist':     39, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      1},
+        {'from': 118892, 'from_side':    'l', 'to':  96716, 'to_side':    'l', 'mean_dist':    -38, 'mapq':  60060, 'bcount':     17, 'min_dist':    -43, 'max_dist':    -27, 'probability': 0.193782, 'to_alt':      2, 'from_alt':      1},
+        {'from': 118892, 'from_side':    'r', 'to':   9344, 'to_side':    'r', 'mean_dist':      8, 'mapq':  60060, 'bcount':     20, 'min_dist':      0, 'max_dist':     35, 'probability': 0.319050, 'to_alt':      2, 'from_alt':      1}
+        ]) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    100,    100,    100,    100,    100,    100,    100,    100,    100,    100,    100,    100,    100,    100,    100,    100,    100,    100,    100,    100,    100],
+        'pos':      [      0,      1,      2,      3,      4,      5,      6,      7,      8,      9,     10,     11,     12,     13,     14,     15,     16,     17,     18,     19,     20],
+        'phase0':   [    101,    101,    101,    101,    101,    101,    101,    101,    101,    101,    101,    101,    101,    101,    101,    101,    101,    101,    101,    101,    101],
+        'scaf0':    [   2799,    674,  20727,   2885,  15812,  10723,  12896,  76860,  32229,  71091,   1306,     44,  99342,  99341,   9344, 118890,  96716,  56740, 101215,  56987,  49093],
+        'strand0':  [    '-',    '+',    '-',    '+',    '+',    '-',    '-',    '-',    '+',    '-',    '+',    '-',    '-',    '-',    '+',    '-',    '+',    '-',    '-',    '-',    '+'],
+        'dist0':    [      0,     60,    -68,    -44,    -44,    -43,    -43,    -46,   -456,      3,    -45,    -43,    -44,      0,      0,    -13,     -3,    -45,    469,    -10,      4],
+        'phase1':   [   -102,   -102,    102,    102,    102,    102,    102,    102,    102,    102,    102,    102,   -102,   -102,   -102,   -102,   -102,   -102,   -102,   -102,   -102],
+        'scaf1':    [     -1,     -1,  20727,   2885,  13452,  10723,  12910,  76860,     -1,  71091,     -1,     44,     -1,     -1,     -1,     -1,     -1,     -1,     -1,     -1,     -1],
+        'strand1':  [     '',     '',    '-',    '+',    '-',    '-',    '-',    '-',     '',    '-',     '',    '-',     '',     '',     '',     '',     '',     '',     '',     '',     ''],
+        'dist1':    [      0,      0,    -18,    245,    -45,    -41,    -43,    -42,      0,   2134,      0,      1,      0,      0,      0,      0,      0,      0,      0,      0,      0]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    101,    101,    101,    101],
+        'pos':      [      0,      1,      2,      3],
+        'phase0':   [    103,    103,    103,    103],
+        'scaf0':    [ 109207,  30179,     -1,  47404],
+        'strand0':  [    '+',    '+',     '',    '+'],
+        'dist0':    [      0,    -40,      0,    -32],
+        'phase1':   [   -104,    104,    104,    104],
+        'scaf1':    [     -1,  26855,  33144,  47404],
+        'strand1':  [     '',    '-',    '-',    '+'],
+        'dist1':    [      0,    -43,    -40,  -4062]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    102,    102,    102,    102,    102,    102,    102,    102,    102,    102,    102,    102,    102],
+        'pos':      [      0,      1,      2,      3,      4,      5,      6,      7,      8,      9,     10,     11,     12],
+        'phase0':   [    105,    105,    105,    105,    105,    105,    105,    105,    105,    105,    105,    105,    105],
+        'scaf0':    [  30214,  49093,  51660, 101215,  47516,  96716, 118892,   9344,  99342, 107483, 107484, 107485, 107486],
+        'strand0':  [    '+',    '-',    '+',    '+',    '+',    '-',    '+',    '-',    '+',    '+',    '+',    '+',    '+'],
+        'dist0':    [      0,     17,    -14,      5,    453,    -45,    -38,      8,     73,    -44,      0,      0,      0],
+        'phase1':   [   -106,   -106,   -106,   -106,   -106,   -106,   -106,   -106,   -106,   -106,   -106,   -106,   -106],
+        'scaf1':    [     -1,     -1,     -1,     -1,     -1,     -1,     -1,     -1,     -1,     -1,     -1,     -1,     -1],
+        'strand1':  [     '',     '',     '',     '',     '',     '',     '',     '',     '',     '',     '',     '',     ''],
+        'dist1':    [      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    103,    103,    103,    103,    103],
+        'pos':      [      0,      1,      2,      3,      4],
+        'phase0':   [    107,    107,    107,    107,    107],
+        'scaf0':    [  13591,  11659,   2725,  14096,    929],
+        'strand0':  [    '+',    '+',    '-',    '-',    '-'],
+        'dist0':    [      0,    -43,    136,    642,    -44],
+        'phase1':   [   -108,    108,    108,    108,    108],
+        'scaf1':    [     -1,  13029,   2725,     -1,    929],
+        'strand1':  [     '',    '-',    '-',     '',    '-'],
+        'dist1':    [      0,    -43,    143,      0,   1205]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    104],
+        'pos':      [      0],
+        'phase0':   [    109],
+        'scaf0':    [ 117304],
+        'strand0':  [    '+'],
+        'dist0':    [      0],
+        'phase1':   [   -110],
+        'scaf1':    [     -1],
+        'strand1':  [     ''],
+        'dist1':    [      0]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    105,    105,    105,    105,    105],
+        'pos':      [      0,      1,      2,      3,      4],
+        'phase0':   [    111,    111,    111,    111,    111],
+        'scaf0':    [ 117303, 107484, 107485, 107486,  33994],
+        'strand0':  [    '-',    '+',    '+',    '+',    '+'],
+        'dist0':    [      0,   -888,      0,      0,    -44],
+        'phase1':   [   -112,   -112,   -112,   -112,   -112],
+        'scaf1':    [     -1,     -1,     -1,     -1,     -1],
+        'strand1':  [     '',     '',     '',     '',     ''],
+        'dist1':    [      0,      0,      0,      0,      0]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    106],
+        'pos':      [      0],
+        'phase0':   [    113],
+        'scaf0':    [  58443],
+        'strand0':  [    '+'],
+        'dist0':    [      0],
+        'phase1':   [   -114],
+        'scaf1':    [     -1],
+        'strand1':  [     ''],
+        'dist1':    [      0]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    107,    107],
+        'pos':      [      0,      1],
+        'phase0':   [    115,    115],
+        'scaf0':    [  99004, 107486],
+        'strand0':  [    '+',    '-'],
+        'dist0':    [      0,    838],
+        'phase1':   [   -116,   -116],
+        'scaf1':    [     -1,     -1],
+        'strand1':  [     '',     ''],
+        'dist1':    [      0,      0]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    108],
+        'pos':      [      0],
+        'phase0':   [    117],
+        'scaf0':    [ 110827],
+        'strand0':  [    '+'],
+        'dist0':    [      0],
+        'phase1':   [   -118],
+        'scaf1':    [     -1],
+        'strand1':  [     ''],
+        'dist1':    [      0]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    109,    109,    109,    109,    109,    109,    109],
+        'pos':      [      0,      1,      2,      3,      4,      5,      6],
+        'phase0':   [    119,    119,    119,    119,    119,    119,    119],
+        'scaf0':    [     69,  13434, 112333,    114,    115,     -1, 115803],
+        'strand0':  [    '+',    '-',    '+',    '+',    '+',    '+',    '+'],
+        'dist0':    [      0,    -41,     38,   -819,   1131,      0,    885],
+        'phase1':   [   -120,    120,    120,    120,    120,    120,    120],
+        'scaf1':    [     -1,  13455, 112333,  41636,    115,  15177, 115803],
+        'strand1':  [     '',    '-',    '+',    '-',    '+',    '+',    '+'],
+        'dist1':    [      0,    -43,    -43,   -710,   1932,    -42,      5]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    110,    110,    110,    110,    110],
+        'pos':      [      0,      1,      2,      3,      4],
+        'phase0':   [    121,    121,    121,    121,    121],
+        'scaf0':    [    372, 107485, 107486, 101373,  70951],
+        'strand0':  [    '+',    '+',    '+',    '-',    '+'],
+        'dist0':    [      0,  -1436,      0,  -1922,      0],
+        'phase1':   [   -122,   -122,   -122,   -122,   -122],
+        'scaf1':    [     -1,     -1,     -1,     -1,     -1],
+        'strand1':  [     '',     '',     '',     '',     ''],
+        'dist1':    [      0,      0,      0,      0,      0]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    111,    111,    111,    111,    111,    111,    111],
+        'pos':      [      0,      1,      2,      3,      4,      5,      6],
+        'phase0':   [    123,    123,    123,    123,    123,    123,    123],
+        'scaf0':    [ 107486, 101373,  31749,  53480, 101373,  31749,  31756],
+        'strand0':  [    '+',    '-',    '-',    '-',    '-',    '-',    '-'],
+        'dist0':    [      0,  -1922,   -350,   -646,  -1383,   -350,     -1],
+        'phase1':   [   -124,   -124,   -124,   -124,   -124,   -124,   -124],
+        'scaf1':    [     -1,     -1,     -1,     -1,     -1,     -1,     -1],
+        'strand1':  [     '',     '',     '',     '',     '',     '',     ''],
+        'dist1':    [      0,      0,      0,      0,      0,      0,      0]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    112,    112,    112],
+        'pos':      [      0,      1,      2],
+        'phase0':   [    125,    125,    125],
+        'scaf0':    [  40554,  53480,   2722],
+        'strand0':  [    '+',    '-',    '+'],
+        'dist0':    [      0,      0,      0],
+        'phase1':   [   -126,   -126,   -126],
+        'scaf1':    [     -1,     -1,     -1],
+        'strand1':  [     '',     '',     ''],
+        'dist1':    [      0,      0,      0]
+        }) )
+#
+    # Test 2
+    scaffolds.append( pd.DataFrame({'case':2, 'scaffold':[19382, 66038 ,115947, 115948, 115949, 115950, 115951, 115952]}) )
+    scaffold_graph.append( pd.DataFrame([
+        {'from':  19382, 'from_side':    'l', 'length':      4, 'scaf1': 115947, 'strand1':    '+', 'dist1':    -41, 'scaf2': 115949, 'strand2':    '+', 'dist2':    515, 'scaf3': 115951, 'strand3':    '+', 'dist3':   9325},
+        {'from':  66038, 'from_side':    'r', 'length':      3, 'scaf1': 115947, 'strand1':    '+', 'dist1':    381, 'scaf2': 115948, 'strand2':    '+', 'dist2':      0},
+        {'from': 115947, 'from_side':    'l', 'length':      2, 'scaf1':  19382, 'strand1':    '+', 'dist1':    -41},
+        {'from': 115947, 'from_side':    'l', 'length':      2, 'scaf1':  66038, 'strand1':    '-', 'dist1':    381},
+        {'from': 115947, 'from_side':    'r', 'length':      2, 'scaf1': 115948, 'strand1':    '+', 'dist1':      0},
+        {'from': 115947, 'from_side':    'r', 'length':      4, 'scaf1': 115949, 'strand1':    '+', 'dist1':    515, 'scaf2': 115951, 'strand2':    '+', 'dist2':   9325, 'scaf3': 115952, 'strand3':    '-', 'dist3':    -43},
+        {'from': 115948, 'from_side':    'l', 'length':      3, 'scaf1': 115947, 'strand1':    '-', 'dist1':      0, 'scaf2':  66038, 'strand2':    '-', 'dist2':    381},
+        {'from': 115948, 'from_side':    'r', 'length':      5, 'scaf1': 115949, 'strand1':    '+', 'dist1':      0, 'scaf2': 115950, 'strand2':    '+', 'dist2':      0, 'scaf3': 115951, 'strand3':    '+', 'dist3':      0, 'scaf4': 115952, 'strand4':    '+', 'dist4':    -42},
+        {'from': 115949, 'from_side':    'l', 'length':      3, 'scaf1': 115947, 'strand1':    '-', 'dist1':    515, 'scaf2':  19382, 'strand2':    '+', 'dist2':    -41},
+        {'from': 115949, 'from_side':    'l', 'length':      2, 'scaf1': 115948, 'strand1':    '-', 'dist1':      0},
+        {'from': 115949, 'from_side':    'r', 'length':      4, 'scaf1': 115950, 'strand1':    '+', 'dist1':      0, 'scaf2': 115951, 'strand2':    '+', 'dist2':      0, 'scaf3': 115952, 'strand3':    '+', 'dist3':    -42},
+        {'from': 115949, 'from_side':    'r', 'length':      3, 'scaf1': 115951, 'strand1':    '+', 'dist1':   9325, 'scaf2': 115952, 'strand2':    '-', 'dist2':    -43},
+        {'from': 115950, 'from_side':    'l', 'length':      3, 'scaf1': 115949, 'strand1':    '-', 'dist1':      0, 'scaf2': 115948, 'strand2':    '-', 'dist2':      0},
+        {'from': 115950, 'from_side':    'r', 'length':      3, 'scaf1': 115951, 'strand1':    '+', 'dist1':      0, 'scaf2': 115952, 'strand2':    '+', 'dist2':    -42},
+        {'from': 115951, 'from_side':    'l', 'length':      4, 'scaf1': 115949, 'strand1':    '-', 'dist1':   9325, 'scaf2': 115947, 'strand2':    '-', 'dist2':    515, 'scaf3':  19382, 'strand3':    '+', 'dist3':    -41},
+        {'from': 115951, 'from_side':    'l', 'length':      4, 'scaf1': 115950, 'strand1':    '-', 'dist1':      0, 'scaf2': 115949, 'strand2':    '-', 'dist2':      0, 'scaf3': 115948, 'strand3':    '-', 'dist3':      0},
+        {'from': 115951, 'from_side':    'r', 'length':      2, 'scaf1': 115952, 'strand1':    '+', 'dist1':    -42},
+        {'from': 115951, 'from_side':    'r', 'length':      2, 'scaf1': 115952, 'strand1':    '-', 'dist1':    -43},
+        {'from': 115952, 'from_side':    'l', 'length':      5, 'scaf1': 115951, 'strand1':    '-', 'dist1':    -42, 'scaf2': 115950, 'strand2':    '-', 'dist2':      0, 'scaf3': 115949, 'strand3':    '-', 'dist3':      0, 'scaf4': 115948, 'strand4':    '-', 'dist4':      0},
+        {'from': 115952, 'from_side':    'r', 'length':      4, 'scaf1': 115951, 'strand1':    '-', 'dist1':    -43, 'scaf2': 115949, 'strand2':    '-', 'dist2':   9325, 'scaf3': 115947, 'strand3':    '-', 'dist3':    515}
+        ]) )
+    scaf_bridges.append( pd.DataFrame([
+        {'from':  19382, 'from_side':    'l', 'to': 115947, 'to_side':    'l', 'mean_dist':    -41, 'mapq':  60060, 'bcount':     22, 'min_dist':    -48, 'max_dist':    -25, 'probability': 0.417654, 'to_alt':      2, 'from_alt':      1},
+        {'from':  66038, 'from_side':    'r', 'to': 115947, 'to_side':    'l', 'mean_dist':    381, 'mapq':  60060, 'bcount':     22, 'min_dist':    354, 'max_dist':    485, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      1},
+        {'from': 115947, 'from_side':    'l', 'to':  19382, 'to_side':    'l', 'mean_dist':    -41, 'mapq':  60060, 'bcount':     22, 'min_dist':    -48, 'max_dist':    -25, 'probability': 0.417654, 'to_alt':      1, 'from_alt':      2},
+        {'from': 115947, 'from_side':    'l', 'to':  66038, 'to_side':    'r', 'mean_dist':    381, 'mapq':  60060, 'bcount':     22, 'min_dist':    354, 'max_dist':    485, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      2},
+        {'from': 115947, 'from_side':    'r', 'to': 115948, 'to_side':    'l', 'mean_dist':      0, 'mapq':  60060, 'bcount':     23, 'min_dist':      0, 'max_dist':      0, 'probability': 0.469443, 'to_alt':      1, 'from_alt':      2},
+        {'from': 115947, 'from_side':    'r', 'to': 115949, 'to_side':    'l', 'mean_dist':    515, 'mapq':  60060, 'bcount':     20, 'min_dist':    473, 'max_dist':    642, 'probability': 0.470466, 'to_alt':      2, 'from_alt':      2},
+        {'from': 115948, 'from_side':    'l', 'to': 115947, 'to_side':    'r', 'mean_dist':      0, 'mapq':  60060, 'bcount':     23, 'min_dist':      0, 'max_dist':      0, 'probability': 0.469443, 'to_alt':      2, 'from_alt':      1},
+        {'from': 115948, 'from_side':    'r', 'to': 115949, 'to_side':    'l', 'mean_dist':      0, 'mapq':  60060, 'bcount':     17, 'min_dist':      0, 'max_dist':      0, 'probability': 0.193782, 'to_alt':      2, 'from_alt':      1},
+        {'from': 115949, 'from_side':    'l', 'to': 115947, 'to_side':    'r', 'mean_dist':    515, 'mapq':  60060, 'bcount':     20, 'min_dist':    473, 'max_dist':    642, 'probability': 0.470466, 'to_alt':      2, 'from_alt':      2},
+        {'from': 115949, 'from_side':    'l', 'to': 115948, 'to_side':    'r', 'mean_dist':      0, 'mapq':  60060, 'bcount':     17, 'min_dist':      0, 'max_dist':      0, 'probability': 0.193782, 'to_alt':      1, 'from_alt':      2},
+        {'from': 115949, 'from_side':    'r', 'to': 115950, 'to_side':    'l', 'mean_dist':      0, 'mapq':  60060, 'bcount':     16, 'min_dist':      0, 'max_dist':      0, 'probability': 0.159802, 'to_alt':      1, 'from_alt':      2},
+        {'from': 115949, 'from_side':    'r', 'to': 115951, 'to_side':    'l', 'mean_dist':   9325, 'mapq':  60060, 'bcount':      6, 'min_dist':   8844, 'max_dist':  10272, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      2},
+        {'from': 115950, 'from_side':    'l', 'to': 115949, 'to_side':    'r', 'mean_dist':      0, 'mapq':  60060, 'bcount':     16, 'min_dist':      0, 'max_dist':      0, 'probability': 0.159802, 'to_alt':      2, 'from_alt':      1},
+        {'from': 115950, 'from_side':    'r', 'to': 115951, 'to_side':    'l', 'mean_dist':      0, 'mapq':  60060, 'bcount':     13, 'min_dist':      0, 'max_dist':      0, 'probability': 0.082422, 'to_alt':      2, 'from_alt':      1},
+        {'from': 115951, 'from_side':    'l', 'to': 115949, 'to_side':    'r', 'mean_dist':   9325, 'mapq':  60060, 'bcount':      6, 'min_dist':   8844, 'max_dist':  10272, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      2},
+        {'from': 115951, 'from_side':    'l', 'to': 115950, 'to_side':    'r', 'mean_dist':      0, 'mapq':  60060, 'bcount':     13, 'min_dist':      0, 'max_dist':      0, 'probability': 0.082422, 'to_alt':      1, 'from_alt':      2},
+        {'from': 115951, 'from_side':    'r', 'to': 115952, 'to_side':    'l', 'mean_dist':    -42, 'mapq':  60060, 'bcount':     10, 'min_dist':    -49, 'max_dist':    -37, 'probability': 0.037322, 'to_alt':      1, 'from_alt':      2},
+        {'from': 115951, 'from_side':    'r', 'to': 115952, 'to_side':    'r', 'mean_dist':    -43, 'mapq':  60060, 'bcount':     20, 'min_dist':    -49, 'max_dist':    -28, 'probability': 0.319050, 'to_alt':      1, 'from_alt':      2},
+        {'from': 115952, 'from_side':    'l', 'to': 115951, 'to_side':    'r', 'mean_dist':    -42, 'mapq':  60060, 'bcount':     10, 'min_dist':    -49, 'max_dist':    -37, 'probability': 0.037322, 'to_alt':      2, 'from_alt':      1},
+        {'from': 115952, 'from_side':    'r', 'to': 115951, 'to_side':    'r', 'mean_dist':    -43, 'mapq':  60060, 'bcount':     20, 'min_dist':    -49, 'max_dist':    -28, 'probability': 0.319050, 'to_alt':      2, 'from_alt':      1}
+        ]) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    200,    200,    200,    200,    200,    200,    200,    200,    200,    200,    200],
+        'pos':      [      0,      1,      2,      3,      4,      5,      6,      7,      8,      9,     10],
+        'phase0':   [    201,    201,    201,    201,    201,    201,    201,    201,    201,    201,    201],
+        'scaf0':    [  66038, 115947, 115948, 115949, 115950, 115951, 115952, 115951, 115949, 115947,  19382],
+        'strand0':  [    '+',    '+',    '+',    '+',    '+',    '+',    '+',    '-',    '-',    '-',    '+'],
+        'dist0':    [      0,    381,      0,      0,      0,      0,    -42,    -43,   9325,    515,    -41],
+        'phase1':   [   -202,   -202,   -202,   -202,   -202,   -202,   -202,   -202,   -202,   -202,   -202],
+        'scaf1':    [     -1,     -1,     -1,     -1,     -1,     -1,     -1,     -1,     -1,     -1,     -1],
+        'strand1':  [     '',     '',     '',     '',     '',     '',     '',     '',     '',     '',     ''],
+        'dist1':    [      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0]
+        }) )
+#
+    # Test 3
+    scaffolds.append( pd.DataFrame({'case':3, 'scaffold':[30387,  95786, 108403, 110072]}) )
+    scaffold_graph.append( pd.DataFrame([
+        {'from':  30387, 'from_side':    'l', 'length':      3, 'scaf1': 110072, 'strand1':    '+', 'dist1':    758, 'scaf2': 108403, 'strand2':    '+', 'dist2':    -30},
+        {'from':  95786, 'from_side':    'l', 'length':      3, 'scaf1': 110072, 'strand1':    '-', 'dist1':    -29, 'scaf2': 108403, 'strand2':    '-', 'dist2':    813},
+        {'from': 108403, 'from_side':    'l', 'length':      3, 'scaf1': 110072, 'strand1':    '-', 'dist1':    -30, 'scaf2':  30387, 'strand2':    '+', 'dist2':    758},
+        {'from': 108403, 'from_side':    'l', 'length':      3, 'scaf1': 110072, 'strand1':    '-', 'dist1':    -30, 'scaf2': 108403, 'strand2':    '-', 'dist2':    813},
+        {'from': 108403, 'from_side':    'r', 'length':      3, 'scaf1': 110072, 'strand1':    '+', 'dist1':    813, 'scaf2':  95786, 'strand2':    '+', 'dist2':    -29},
+        {'from': 108403, 'from_side':    'r', 'length':      3, 'scaf1': 110072, 'strand1':    '+', 'dist1':    813, 'scaf2': 108403, 'strand2':    '+', 'dist2':    -30},
+        {'from': 110072, 'from_side':    'l', 'length':      2, 'scaf1':  30387, 'strand1':    '+', 'dist1':    758},
+        {'from': 110072, 'from_side':    'l', 'length':      3, 'scaf1': 108403, 'strand1':    '-', 'dist1':    813, 'scaf2': 110072, 'strand2':    '-', 'dist2':    -30},
+        {'from': 110072, 'from_side':    'r', 'length':      2, 'scaf1':  95786, 'strand1':    '+', 'dist1':    -29},
+        {'from': 110072, 'from_side':    'r', 'length':      3, 'scaf1': 108403, 'strand1':    '+', 'dist1':    -30, 'scaf2': 110072, 'strand2':    '+', 'dist2':    813}
+        ]) )
+    scaf_bridges.append( pd.DataFrame([
+        {'from':  30387, 'from_side':    'l', 'to': 110072, 'to_side':    'l', 'mean_dist':    758, 'mapq':  60060, 'bcount':     17, 'min_dist':    711, 'max_dist':    992, 'probability': 0.303341, 'to_alt':      2, 'from_alt':      1},
+        {'from':  95786, 'from_side':    'l', 'to': 110072, 'to_side':    'r', 'mean_dist':    -29, 'mapq':  60060, 'bcount':     24, 'min_dist':    -35, 'max_dist':    -20, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      1},
+        {'from': 108403, 'from_side':    'l', 'to': 110072, 'to_side':    'r', 'mean_dist':    -30, 'mapq':  60060, 'bcount':     34, 'min_dist':    -38, 'max_dist':    -24, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      1},
+        {'from': 108403, 'from_side':    'r', 'to': 110072, 'to_side':    'l', 'mean_dist':    813, 'mapq':  60060, 'bcount':     31, 'min_dist':    745, 'max_dist':   1052, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      1},
+        {'from': 110072, 'from_side':    'l', 'to':  30387, 'to_side':    'l', 'mean_dist':    758, 'mapq':  60060, 'bcount':     17, 'min_dist':    711, 'max_dist':    992, 'probability': 0.303341, 'to_alt':      1, 'from_alt':      2},
+        {'from': 110072, 'from_side':    'l', 'to': 108403, 'to_side':    'r', 'mean_dist':    813, 'mapq':  60060, 'bcount':     31, 'min_dist':    745, 'max_dist':   1052, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      2},
+        {'from': 110072, 'from_side':    'r', 'to':  95786, 'to_side':    'l', 'mean_dist':    -29, 'mapq':  60060, 'bcount':     24, 'min_dist':    -35, 'max_dist':    -20, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      2},
+        {'from': 110072, 'from_side':    'r', 'to': 108403, 'to_side':    'l', 'mean_dist':    -30, 'mapq':  60060, 'bcount':     34, 'min_dist':    -38, 'max_dist':    -24, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      2}
+        ]) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    300,    300,    300,    300,    300,    300,    300],
+        'pos':      [      0,      1,      2,      3,      4,      5,      6],
+        'phase0':   [    301,    301,    301,    301,    301,    301,    301],
+        'scaf0':    [  30387, 110072, 108403, 110072, 108403, 110072,  95786],
+        'strand0':  [    '-',    '+',    '+',    '+',    '+',    '+',    '+'],
+        'dist0':    [      0,    758,    -30,    813,    -30,    813,    -29],
+        'phase1':   [   -302,   -302,   -302,   -302,   -302,   -302,   -302],
+        'scaf1':    [     -1,     -1,     -1,     -1,     -1,     -1,     -1],
+        'strand1':  [     '',     '',     '',     '',     '',     '',     ''],
+        'dist1':    [      0,      0,      0,      0,      0,      0,      0]
+        }) )
+#
+    # Test 4
+    scaffolds.append( pd.DataFrame({'case':4, 'scaffold':[928, 9067, 12976, 13100, 20542, 45222, 80469]}) )
+    scaffold_graph.append( pd.DataFrame([
+        {'from':    928, 'from_side':    'r', 'length':      2, 'scaf1':  45222, 'strand1':    '+', 'dist1':    -44},
+        {'from':    928, 'from_side':    'r', 'length':      2, 'scaf1':  45222, 'strand1':    '+', 'dist1':     20},
+        {'from':   9067, 'from_side':    'l', 'length':      3, 'scaf1':   9067, 'strand1':    '-', 'dist1':   2982, 'scaf2':  80469, 'strand2':    '-', 'dist2':      4},
+        {'from':   9067, 'from_side':    'l', 'length':      2, 'scaf1':  80469, 'strand1':    '-', 'dist1':      4},
+        {'from':   9067, 'from_side':    'r', 'length':      3, 'scaf1':   9067, 'strand1':    '+', 'dist1':   2982, 'scaf2':  45222, 'strand2':    '-', 'dist2':    397},
+        {'from':   9067, 'from_side':    'r', 'length':      2, 'scaf1':  45222, 'strand1':    '-', 'dist1':    397},
+        {'from':  12976, 'from_side':    'l', 'length':      2, 'scaf1':  80469, 'strand1':    '+', 'dist1':    -44},
+        {'from':  12976, 'from_side':    'r', 'length':      2, 'scaf1':  20542, 'strand1':    '+', 'dist1':    -46},
+        {'from':  13100, 'from_side':    'l', 'length':      2, 'scaf1':  20542, 'strand1':    '+', 'dist1':    -43},
+        {'from':  13100, 'from_side':    'r', 'length':      2, 'scaf1':  80469, 'strand1':    '+', 'dist1':    -42},
+        {'from':  20542, 'from_side':    'l', 'length':      3, 'scaf1':  12976, 'strand1':    '-', 'dist1':    -46, 'scaf2':  80469, 'strand2':    '+', 'dist2':    -44},
+        {'from':  20542, 'from_side':    'l', 'length':      3, 'scaf1':  13100, 'strand1':    '+', 'dist1':    -43, 'scaf2':  80469, 'strand2':    '+', 'dist2':    -42},
+        {'from':  45222, 'from_side':    'l', 'length':      2, 'scaf1':    928, 'strand1':    '-', 'dist1':    -44},
+        {'from':  45222, 'from_side':    'l', 'length':      2, 'scaf1':    928, 'strand1':    '-', 'dist1':     20},
+        {'from':  45222, 'from_side':    'r', 'length':      4, 'scaf1':   9067, 'strand1':    '-', 'dist1':    397, 'scaf2':   9067, 'strand2':    '-', 'dist2':   2982, 'scaf3':  80469, 'strand3':    '-', 'dist3':      4},
+        {'from':  45222, 'from_side':    'r', 'length':      3, 'scaf1':   9067, 'strand1':    '-', 'dist1':    397, 'scaf2':  80469, 'strand2':    '-', 'dist2':      4},
+        {'from':  80469, 'from_side':    'l', 'length':      3, 'scaf1':  12976, 'strand1':    '+', 'dist1':    -44, 'scaf2':  20542, 'strand2':    '+', 'dist2':    -46},
+        {'from':  80469, 'from_side':    'l', 'length':      3, 'scaf1':  13100, 'strand1':    '-', 'dist1':    -42, 'scaf2':  20542, 'strand2':    '+', 'dist2':    -43},
+        {'from':  80469, 'from_side':    'r', 'length':      4, 'scaf1':   9067, 'strand1':    '+', 'dist1':      4, 'scaf2':   9067, 'strand2':    '+', 'dist2':   2982, 'scaf3':  45222, 'strand3':    '-', 'dist3':    397},
+        {'from':  80469, 'from_side':    'r', 'length':      3, 'scaf1':   9067, 'strand1':    '+', 'dist1':      4, 'scaf2':  45222, 'strand2':    '-', 'dist2':    397}
+        ]) )
+    scaf_bridges.append( pd.DataFrame([
+        {'from':    928, 'from_side':    'r', 'to':  45222, 'to_side':    'l', 'mean_dist':    -44, 'mapq':  60060, 'bcount':     10, 'min_dist':    -49, 'max_dist':    -39, 'probability': 0.037322, 'to_alt':      2, 'from_alt':      2},
+        {'from':    928, 'from_side':    'r', 'to':  45222, 'to_side':    'l', 'mean_dist':     20, 'mapq':  60060, 'bcount':     10, 'min_dist':      9, 'max_dist':     39, 'probability': 0.037322, 'to_alt':      2, 'from_alt':      2},
+        {'from':   9067, 'from_side':    'l', 'to':   9067, 'to_side':    'r', 'mean_dist':   2982, 'mapq':  60060, 'bcount':      7, 'min_dist':   2857, 'max_dist':   3235, 'probability': 0.076700, 'to_alt':      2, 'from_alt':      2},
+        {'from':   9067, 'from_side':    'l', 'to':  80469, 'to_side':    'r', 'mean_dist':      4, 'mapq':  60060, 'bcount':     19, 'min_dist':      1, 'max_dist':     19, 'probability': 0.273725, 'to_alt':      1, 'from_alt':      2},
+        {'from':   9067, 'from_side':    'r', 'to':   9067, 'to_side':    'l', 'mean_dist':   2982, 'mapq':  60060, 'bcount':      7, 'min_dist':   2857, 'max_dist':   3235, 'probability': 0.076700, 'to_alt':      2, 'from_alt':      2},
+        {'from':   9067, 'from_side':    'r', 'to':  45222, 'to_side':    'r', 'mean_dist':    397, 'mapq':  60060, 'bcount':     24, 'min_dist':    379, 'max_dist':    424, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      2},
+        {'from':  12976, 'from_side':    'l', 'to':  80469, 'to_side':    'l', 'mean_dist':    -44, 'mapq':  60060, 'bcount':      9, 'min_dist':    -49, 'max_dist':    -37, 'probability': 0.027818, 'to_alt':      2, 'from_alt':      1},
+        {'from':  12976, 'from_side':    'r', 'to':  20542, 'to_side':    'l', 'mean_dist':    -46, 'mapq':  60060, 'bcount':      5, 'min_dist':    -55, 'max_dist':    -35, 'probability': 0.007368, 'to_alt':      2, 'from_alt':      1},
+        {'from':  13100, 'from_side':    'l', 'to':  20542, 'to_side':    'l', 'mean_dist':    -43, 'mapq':  60060, 'bcount':     10, 'min_dist':    -54, 'max_dist':    -29, 'probability': 0.037322, 'to_alt':      2, 'from_alt':      1},
+        {'from':  13100, 'from_side':    'r', 'to':  80469, 'to_side':    'l', 'mean_dist':    -42, 'mapq':  60060, 'bcount':      9, 'min_dist':    -47, 'max_dist':    -27, 'probability': 0.027818, 'to_alt':      2, 'from_alt':      1},
+        {'from':  20542, 'from_side':    'l', 'to':  12976, 'to_side':    'r', 'mean_dist':    -46, 'mapq':  60060, 'bcount':      5, 'min_dist':    -55, 'max_dist':    -35, 'probability': 0.007368, 'to_alt':      1, 'from_alt':      2},
+        {'from':  20542, 'from_side':    'l', 'to':  13100, 'to_side':    'l', 'mean_dist':    -43, 'mapq':  60060, 'bcount':     10, 'min_dist':    -54, 'max_dist':    -29, 'probability': 0.037322, 'to_alt':      1, 'from_alt':      2},
+        {'from':  45222, 'from_side':    'l', 'to':    928, 'to_side':    'r', 'mean_dist':    -44, 'mapq':  60060, 'bcount':     10, 'min_dist':    -49, 'max_dist':    -39, 'probability': 0.037322, 'to_alt':      2, 'from_alt':      2},
+        {'from':  45222, 'from_side':    'l', 'to':    928, 'to_side':    'r', 'mean_dist':     20, 'mapq':  60060, 'bcount':     10, 'min_dist':      9, 'max_dist':     39, 'probability': 0.037322, 'to_alt':      2, 'from_alt':      2},
+        {'from':  45222, 'from_side':    'r', 'to':   9067, 'to_side':    'r', 'mean_dist':    397, 'mapq':  60060, 'bcount':     24, 'min_dist':    379, 'max_dist':    424, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      1},
+        {'from':  80469, 'from_side':    'l', 'to':  12976, 'to_side':    'l', 'mean_dist':    -44, 'mapq':  60060, 'bcount':      9, 'min_dist':    -49, 'max_dist':    -37, 'probability': 0.027818, 'to_alt':      1, 'from_alt':      2},
+        {'from':  80469, 'from_side':    'l', 'to':  13100, 'to_side':    'r', 'mean_dist':    -42, 'mapq':  60060, 'bcount':      9, 'min_dist':    -47, 'max_dist':    -27, 'probability': 0.027818, 'to_alt':      1, 'from_alt':      2},
+        {'from':  80469, 'from_side':    'r', 'to':   9067, 'to_side':    'l', 'mean_dist':      4, 'mapq':  60060, 'bcount':     19, 'min_dist':      1, 'max_dist':     19, 'probability': 0.273725, 'to_alt':      2, 'from_alt':      1}
+        ]) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    400,    400,    400,    400,    400,    400,    400],
+        'pos':      [      0,      1,      2,      3,      4,      5,      6],
+        'phase0':   [    401,    401,    401,    401,    401,    401,    401],
+        'scaf0':    [    928,  45222,   9067,     -1,  80469,  13100,  20542],
+        'strand0':  [    '+',    '+',    '-',     '',    '-',    '-',    '+'],
+        'dist0':    [      0,     20,    397,      0,      4,    -42,    -43],
+        'phase1':   [   -402,    402,   -402,    402,   -402,    402,    402],
+        'scaf1':    [     -1,  45222,     -1,   9067,     -1,  12976,  20542],
+        'strand1':  [     '',    '+',     '',    '-',     '',    '+',    '+'],
+        'dist1':    [      0,    -44,      0,   2982,      0,    -44,    -46]
+        }) )
+#
+    # Test 5
+    scaffolds.append( pd.DataFrame({'case':5, 'scaffold':[7, 1440, 7349, 10945, 11769, 23515, 29100, 30446, 31108, 31729, 31737, 31758, 32135, 32420, 45782, 45783, 47750, 49372, 54753, 74998, 76037, 86633, 93920, 95291, 105853, 110006, 113898]}) )
+    scaffold_graph.append( pd.DataFrame([
+        {'from':      7, 'from_side':    'l', 'length':      4, 'scaf1':  11769, 'strand1':    '+', 'dist1':     76, 'scaf2':   1440, 'strand2':    '+', 'dist2':    -45, 'scaf3': 110006, 'strand3':    '-', 'dist3':    406},
+        {'from':      7, 'from_side':    'l', 'length':      2, 'scaf1':  93920, 'strand1':    '+', 'dist1':    383},
+        {'from':      7, 'from_side':    'r', 'length':      6, 'scaf1':  45782, 'strand1':    '+', 'dist1':   -230, 'scaf2':  45783, 'strand2':    '+', 'dist2':      0, 'scaf3':  31737, 'strand3':    '+', 'dist3':   1044, 'scaf4':  31758, 'strand4':    '+', 'dist4':     86, 'scaf5':  47750, 'strand5':    '+', 'dist5':    -42},
+        {'from':      7, 'from_side':    'r', 'length':      5, 'scaf1':  74998, 'strand1':    '+', 'dist1':   -558, 'scaf2':  32135, 'strand2':    '-', 'dist2':    739, 'scaf3':  45782, 'strand3':    '+', 'dist3':   -502, 'scaf4':  45783, 'strand4':    '+', 'dist4':      0},
+        {'from':      7, 'from_side':    'r', 'length':      6, 'scaf1':  74998, 'strand1':    '+', 'dist1':   -558, 'scaf2':  32135, 'strand2':    '-', 'dist2':    739, 'scaf3':  45782, 'strand3':    '+', 'dist3':   -502, 'scaf4':  49372, 'strand4':    '-', 'dist4':    334, 'scaf5':  30446, 'strand5':    '+', 'dist5':   9158},
+        {'from':      7, 'from_side':    'r', 'length':      6, 'scaf1':  74998, 'strand1':    '+', 'dist1':   -558, 'scaf2':  32135, 'strand2':    '-', 'dist2':    739, 'scaf3':  45782, 'strand3':    '+', 'dist3':   -502, 'scaf4':  49372, 'strand4':    '-', 'dist4':    334, 'scaf5':  86633, 'strand5':    '-', 'dist5':    432},
+        {'from':   1440, 'from_side':    'l', 'length':      5, 'scaf1':  11769, 'strand1':    '-', 'dist1':    -45, 'scaf2':      7, 'strand2':    '+', 'dist2':     76, 'scaf3':  74998, 'strand3':    '+', 'dist3':   -558, 'scaf4':  32135, 'strand4':    '-', 'dist4':    739},
+        {'from':   1440, 'from_side':    'r', 'length':      2, 'scaf1': 110006, 'strand1':    '-', 'dist1':    406},
+        {'from':   7349, 'from_side':    'l', 'length':      2, 'scaf1': 110006, 'strand1':    '-', 'dist1':    387},
+        {'from':   7349, 'from_side':    'r', 'length':      2, 'scaf1':  11769, 'strand1':    '-', 'dist1':    -45},
+        {'from':  10945, 'from_side':    'l', 'length':      4, 'scaf1':  95291, 'strand1':    '-', 'dist1':    -45, 'scaf2':  54753, 'strand2':    '-', 'dist2':    -18, 'scaf3':  31108, 'strand3':    '+', 'dist3':      0},
+        {'from':  10945, 'from_side':    'r', 'length':      7, 'scaf1': 105853, 'strand1':    '-', 'dist1':    -43, 'scaf2':  32135, 'strand2':    '-', 'dist2':    -45, 'scaf3':  45782, 'strand3':    '+', 'dist3':   -502, 'scaf4':  49372, 'strand4':    '-', 'dist4':    334, 'scaf5':  86633, 'strand5':    '-', 'dist5':    432, 'scaf6':  30446, 'strand6':    '+', 'dist6':    -43},
+        {'from':  11769, 'from_side':    'l', 'length':      7, 'scaf1':      7, 'strand1':    '+', 'dist1':     76, 'scaf2':  74998, 'strand2':    '+', 'dist2':   -558, 'scaf3':  32135, 'strand3':    '-', 'dist3':    739, 'scaf4':  45782, 'strand4':    '+', 'dist4':   -502, 'scaf5':  49372, 'strand5':    '-', 'dist5':    334, 'scaf6':  86633, 'strand6':    '-', 'dist6':    432},
+        {'from':  11769, 'from_side':    'r', 'length':      3, 'scaf1':   1440, 'strand1':    '+', 'dist1':    -45, 'scaf2': 110006, 'strand2':    '-', 'dist2':    406},
+        {'from':  11769, 'from_side':    'r', 'length':      3, 'scaf1':   7349, 'strand1':    '-', 'dist1':    -45, 'scaf2': 110006, 'strand2':    '-', 'dist2':    387},
+        {'from':  23515, 'from_side':    'r', 'length':      5, 'scaf1':  95291, 'strand1':    '+', 'dist1':      3, 'scaf2':  29100, 'strand2':    '-', 'dist2':    -43, 'scaf3': 105853, 'strand3':    '-', 'dist3':    -44, 'scaf4':  32420, 'strand4':    '-', 'dist4':    -44},
+        {'from':  29100, 'from_side':    'l', 'length':      3, 'scaf1': 105853, 'strand1':    '-', 'dist1':    -44, 'scaf2':  32420, 'strand2':    '-', 'dist2':    -44},
+        {'from':  29100, 'from_side':    'r', 'length':      3, 'scaf1':  95291, 'strand1':    '-', 'dist1':    -43, 'scaf2':  23515, 'strand2':    '-', 'dist2':      3},
+        {'from':  30446, 'from_side':    'l', 'length':      6, 'scaf1':  49372, 'strand1':    '+', 'dist1':   9158, 'scaf2':  45782, 'strand2':    '-', 'dist2':    334, 'scaf3':  32135, 'strand3':    '+', 'dist3':   -502, 'scaf4':  74998, 'strand4':    '-', 'dist4':    739, 'scaf5':      7, 'strand5':    '-', 'dist5':   -558},
+        {'from':  30446, 'from_side':    'l', 'length':      8, 'scaf1':  86633, 'strand1':    '+', 'dist1':    -43, 'scaf2':  49372, 'strand2':    '+', 'dist2':    432, 'scaf3':  45782, 'strand3':    '-', 'dist3':    334, 'scaf4':  32135, 'strand4':    '+', 'dist4':   -502, 'scaf5': 105853, 'strand5':    '+', 'dist5':    -45, 'scaf6':  10945, 'strand6':    '-', 'dist6':    -43, 'scaf7':  95291, 'strand7':    '-', 'dist7':    -45},
+        {'from':  30446, 'from_side':    'r', 'length':      4, 'scaf1':  31729, 'strand1':    '+', 'dist1':    630, 'scaf2':  31758, 'strand2':    '+', 'dist2':   -399, 'scaf3':  47750, 'strand3':    '+', 'dist3':    -42},
+        {'from':  30446, 'from_side':    'r', 'length':      4, 'scaf1':  31729, 'strand1':    '+', 'dist1':    630, 'scaf2':  31758, 'strand2':    '+', 'dist2':   -399, 'scaf3': 113898, 'strand3':    '+', 'dist3':    686},
+        {'from':  30446, 'from_side':    'r', 'length':      5, 'scaf1':  76037, 'strand1':    '-', 'dist1':      0, 'scaf2':  31729, 'strand2':    '+', 'dist2':   -162, 'scaf3':  31758, 'strand3':    '+', 'dist3':   -399, 'scaf4':  47750, 'strand4':    '+', 'dist4':    -42},
+        {'from':  30446, 'from_side':    'r', 'length':      5, 'scaf1':  76037, 'strand1':    '-', 'dist1':      0, 'scaf2':  31729, 'strand2':    '+', 'dist2':   -162, 'scaf3':  31758, 'strand3':    '+', 'dist3':   -399, 'scaf4': 113898, 'strand4':    '+', 'dist4':    686},
+        {'from':  30446, 'from_side':    'r', 'length':      3, 'scaf1':  76037, 'strand1':    '-', 'dist1':      0, 'scaf2':  31737, 'strand2':    '+', 'dist2':   -168},
+        {'from':  31108, 'from_side':    'l', 'length':      8, 'scaf1':  54753, 'strand1':    '+', 'dist1':      0, 'scaf2':  95291, 'strand2':    '+', 'dist2':    -18, 'scaf3':  10945, 'strand3':    '+', 'dist3':    -45, 'scaf4': 105853, 'strand4':    '-', 'dist4':    -43, 'scaf5':  32135, 'strand5':    '-', 'dist5':    -45, 'scaf6':  45782, 'strand6':    '+', 'dist6':   -502, 'scaf7':  49372, 'strand7':    '-', 'dist7':    334},
+        {'from':  31108, 'from_side':    'l', 'length':      2, 'scaf1':  93920, 'strand1':    '-', 'dist1':  -4681},
+        {'from':  31729, 'from_side':    'l', 'length':      6, 'scaf1':  30446, 'strand1':    '-', 'dist1':    630, 'scaf2':  86633, 'strand2':    '+', 'dist2':    -43, 'scaf3':  49372, 'strand3':    '+', 'dist3':    432, 'scaf4':  45782, 'strand4':    '-', 'dist4':    334, 'scaf5':  32135, 'strand5':    '+', 'dist5':   -502},
+        {'from':  31729, 'from_side':    'l', 'length':      5, 'scaf1':  76037, 'strand1':    '+', 'dist1':   -162, 'scaf2':  30446, 'strand2':    '-', 'dist2':      0, 'scaf3':  86633, 'strand3':    '+', 'dist3':    -43, 'scaf4':  49372, 'strand4':    '+', 'dist4':    432},
+        {'from':  31729, 'from_side':    'r', 'length':      3, 'scaf1':  31758, 'strand1':    '+', 'dist1':   -399, 'scaf2':  47750, 'strand2':    '+', 'dist2':    -42},
+        {'from':  31729, 'from_side':    'r', 'length':      3, 'scaf1':  31758, 'strand1':    '+', 'dist1':   -399, 'scaf2': 113898, 'strand2':    '+', 'dist2':    686},
+        {'from':  31737, 'from_side':    'l', 'length':      5, 'scaf1':  45783, 'strand1':    '-', 'dist1':   1044, 'scaf2':  45782, 'strand2':    '-', 'dist2':      0, 'scaf3':      7, 'strand3':    '-', 'dist3':   -230, 'scaf4':  93920, 'strand4':    '+', 'dist4':    383},
+        {'from':  31737, 'from_side':    'l', 'length':      3, 'scaf1':  76037, 'strand1':    '+', 'dist1':   -168, 'scaf2':  30446, 'strand2':    '-', 'dist2':      0},
+        {'from':  31737, 'from_side':    'r', 'length':      4, 'scaf1':  31758, 'strand1':    '+', 'dist1':     86, 'scaf2':  47750, 'strand2':    '+', 'dist2':    -42, 'scaf3': 113898, 'strand3':    '+', 'dist3':    -10},
+        {'from':  31758, 'from_side':    'l', 'length':      7, 'scaf1':  31729, 'strand1':    '-', 'dist1':   -399, 'scaf2':  30446, 'strand2':    '-', 'dist2':    630, 'scaf3':  86633, 'strand3':    '+', 'dist3':    -43, 'scaf4':  49372, 'strand4':    '+', 'dist4':    432, 'scaf5':  45782, 'strand5':    '-', 'dist5':    334, 'scaf6':  32135, 'strand6':    '+', 'dist6':   -502},
+        {'from':  31758, 'from_side':    'l', 'length':      6, 'scaf1':  31729, 'strand1':    '-', 'dist1':   -399, 'scaf2':  76037, 'strand2':    '+', 'dist2':   -162, 'scaf3':  30446, 'strand3':    '-', 'dist3':      0, 'scaf4':  86633, 'strand4':    '+', 'dist4':    -43, 'scaf5':  49372, 'strand5':    '+', 'dist5':    432},
+        {'from':  31758, 'from_side':    'l', 'length':      6, 'scaf1':  31737, 'strand1':    '-', 'dist1':     86, 'scaf2':  45783, 'strand2':    '-', 'dist2':   1044, 'scaf3':  45782, 'strand3':    '-', 'dist3':      0, 'scaf4':      7, 'strand4':    '-', 'dist4':   -230, 'scaf5':  93920, 'strand5':    '+', 'dist5':    383},
+        {'from':  31758, 'from_side':    'l', 'length':      3, 'scaf1':  31737, 'strand1':    '-', 'dist1':     86, 'scaf2':  76037, 'strand2':    '+', 'dist2':   -168},
+        {'from':  31758, 'from_side':    'r', 'length':      3, 'scaf1':  47750, 'strand1':    '+', 'dist1':    -42, 'scaf2': 113898, 'strand2':    '+', 'dist2':    -10},
+        {'from':  31758, 'from_side':    'r', 'length':      2, 'scaf1': 113898, 'strand1':    '+', 'dist1':    686},
+        {'from':  32135, 'from_side':    'l', 'length':      3, 'scaf1':  45782, 'strand1':    '+', 'dist1':   -502, 'scaf2':  45783, 'strand2':    '+', 'dist2':      0},
+        {'from':  32135, 'from_side':    'l', 'length':      4, 'scaf1':  45782, 'strand1':    '+', 'dist1':   -502, 'scaf2':  49372, 'strand2':    '-', 'dist2':    334, 'scaf3':  30446, 'strand3':    '+', 'dist3':   9158},
+        {'from':  32135, 'from_side':    'l', 'length':      8, 'scaf1':  45782, 'strand1':    '+', 'dist1':   -502, 'scaf2':  49372, 'strand2':    '-', 'dist2':    334, 'scaf3':  86633, 'strand3':    '-', 'dist3':    432, 'scaf4':  30446, 'strand4':    '+', 'dist4':    -43, 'scaf5':  31729, 'strand5':    '+', 'dist5':    630, 'scaf6':  31758, 'strand6':    '+', 'dist6':   -399, 'scaf7': 113898, 'strand7':    '+', 'dist7':    686},
+        {'from':  32135, 'from_side':    'r', 'length':      6, 'scaf1':  74998, 'strand1':    '-', 'dist1':    739, 'scaf2':      7, 'strand2':    '-', 'dist2':   -558, 'scaf3':  11769, 'strand3':    '+', 'dist3':     76, 'scaf4':   1440, 'strand4':    '+', 'dist4':    -45, 'scaf5': 110006, 'strand5':    '-', 'dist5':    406},
+        {'from':  32135, 'from_side':    'r', 'length':      4, 'scaf1':  74998, 'strand1':    '-', 'dist1':    739, 'scaf2':      7, 'strand2':    '-', 'dist2':   -558, 'scaf3':  93920, 'strand3':    '+', 'dist3':    383},
+        {'from':  32135, 'from_side':    'r', 'length':      6, 'scaf1': 105853, 'strand1':    '+', 'dist1':    -45, 'scaf2':  10945, 'strand2':    '-', 'dist2':    -43, 'scaf3':  95291, 'strand3':    '-', 'dist3':    -45, 'scaf4':  54753, 'strand4':    '-', 'dist4':    -18, 'scaf5':  31108, 'strand5':    '+', 'dist5':      0},
+        {'from':  32420, 'from_side':    'r', 'length':      5, 'scaf1': 105853, 'strand1':    '+', 'dist1':    -44, 'scaf2':  29100, 'strand2':    '+', 'dist2':    -44, 'scaf3':  95291, 'strand3':    '-', 'dist3':    -43, 'scaf4':  23515, 'strand4':    '-', 'dist4':      3},
+        {'from':  45782, 'from_side':    'l', 'length':      3, 'scaf1':      7, 'strand1':    '-', 'dist1':   -230, 'scaf2':  93920, 'strand2':    '+', 'dist2':    383},
+        {'from':  45782, 'from_side':    'l', 'length':      5, 'scaf1':  32135, 'strand1':    '+', 'dist1':   -502, 'scaf2':  74998, 'strand2':    '-', 'dist2':    739, 'scaf3':      7, 'strand3':    '-', 'dist3':   -558, 'scaf4':  11769, 'strand4':    '+', 'dist4':     76},
+        {'from':  45782, 'from_side':    'l', 'length':      5, 'scaf1':  32135, 'strand1':    '+', 'dist1':   -502, 'scaf2':  74998, 'strand2':    '-', 'dist2':    739, 'scaf3':      7, 'strand3':    '-', 'dist3':   -558, 'scaf4':  93920, 'strand4':    '+', 'dist4':    383},
+        {'from':  45782, 'from_side':    'l', 'length':      7, 'scaf1':  32135, 'strand1':    '+', 'dist1':   -502, 'scaf2': 105853, 'strand2':    '+', 'dist2':    -45, 'scaf3':  10945, 'strand3':    '-', 'dist3':    -43, 'scaf4':  95291, 'strand4':    '-', 'dist4':    -45, 'scaf5':  54753, 'strand5':    '-', 'dist5':    -18, 'scaf6':  31108, 'strand6':    '+', 'dist6':      0},
+        {'from':  45782, 'from_side':    'r', 'length':      5, 'scaf1':  45783, 'strand1':    '+', 'dist1':      0, 'scaf2':  31737, 'strand2':    '+', 'dist2':   1044, 'scaf3':  31758, 'strand3':    '+', 'dist3':     86, 'scaf4':  47750, 'strand4':    '+', 'dist4':    -42},
+        {'from':  45782, 'from_side':    'r', 'length':      3, 'scaf1':  49372, 'strand1':    '-', 'dist1':    334, 'scaf2':  30446, 'strand2':    '+', 'dist2':   9158},
+        {'from':  45782, 'from_side':    'r', 'length':      7, 'scaf1':  49372, 'strand1':    '-', 'dist1':    334, 'scaf2':  86633, 'strand2':    '-', 'dist2':    432, 'scaf3':  30446, 'strand3':    '+', 'dist3':    -43, 'scaf4':  31729, 'strand4':    '+', 'dist4':    630, 'scaf5':  31758, 'strand5':    '+', 'dist5':   -399, 'scaf6': 113898, 'strand6':    '+', 'dist6':    686},
+        {'from':  45783, 'from_side':    'l', 'length':      4, 'scaf1':  45782, 'strand1':    '-', 'dist1':      0, 'scaf2':      7, 'strand2':    '-', 'dist2':   -230, 'scaf3':  93920, 'strand3':    '+', 'dist3':    383},
+        {'from':  45783, 'from_side':    'l', 'length':      6, 'scaf1':  45782, 'strand1':    '-', 'dist1':      0, 'scaf2':  32135, 'strand2':    '+', 'dist2':   -502, 'scaf3':  74998, 'strand3':    '-', 'dist3':    739, 'scaf4':      7, 'strand4':    '-', 'dist4':   -558, 'scaf5':  93920, 'strand5':    '+', 'dist5':    383},
+        {'from':  45783, 'from_side':    'r', 'length':      5, 'scaf1':  31737, 'strand1':    '+', 'dist1':   1044, 'scaf2':  31758, 'strand2':    '+', 'dist2':     86, 'scaf3':  47750, 'strand3':    '+', 'dist3':    -42, 'scaf4': 113898, 'strand4':    '+', 'dist4':    -10},
+        {'from':  47750, 'from_side':    'l', 'length':      4, 'scaf1':  31758, 'strand1':    '-', 'dist1':    -42, 'scaf2':  31729, 'strand2':    '-', 'dist2':   -399, 'scaf3':  30446, 'strand3':    '-', 'dist3':    630},
+        {'from':  47750, 'from_side':    'l', 'length':      5, 'scaf1':  31758, 'strand1':    '-', 'dist1':    -42, 'scaf2':  31729, 'strand2':    '-', 'dist2':   -399, 'scaf3':  76037, 'strand3':    '+', 'dist3':   -162, 'scaf4':  30446, 'strand4':    '-', 'dist4':      0},
+        {'from':  47750, 'from_side':    'l', 'length':      7, 'scaf1':  31758, 'strand1':    '-', 'dist1':    -42, 'scaf2':  31737, 'strand2':    '-', 'dist2':     86, 'scaf3':  45783, 'strand3':    '-', 'dist3':   1044, 'scaf4':  45782, 'strand4':    '-', 'dist4':      0, 'scaf5':      7, 'strand5':    '-', 'dist5':   -230, 'scaf6':  93920, 'strand6':    '+', 'dist6':    383},
+        {'from':  47750, 'from_side':    'l', 'length':      4, 'scaf1':  31758, 'strand1':    '-', 'dist1':    -42, 'scaf2':  31737, 'strand2':    '-', 'dist2':     86, 'scaf3':  76037, 'strand3':    '+', 'dist3':   -168},
+        {'from':  47750, 'from_side':    'r', 'length':      2, 'scaf1': 113898, 'strand1':    '+', 'dist1':    -10},
+        {'from':  49372, 'from_side':    'l', 'length':      2, 'scaf1':  30446, 'strand1':    '+', 'dist1':   9158},
+        {'from':  49372, 'from_side':    'l', 'length':      6, 'scaf1':  86633, 'strand1':    '-', 'dist1':    432, 'scaf2':  30446, 'strand2':    '+', 'dist2':    -43, 'scaf3':  31729, 'strand3':    '+', 'dist3':    630, 'scaf4':  31758, 'strand4':    '+', 'dist4':   -399, 'scaf5': 113898, 'strand5':    '+', 'dist5':    686},
+        {'from':  49372, 'from_side':    'l', 'length':      6, 'scaf1':  86633, 'strand1':    '-', 'dist1':    432, 'scaf2':  30446, 'strand2':    '+', 'dist2':    -43, 'scaf3':  76037, 'strand3':    '-', 'dist3':      0, 'scaf4':  31729, 'strand4':    '+', 'dist4':   -162, 'scaf5':  31758, 'strand5':    '+', 'dist5':   -399},
+        {'from':  49372, 'from_side':    'r', 'length':      6, 'scaf1':  45782, 'strand1':    '-', 'dist1':    334, 'scaf2':  32135, 'strand2':    '+', 'dist2':   -502, 'scaf3':  74998, 'strand3':    '-', 'dist3':    739, 'scaf4':      7, 'strand4':    '-', 'dist4':   -558, 'scaf5':  11769, 'strand5':    '+', 'dist5':     76},
+        {'from':  49372, 'from_side':    'r', 'length':      8, 'scaf1':  45782, 'strand1':    '-', 'dist1':    334, 'scaf2':  32135, 'strand2':    '+', 'dist2':   -502, 'scaf3': 105853, 'strand3':    '+', 'dist3':    -45, 'scaf4':  10945, 'strand4':    '-', 'dist4':    -43, 'scaf5':  95291, 'strand5':    '-', 'dist5':    -45, 'scaf6':  54753, 'strand6':    '-', 'dist6':    -18, 'scaf7':  31108, 'strand7':    '+', 'dist7':      0},
+        {'from':  54753, 'from_side':    'l', 'length':      2, 'scaf1':  31108, 'strand1':    '+', 'dist1':      0},
+        {'from':  54753, 'from_side':    'r', 'length':      7, 'scaf1':  95291, 'strand1':    '+', 'dist1':    -18, 'scaf2':  10945, 'strand2':    '+', 'dist2':    -45, 'scaf3': 105853, 'strand3':    '-', 'dist3':    -43, 'scaf4':  32135, 'strand4':    '-', 'dist4':    -45, 'scaf5':  45782, 'strand5':    '+', 'dist5':   -502, 'scaf6':  49372, 'strand6':    '-', 'dist6':    334},
+        {'from':  74998, 'from_side':    'l', 'length':      5, 'scaf1':      7, 'strand1':    '-', 'dist1':   -558, 'scaf2':  11769, 'strand2':    '+', 'dist2':     76, 'scaf3':   1440, 'strand3':    '+', 'dist3':    -45, 'scaf4': 110006, 'strand4':    '-', 'dist4':    406},
+        {'from':  74998, 'from_side':    'l', 'length':      3, 'scaf1':      7, 'strand1':    '-', 'dist1':   -558, 'scaf2':  93920, 'strand2':    '+', 'dist2':    383},
+        {'from':  74998, 'from_side':    'r', 'length':      4, 'scaf1':  32135, 'strand1':    '-', 'dist1':    739, 'scaf2':  45782, 'strand2':    '+', 'dist2':   -502, 'scaf3':  45783, 'strand3':    '+', 'dist3':      0},
+        {'from':  74998, 'from_side':    'r', 'length':      5, 'scaf1':  32135, 'strand1':    '-', 'dist1':    739, 'scaf2':  45782, 'strand2':    '+', 'dist2':   -502, 'scaf3':  49372, 'strand3':    '-', 'dist3':    334, 'scaf4':  30446, 'strand4':    '+', 'dist4':   9158},
+        {'from':  74998, 'from_side':    'r', 'length':      5, 'scaf1':  32135, 'strand1':    '-', 'dist1':    739, 'scaf2':  45782, 'strand2':    '+', 'dist2':   -502, 'scaf3':  49372, 'strand3':    '-', 'dist3':    334, 'scaf4':  86633, 'strand4':    '-', 'dist4':    432},
+        {'from':  76037, 'from_side':    'l', 'length':      4, 'scaf1':  31729, 'strand1':    '+', 'dist1':   -162, 'scaf2':  31758, 'strand2':    '+', 'dist2':   -399, 'scaf3':  47750, 'strand3':    '+', 'dist3':    -42},
+        {'from':  76037, 'from_side':    'l', 'length':      4, 'scaf1':  31729, 'strand1':    '+', 'dist1':   -162, 'scaf2':  31758, 'strand2':    '+', 'dist2':   -399, 'scaf3': 113898, 'strand3':    '+', 'dist3':    686},
+        {'from':  76037, 'from_side':    'l', 'length':      5, 'scaf1':  31737, 'strand1':    '+', 'dist1':   -168, 'scaf2':  31758, 'strand2':    '+', 'dist2':     86, 'scaf3':  47750, 'strand3':    '+', 'dist3':    -42, 'scaf4': 113898, 'strand4':    '+', 'dist4':    -10},
+        {'from':  76037, 'from_side':    'r', 'length':      4, 'scaf1':  30446, 'strand1':    '-', 'dist1':      0, 'scaf2':  86633, 'strand2':    '+', 'dist2':    -43, 'scaf3':  49372, 'strand3':    '+', 'dist3':    432},
+        {'from':  86633, 'from_side':    'l', 'length':      5, 'scaf1':  30446, 'strand1':    '+', 'dist1':    -43, 'scaf2':  31729, 'strand2':    '+', 'dist2':    630, 'scaf3':  31758, 'strand3':    '+', 'dist3':   -399, 'scaf4': 113898, 'strand4':    '+', 'dist4':    686},
+        {'from':  86633, 'from_side':    'l', 'length':      6, 'scaf1':  30446, 'strand1':    '+', 'dist1':    -43, 'scaf2':  76037, 'strand2':    '-', 'dist2':      0, 'scaf3':  31729, 'strand3':    '+', 'dist3':   -162, 'scaf4':  31758, 'strand4':    '+', 'dist4':   -399, 'scaf5': 113898, 'strand5':    '+', 'dist5':    686},
+        {'from':  86633, 'from_side':    'r', 'length':      7, 'scaf1':  49372, 'strand1':    '+', 'dist1':    432, 'scaf2':  45782, 'strand2':    '-', 'dist2':    334, 'scaf3':  32135, 'strand3':    '+', 'dist3':   -502, 'scaf4':  74998, 'strand4':    '-', 'dist4':    739, 'scaf5':      7, 'strand5':    '-', 'dist5':   -558, 'scaf6':  11769, 'strand6':    '+', 'dist6':     76},
+        {'from':  86633, 'from_side':    'r', 'length':      7, 'scaf1':  49372, 'strand1':    '+', 'dist1':    432, 'scaf2':  45782, 'strand2':    '-', 'dist2':    334, 'scaf3':  32135, 'strand3':    '+', 'dist3':   -502, 'scaf4': 105853, 'strand4':    '+', 'dist4':    -45, 'scaf5':  10945, 'strand5':    '-', 'dist5':    -43, 'scaf6':  95291, 'strand6':    '-', 'dist6':    -45},
+        {'from':  93920, 'from_side':    'l', 'length':      7, 'scaf1':      7, 'strand1':    '+', 'dist1':    383, 'scaf2':  45782, 'strand2':    '+', 'dist2':   -230, 'scaf3':  45783, 'strand3':    '+', 'dist3':      0, 'scaf4':  31737, 'strand4':    '+', 'dist4':   1044, 'scaf5':  31758, 'strand5':    '+', 'dist5':     86, 'scaf6':  47750, 'strand6':    '+', 'dist6':    -42},
+        {'from':  93920, 'from_side':    'l', 'length':      6, 'scaf1':      7, 'strand1':    '+', 'dist1':    383, 'scaf2':  74998, 'strand2':    '+', 'dist2':   -558, 'scaf3':  32135, 'strand3':    '-', 'dist3':    739, 'scaf4':  45782, 'strand4':    '+', 'dist4':   -502, 'scaf5':  45783, 'strand5':    '+', 'dist5':      0},
+        {'from':  93920, 'from_side':    'r', 'length':      2, 'scaf1':  31108, 'strand1':    '+', 'dist1':  -4681},
+        {'from':  95291, 'from_side':    'l', 'length':      2, 'scaf1':  23515, 'strand1':    '-', 'dist1':      3},
+        {'from':  95291, 'from_side':    'l', 'length':      3, 'scaf1':  54753, 'strand1':    '-', 'dist1':    -18, 'scaf2':  31108, 'strand2':    '+', 'dist2':      0},
+        {'from':  95291, 'from_side':    'r', 'length':      8, 'scaf1':  10945, 'strand1':    '+', 'dist1':    -45, 'scaf2': 105853, 'strand2':    '-', 'dist2':    -43, 'scaf3':  32135, 'strand3':    '-', 'dist3':    -45, 'scaf4':  45782, 'strand4':    '+', 'dist4':   -502, 'scaf5':  49372, 'strand5':    '-', 'dist5':    334, 'scaf6':  86633, 'strand6':    '-', 'dist6':    432, 'scaf7':  30446, 'strand7':    '+', 'dist7':    -43},
+        {'from':  95291, 'from_side':    'r', 'length':      4, 'scaf1':  29100, 'strand1':    '-', 'dist1':    -43, 'scaf2': 105853, 'strand2':    '-', 'dist2':    -44, 'scaf3':  32420, 'strand3':    '-', 'dist3':    -44},
+        {'from': 105853, 'from_side':    'l', 'length':      6, 'scaf1':  32135, 'strand1':    '-', 'dist1':    -45, 'scaf2':  45782, 'strand2':    '+', 'dist2':   -502, 'scaf3':  49372, 'strand3':    '-', 'dist3':    334, 'scaf4':  86633, 'strand4':    '-', 'dist4':    432, 'scaf5':  30446, 'strand5':    '+', 'dist5':    -43},
+        {'from': 105853, 'from_side':    'l', 'length':      2, 'scaf1':  32420, 'strand1':    '-', 'dist1':    -44},
+        {'from': 105853, 'from_side':    'r', 'length':      5, 'scaf1':  10945, 'strand1':    '-', 'dist1':    -43, 'scaf2':  95291, 'strand2':    '-', 'dist2':    -45, 'scaf3':  54753, 'strand3':    '-', 'dist3':    -18, 'scaf4':  31108, 'strand4':    '+', 'dist4':      0},
+        {'from': 105853, 'from_side':    'r', 'length':      4, 'scaf1':  29100, 'strand1':    '+', 'dist1':    -44, 'scaf2':  95291, 'strand2':    '-', 'dist2':    -43, 'scaf3':  23515, 'strand3':    '-', 'dist3':      3},
+        {'from': 110006, 'from_side':    'r', 'length':      6, 'scaf1':   1440, 'strand1':    '-', 'dist1':    406, 'scaf2':  11769, 'strand2':    '-', 'dist2':    -45, 'scaf3':      7, 'strand3':    '+', 'dist3':     76, 'scaf4':  74998, 'strand4':    '+', 'dist4':   -558, 'scaf5':  32135, 'strand5':    '-', 'dist5':    739},
+        {'from': 110006, 'from_side':    'r', 'length':      3, 'scaf1':   7349, 'strand1':    '+', 'dist1':    387, 'scaf2':  11769, 'strand2':    '-', 'dist2':    -45},
+        {'from': 113898, 'from_side':    'l', 'length':      8, 'scaf1':  31758, 'strand1':    '-', 'dist1':    686, 'scaf2':  31729, 'strand2':    '-', 'dist2':   -399, 'scaf3':  30446, 'strand3':    '-', 'dist3':    630, 'scaf4':  86633, 'strand4':    '+', 'dist4':    -43, 'scaf5':  49372, 'strand5':    '+', 'dist5':    432, 'scaf6':  45782, 'strand6':    '-', 'dist6':    334, 'scaf7':  32135, 'strand7':    '+', 'dist7':   -502},
+        {'from': 113898, 'from_side':    'l', 'length':      6, 'scaf1':  31758, 'strand1':    '-', 'dist1':    686, 'scaf2':  31729, 'strand2':    '-', 'dist2':   -399, 'scaf3':  76037, 'strand3':    '+', 'dist3':   -162, 'scaf4':  30446, 'strand4':    '-', 'dist4':      0, 'scaf5':  86633, 'strand5':    '+', 'dist5':    -43},
+        {'from': 113898, 'from_side':    'l', 'length':      5, 'scaf1':  47750, 'strand1':    '-', 'dist1':    -10, 'scaf2':  31758, 'strand2':    '-', 'dist2':    -42, 'scaf3':  31737, 'strand3':    '-', 'dist3':     86, 'scaf4':  45783, 'strand4':    '-', 'dist4':   1044},
+        {'from': 113898, 'from_side':    'l', 'length':      5, 'scaf1':  47750, 'strand1':    '-', 'dist1':    -10, 'scaf2':  31758, 'strand2':    '-', 'dist2':    -42, 'scaf3':  31737, 'strand3':    '-', 'dist3':     86, 'scaf4':  76037, 'strand4':    '+', 'dist4':   -168},
+        ]) )
+    scaf_bridges.append( pd.DataFrame([
+        {'from':      7, 'from_side':    'l', 'to':  11769, 'to_side':    'l', 'mean_dist':     76, 'mapq':  60060, 'bcount':     16, 'min_dist':     67, 'max_dist':     90, 'probability': 0.159802, 'to_alt':      1, 'from_alt':      2},
+        {'from':      7, 'from_side':    'l', 'to':  93920, 'to_side':    'l', 'mean_dist':    383, 'mapq':  60060, 'bcount':     38, 'min_dist':    364, 'max_dist':    425, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      2},
+        {'from':      7, 'from_side':    'r', 'to':  45782, 'to_side':    'l', 'mean_dist':   -230, 'mapq':  60060, 'bcount':     42, 'min_dist':   -253, 'max_dist':   -155, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      2},
+        {'from':      7, 'from_side':    'r', 'to':  74998, 'to_side':    'l', 'mean_dist':   -558, 'mapq':  60060, 'bcount':     40, 'min_dist':   -659, 'max_dist':   -401, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      2},
+        {'from':   1440, 'from_side':    'l', 'to':  11769, 'to_side':    'r', 'mean_dist':    -45, 'mapq':  60060, 'bcount':     13, 'min_dist':    -54, 'max_dist':    -37, 'probability': 0.082422, 'to_alt':      2, 'from_alt':      1},
+        {'from':   1440, 'from_side':    'r', 'to': 110006, 'to_side':    'r', 'mean_dist':    406, 'mapq':  60060, 'bcount':     11, 'min_dist':    386, 'max_dist':    433, 'probability': 0.081320, 'to_alt':      2, 'from_alt':      1},
+        {'from':   7349, 'from_side':    'l', 'to': 110006, 'to_side':    'r', 'mean_dist':    387, 'mapq':  60060, 'bcount':      6, 'min_dist':    371, 'max_dist':    408, 'probability': 0.016554, 'to_alt':      2, 'from_alt':      1},
+        {'from':   7349, 'from_side':    'r', 'to':  11769, 'to_side':    'r', 'mean_dist':    -45, 'mapq':  60060, 'bcount':      8, 'min_dist':    -51, 'max_dist':    -39, 'probability': 0.020422, 'to_alt':      2, 'from_alt':      1},
+        {'from':  10945, 'from_side':    'l', 'to':  95291, 'to_side':    'r', 'mean_dist':    -45, 'mapq':  60060, 'bcount':     16, 'min_dist':    -49, 'max_dist':    -40, 'probability': 0.159802, 'to_alt':      2, 'from_alt':      1},
+        {'from':  10945, 'from_side':    'r', 'to': 105853, 'to_side':    'r', 'mean_dist':    -43, 'mapq':  60060, 'bcount':     15, 'min_dist':    -49, 'max_dist':    -15, 'probability': 0.129976, 'to_alt':      2, 'from_alt':      1},
+        {'from':  11769, 'from_side':    'l', 'to':      7, 'to_side':    'l', 'mean_dist':     76, 'mapq':  60060, 'bcount':     16, 'min_dist':     67, 'max_dist':     90, 'probability': 0.159802, 'to_alt':      2, 'from_alt':      1},
+        {'from':  11769, 'from_side':    'r', 'to':   1440, 'to_side':    'l', 'mean_dist':    -45, 'mapq':  60060, 'bcount':     13, 'min_dist':    -54, 'max_dist':    -37, 'probability': 0.082422, 'to_alt':      1, 'from_alt':      2},
+        {'from':  11769, 'from_side':    'r', 'to':   7349, 'to_side':    'r', 'mean_dist':    -45, 'mapq':  60060, 'bcount':      8, 'min_dist':    -51, 'max_dist':    -39, 'probability': 0.020422, 'to_alt':      1, 'from_alt':      2},
+        {'from':  23515, 'from_side':    'r', 'to':  95291, 'to_side':    'l', 'mean_dist':      3, 'mapq':  60060, 'bcount':     13, 'min_dist':      1, 'max_dist':      8, 'probability': 0.082422, 'to_alt':      2, 'from_alt':      1},
+        {'from':  29100, 'from_side':    'l', 'to': 105853, 'to_side':    'r', 'mean_dist':    -44, 'mapq':  60060, 'bcount':     17, 'min_dist':    -48, 'max_dist':    -38, 'probability': 0.193782, 'to_alt':      2, 'from_alt':      1},
+        {'from':  29100, 'from_side':    'r', 'to':  95291, 'to_side':    'r', 'mean_dist':    -43, 'mapq':  60060, 'bcount':     14, 'min_dist':    -50, 'max_dist':    -34, 'probability': 0.104244, 'to_alt':      2, 'from_alt':      1},
+        {'from':  30446, 'from_side':    'l', 'to':  49372, 'to_side':    'l', 'mean_dist':   9158, 'mapq':  60060, 'bcount':      2, 'min_dist':   8995, 'max_dist':   9322, 'probability': 0.096053, 'to_alt':      3, 'from_alt':      2},
+        {'from':  30446, 'from_side':    'l', 'to':  86633, 'to_side':    'l', 'mean_dist':    -43, 'mapq':  60060, 'bcount':     30, 'min_dist':    -50, 'max_dist':    -32, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      2},
+        {'from':  30446, 'from_side':    'r', 'to':  31729, 'to_side':    'l', 'mean_dist':    630, 'mapq':  60060, 'bcount':     17, 'min_dist':    586, 'max_dist':    882, 'probability': 0.303341, 'to_alt':      2, 'from_alt':      2},
+        {'from':  30446, 'from_side':    'r', 'to':  76037, 'to_side':    'r', 'mean_dist':      0, 'mapq':  60060, 'bcount':     27, 'min_dist':      0, 'max_dist':      0, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      2},
+        {'from':  31108, 'from_side':    'l', 'to':  54753, 'to_side':    'l', 'mean_dist':      0, 'mapq':  60060, 'bcount':     14, 'min_dist':      0, 'max_dist':      0, 'probability': 0.104244, 'to_alt':      2, 'from_alt':      1},
+        {'from':  31108, 'from_side':    'l', 'to':  93920, 'to_side':    'r', 'mean_dist':  -4681, 'mapq':  60060, 'bcount':      6, 'min_dist':  -4716, 'max_dist':  -4577, 'probability': 0.108994, 'to_alt':      2, 'from_alt':      1},
+        {'from':  31729, 'from_side':    'l', 'to':  30446, 'to_side':    'r', 'mean_dist':    630, 'mapq':  60060, 'bcount':     17, 'min_dist':    586, 'max_dist':    882, 'probability': 0.303341, 'to_alt':      2, 'from_alt':      2},
+        {'from':  31729, 'from_side':    'l', 'to':  76037, 'to_side':    'l', 'mean_dist':   -162, 'mapq':  60060, 'bcount':     14, 'min_dist':   -174, 'max_dist':   -147, 'probability': 0.104244, 'to_alt':      2, 'from_alt':      2},
+        {'from':  31729, 'from_side':    'r', 'to':  31758, 'to_side':    'l', 'mean_dist':   -399, 'mapq':  60060, 'bcount':     21, 'min_dist':   -463, 'max_dist':   -335, 'probability': 0.367256, 'to_alt':      2, 'from_alt':      1},
+        {'from':  31737, 'from_side':    'l', 'to':  45783, 'to_side':    'r', 'mean_dist':   1044, 'mapq':  60060, 'bcount':      9, 'min_dist':    996, 'max_dist':   1138, 'probability': 0.045509, 'to_alt':      1, 'from_alt':      2},
+        {'from':  31737, 'from_side':    'l', 'to':  76037, 'to_side':    'l', 'mean_dist':   -168, 'mapq':  60060, 'bcount':      9, 'min_dist':   -186, 'max_dist':   -143, 'probability': 0.027818, 'to_alt':      2, 'from_alt':      2},
+        {'from':  31737, 'from_side':    'r', 'to':  31758, 'to_side':    'l', 'mean_dist':     86, 'mapq':  60060, 'bcount':     18, 'min_dist':     69, 'max_dist':    120, 'probability': 0.231835, 'to_alt':      2, 'from_alt':      1},
+        {'from':  31758, 'from_side':    'l', 'to':  31729, 'to_side':    'r', 'mean_dist':   -399, 'mapq':  60060, 'bcount':     21, 'min_dist':   -463, 'max_dist':   -335, 'probability': 0.367256, 'to_alt':      1, 'from_alt':      2},
+        {'from':  31758, 'from_side':    'l', 'to':  31737, 'to_side':    'r', 'mean_dist':     86, 'mapq':  60060, 'bcount':     18, 'min_dist':     69, 'max_dist':    120, 'probability': 0.231835, 'to_alt':      1, 'from_alt':      2},
+        {'from':  31758, 'from_side':    'r', 'to':  47750, 'to_side':    'l', 'mean_dist':    -42, 'mapq':  60060, 'bcount':     47, 'min_dist':    -49, 'max_dist':    -17, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      2},
+        {'from':  31758, 'from_side':    'r', 'to': 113898, 'to_side':    'l', 'mean_dist':    686, 'mapq':  60060, 'bcount':     20, 'min_dist':    648, 'max_dist':    763, 'probability': 0.470466, 'to_alt':      2, 'from_alt':      2},
+        {'from':  32135, 'from_side':    'l', 'to':  45782, 'to_side':    'l', 'mean_dist':   -502, 'mapq':  60060, 'bcount':     42, 'min_dist':   -560, 'max_dist':   -395, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      1},
+        {'from':  32135, 'from_side':    'r', 'to':  74998, 'to_side':    'r', 'mean_dist':    739, 'mapq':  60060, 'bcount':     24, 'min_dist':    660, 'max_dist':    984, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      2},
+        {'from':  32135, 'from_side':    'r', 'to': 105853, 'to_side':    'l', 'mean_dist':    -45, 'mapq':  60060, 'bcount':     21, 'min_dist':    -50, 'max_dist':    -34, 'probability': 0.367256, 'to_alt':      2, 'from_alt':      2},
+        {'from':  32420, 'from_side':    'r', 'to': 105853, 'to_side':    'l', 'mean_dist':    -44, 'mapq':  60060, 'bcount':     18, 'min_dist':    -50, 'max_dist':    -32, 'probability': 0.231835, 'to_alt':      2, 'from_alt':      1},
+        {'from':  45782, 'from_side':    'l', 'to':      7, 'to_side':    'r', 'mean_dist':   -230, 'mapq':  60060, 'bcount':     42, 'min_dist':   -253, 'max_dist':   -155, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      2},
+        {'from':  45782, 'from_side':    'l', 'to':  32135, 'to_side':    'l', 'mean_dist':   -502, 'mapq':  60060, 'bcount':     42, 'min_dist':   -560, 'max_dist':   -395, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      2},
+        {'from':  45782, 'from_side':    'r', 'to':  45783, 'to_side':    'l', 'mean_dist':      0, 'mapq':  60060, 'bcount':     43, 'min_dist':      0, 'max_dist':      0, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      2},
+        {'from':  45782, 'from_side':    'r', 'to':  49372, 'to_side':    'r', 'mean_dist':    334, 'mapq':  60060, 'bcount':     35, 'min_dist':    308, 'max_dist':    376, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      2},
+        {'from':  45783, 'from_side':    'l', 'to':  45782, 'to_side':    'r', 'mean_dist':      0, 'mapq':  60060, 'bcount':     43, 'min_dist':      0, 'max_dist':      0, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      1},
+        {'from':  45783, 'from_side':    'r', 'to':  31737, 'to_side':    'l', 'mean_dist':   1044, 'mapq':  60060, 'bcount':      9, 'min_dist':    996, 'max_dist':   1138, 'probability': 0.045509, 'to_alt':      2, 'from_alt':      1},
+        {'from':  47750, 'from_side':    'l', 'to':  31758, 'to_side':    'r', 'mean_dist':    -42, 'mapq':  60060, 'bcount':     47, 'min_dist':    -49, 'max_dist':    -17, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      1},
+        {'from':  47750, 'from_side':    'r', 'to': 113898, 'to_side':    'l', 'mean_dist':    -10, 'mapq':  60060, 'bcount':     31, 'min_dist':    -33, 'max_dist':     40, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      1},
+        {'from':  49372, 'from_side':    'l', 'to':  30446, 'to_side':    'l', 'mean_dist':   9158, 'mapq':  60060, 'bcount':      2, 'min_dist':   8995, 'max_dist':   9322, 'probability': 0.096053, 'to_alt':      2, 'from_alt':      3},
+        {'from':  49372, 'from_side':    'l', 'to':  86633, 'to_side':    'r', 'mean_dist':    432, 'mapq':  60060, 'bcount':     18, 'min_dist':    409, 'max_dist':    461, 'probability': 0.356470, 'to_alt':      1, 'from_alt':      3},
+        {'from':  49372, 'from_side':    'r', 'to':  45782, 'to_side':    'r', 'mean_dist':    334, 'mapq':  60060, 'bcount':     35, 'min_dist':    308, 'max_dist':    376, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      1},
+        {'from':  54753, 'from_side':    'l', 'to':  31108, 'to_side':    'l', 'mean_dist':      0, 'mapq':  60060, 'bcount':     14, 'min_dist':      0, 'max_dist':      0, 'probability': 0.104244, 'to_alt':      2, 'from_alt':      1},
+        {'from':  54753, 'from_side':    'r', 'to':  95291, 'to_side':    'l', 'mean_dist':    -18, 'mapq':  60060, 'bcount':     16, 'min_dist':    -22, 'max_dist':    -14, 'probability': 0.159802, 'to_alt':      2, 'from_alt':      1},
+        {'from':  74998, 'from_side':    'l', 'to':      7, 'to_side':    'r', 'mean_dist':   -558, 'mapq':  60060, 'bcount':     40, 'min_dist':   -659, 'max_dist':   -401, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      1},
+        {'from':  74998, 'from_side':    'r', 'to':  32135, 'to_side':    'r', 'mean_dist':    739, 'mapq':  60060, 'bcount':     24, 'min_dist':    660, 'max_dist':    984, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      1},
+        {'from':  76037, 'from_side':    'l', 'to':  31729, 'to_side':    'l', 'mean_dist':   -162, 'mapq':  60060, 'bcount':     14, 'min_dist':   -174, 'max_dist':   -147, 'probability': 0.104244, 'to_alt':      2, 'from_alt':      2},
+        {'from':  76037, 'from_side':    'l', 'to':  31737, 'to_side':    'l', 'mean_dist':   -168, 'mapq':  60060, 'bcount':      9, 'min_dist':   -186, 'max_dist':   -143, 'probability': 0.027818, 'to_alt':      2, 'from_alt':      2},
+        {'from':  76037, 'from_side':    'r', 'to':  30446, 'to_side':    'r', 'mean_dist':      0, 'mapq':  60060, 'bcount':     27, 'min_dist':      0, 'max_dist':      0, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      1},
+        {'from':  86633, 'from_side':    'l', 'to':  30446, 'to_side':    'l', 'mean_dist':    -43, 'mapq':  60060, 'bcount':     30, 'min_dist':    -50, 'max_dist':    -32, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      1},
+        {'from':  86633, 'from_side':    'r', 'to':  49372, 'to_side':    'l', 'mean_dist':    432, 'mapq':  60060, 'bcount':     18, 'min_dist':    409, 'max_dist':    461, 'probability': 0.356470, 'to_alt':      3, 'from_alt':      1},
+        {'from':  93920, 'from_side':    'l', 'to':      7, 'to_side':    'l', 'mean_dist':    383, 'mapq':  60060, 'bcount':     38, 'min_dist':    364, 'max_dist':    425, 'probability': 0.500000, 'to_alt':      2, 'from_alt':      1},
+        {'from':  93920, 'from_side':    'r', 'to':  31108, 'to_side':    'l', 'mean_dist':  -4681, 'mapq':  60060, 'bcount':      6, 'min_dist':  -4716, 'max_dist':  -4577, 'probability': 0.108994, 'to_alt':      2, 'from_alt':      1},
+        {'from':  95291, 'from_side':    'l', 'to':  23515, 'to_side':    'r', 'mean_dist':      3, 'mapq':  60060, 'bcount':     13, 'min_dist':      1, 'max_dist':      8, 'probability': 0.082422, 'to_alt':      1, 'from_alt':      2},
+        {'from':  95291, 'from_side':    'l', 'to':  54753, 'to_side':    'r', 'mean_dist':    -18, 'mapq':  60060, 'bcount':     16, 'min_dist':    -22, 'max_dist':    -14, 'probability': 0.159802, 'to_alt':      1, 'from_alt':      2},
+        {'from':  95291, 'from_side':    'r', 'to':  10945, 'to_side':    'l', 'mean_dist':    -45, 'mapq':  60060, 'bcount':     16, 'min_dist':    -49, 'max_dist':    -40, 'probability': 0.159802, 'to_alt':      1, 'from_alt':      2},
+        {'from':  95291, 'from_side':    'r', 'to':  29100, 'to_side':    'r', 'mean_dist':    -43, 'mapq':  60060, 'bcount':     14, 'min_dist':    -50, 'max_dist':    -34, 'probability': 0.104244, 'to_alt':      1, 'from_alt':      2},
+        {'from': 105853, 'from_side':    'l', 'to':  32135, 'to_side':    'r', 'mean_dist':    -45, 'mapq':  60060, 'bcount':     21, 'min_dist':    -50, 'max_dist':    -34, 'probability': 0.367256, 'to_alt':      2, 'from_alt':      2},
+        {'from': 105853, 'from_side':    'l', 'to':  32420, 'to_side':    'r', 'mean_dist':    -44, 'mapq':  60060, 'bcount':     18, 'min_dist':    -50, 'max_dist':    -32, 'probability': 0.231835, 'to_alt':      1, 'from_alt':      2},
+        {'from': 105853, 'from_side':    'r', 'to':  10945, 'to_side':    'r', 'mean_dist':    -43, 'mapq':  60060, 'bcount':     15, 'min_dist':    -49, 'max_dist':    -15, 'probability': 0.129976, 'to_alt':      1, 'from_alt':      2},
+        {'from': 105853, 'from_side':    'r', 'to':  29100, 'to_side':    'l', 'mean_dist':    -44, 'mapq':  60060, 'bcount':     17, 'min_dist':    -48, 'max_dist':    -38, 'probability': 0.193782, 'to_alt':      1, 'from_alt':      2},
+        {'from': 110006, 'from_side':    'r', 'to':   1440, 'to_side':    'r', 'mean_dist':    406, 'mapq':  60060, 'bcount':     11, 'min_dist':    386, 'max_dist':    433, 'probability': 0.081320, 'to_alt':      1, 'from_alt':      2},
+        {'from': 110006, 'from_side':    'r', 'to':   7349, 'to_side':    'l', 'mean_dist':    387, 'mapq':  60060, 'bcount':      6, 'min_dist':    371, 'max_dist':    408, 'probability': 0.016554, 'to_alt':      1, 'from_alt':      2},
+        {'from': 113898, 'from_side':    'l', 'to':  31758, 'to_side':    'r', 'mean_dist':    686, 'mapq':  60060, 'bcount':     20, 'min_dist':    648, 'max_dist':    763, 'probability': 0.470466, 'to_alt':      2, 'from_alt':      2},
+        {'from': 113898, 'from_side':    'l', 'to':  47750, 'to_side':    'r', 'mean_dist':    -10, 'mapq':  60060, 'bcount':     31, 'min_dist':    -33, 'max_dist':     40, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      2}
+        ]) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    500,    500,    500,    500,    500,    500],
+        'pos':      [      0,      1,      2,      3,      4,      5],
+        'phase0':   [    501,    501,    501,    501,    501,    501],
+        'scaf0':    [ 110006,   1440,  11769,      7,  74998,  32135],
+        'strand0':  [    '+',    '-',    '-',    '+',    '+',    '-'],
+        'dist0':    [      0,    406,    -45,     76,   -558,    739],
+        'phase1':   [   -502,    502,   -502,   -502,   -502,   -502],
+        'scaf1':    [     -1,   7349,     -1,     -1,     -1,     -1],
+        'strand1':  [     '',    '+',     '',     '',     '',     ''],
+        'dist1':    [      0,    387,      0,      0,      0,      0]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    501,    501,    501,    501,    501,    501,    501,    501],
+        'pos':      [      0,      1,      2,      3,      4,      5,      6,      7],
+        'phase0':   [    503,    503,    503,    503,    503,    503,    503,    503],
+        'scaf0':    [  93920,      7,     -1,     -1,  45782,  45783,  31737,  31758],
+        'strand0':  [    '-',    '+',     '',     '',    '+',    '+',    '+',    '+'],
+        'dist0':    [      0,    383,      0,      0,   -230,      0,   1044,     86],
+        'phase1':   [   -504,   -504,    504,    504,    504,   -504,   -504,   -504],
+        'scaf1':    [     -1,     -1,  74998,  32135,  45782,     -1,     -1,     -1],
+        'strand1':  [     '',     '',    '+',    '-',    '+',     '',     '',     ''],
+        'dist1':    [      0,      0,   -558,    739,   -502,      0,      0,      0]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    502,    502,    502,    502,    502],
+        'pos':      [      0,      1,      2,      3,      4],
+        'phase0':   [    505,    505,    505,    505,    505],
+        'scaf0':    [  54753,  95291,  10945, 105853,  32135],
+        'strand0':  [    '+',    '+',    '+',    '-',    '-'],
+        'dist0':    [      0,    -18,    -45,    -43,    -45],
+        'phase1':   [   -506,   -506,   -506,   -506,   -506],
+        'scaf1':    [     -1,     -1,     -1,     -1,     -1],
+        'strand1':  [     '',     '',     '',     '',     ''],
+        'dist1':    [      0,      0,      0,      0,      0]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    503,    503,    503,    503,    503],
+        'pos':      [      0,      1,      2,      3,      4],
+        'phase0':   [    507,    507,    507,    507,    507],
+        'scaf0':    [  23515,  95291,  29100, 105853,  32420],
+        'strand0':  [    '+',    '+',    '-',    '-',    '-'],
+        'dist0':    [      0,      3,    -43,    -44,    -44],
+        'phase1':   [   -508,   -508,   -508,   -508,   -508],
+        'scaf1':    [     -1,     -1,     -1,     -1,     -1],
+        'strand1':  [     '',     '',     '',     '',     ''],
+        'dist1':    [      0,      0,      0,      0,      0]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    504,    504,    504,    504],
+        'pos':      [      0,      1,      2,      3],
+        'phase0':   [    509,    509,    509,    509],
+        'scaf0':    [  31729,  31758,  47750, 113898],
+        'strand0':  [    '+',    '+',    '+',    '+'],
+        'dist0':    [      0,   -399,    -42,    -10],
+        'phase1':   [   -510,   -510,    510,    510],
+        'scaf1':    [     -1,     -1,     -1, 113898],
+        'strand1':  [     '',     '',     '',    '+'],
+        'dist1':    [      0,      0,      0,    686]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    505,    505,    505,    505,    505,    505],
+        'pos':      [      0,      1,      2,      3,      4,      5],
+        'phase0':   [    511,    511,    511,    511,    511,    511],
+        'scaf0':    [  74998,  32135,  45782,  49372,  86633,  30446],
+        'strand0':  [    '+',    '-',    '+',    '-',    '-',    '+'],
+        'dist0':    [      0,    739,   -502,    334,    432,    -43],
+        'phase1':   [   -512,   -512,   -512,   -512,    512,    512],
+        'scaf1':    [     -1,     -1,     -1,     -1,     -1,  30446],
+        'strand1':  [     '',     '',     '',     '',     '',    '+'],
+        'dist1':    [      0,      0,      0,      0,      0,   9158]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    506,    506],
+        'pos':      [      0,      1],
+        'phase0':   [    513,    513],
+        'scaf0':    [  76037,  30446],
+        'strand0':  [    '+',    '-'],
+        'dist0':    [      0,      0],
+        'phase1':   [   -514,   -514],
+        'scaf1':    [     -1,     -1],
+        'strand1':  [     '',     ''],
+        'dist1':    [      0,      0]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    507,    507],
+        'pos':      [      0,      1],
+        'phase0':   [    515,    515],
+        'scaf0':    [  31729,  30446],
+        'strand0':  [    '-',    '-'],
+        'dist0':    [      0,    630],
+        'phase1':   [   -516,   -516],
+        'scaf1':    [     -1,     -1],
+        'strand1':  [     '',     ''],
+        'dist1':    [      0,      0]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    508],
+        'pos':      [      0],
+        'phase0':   [    517],
+        'scaf0':    [  31108],
+        'strand0':  [    '+'],
+        'dist0':    [      0],
+        'phase1':   [   -518],
+        'scaf1':    [     -1],
+        'strand1':  [     ''],
+        'dist1':    [      0]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    509,    509],
+        'pos':      [      0,      1],
+        'phase0':   [    519,    519],
+        'scaf0':    [  31729,  76037],
+        'strand0':  [    '-',    '+'],
+        'dist0':    [      0,   -162],
+        'phase1':   [   -520,   -520],
+        'scaf1':    [     -1,     -1],
+        'strand1':  [     '',     ''],
+        'dist1':    [      0,      0]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    511,    511],
+        'pos':      [      0,      1],
+        'phase0':   [    523,    523],
+        'scaf0':    [  76037,  31737],
+        'strand0':  [    '-',    '+'],
+        'dist0':    [      0,   -168],
+        'phase1':   [   -524,   -524],
+        'scaf1':    [     -1,     -1],
+        'strand1':  [     '',     ''],
+        'dist1':    [      0,      0]
+        }) )
+#
+    # Test 6
+    scaffolds.append( pd.DataFrame({'case':6, 'scaffold':[9064, 41269, 51925, 67414, 123224, 123225, 123226, 123227, 123228, 123229, 123230, 123231, 123236, 123237, 123238]}) )
+    scaffold_graph.append( pd.DataFrame([
+        {'from':   9064, 'from_side':    'l', 'length':      7, 'scaf1': 123226, 'strand1':    '+', 'dist1':     -5, 'scaf2': 123238, 'strand2':    '+', 'dist2':      3, 'scaf3': 123225, 'strand3':    '+', 'dist3':    -42, 'scaf4': 123231, 'strand4':    '+', 'dist4':    -42, 'scaf5': 123227, 'strand5':    '+', 'dist5':    549, 'scaf6': 123236, 'strand6':    '+', 'dist6':    224},
+        {'from':   9064, 'from_side':    'l', 'length':      6, 'scaf1': 123226, 'strand1':    '+', 'dist1':     -5, 'scaf2': 123238, 'strand2':    '+', 'dist2':    400, 'scaf3': 123225, 'strand3':    '+', 'dist3':    -42, 'scaf4': 123231, 'strand4':    '+', 'dist4':    -42, 'scaf5': 123227, 'strand5':    '+', 'dist5':    549},
+        {'from':  41269, 'from_side':    'l', 'length':      5, 'scaf1': 123224, 'strand1':    '+', 'dist1':   -519, 'scaf2': 123228, 'strand2':    '+', 'dist2':     43, 'scaf3':  51925, 'strand3':    '+', 'dist3':     55, 'scaf4':  67414, 'strand4':    '+', 'dist4':     87},
+        {'from':  41269, 'from_side':    'r', 'length':      7, 'scaf1':  51925, 'strand1':    '-', 'dist1':      4, 'scaf2': 123224, 'strand2':    '-', 'dist2':    965, 'scaf3': 123229, 'strand3':    '-', 'dist3':    179, 'scaf4': 123225, 'strand4':    '-', 'dist4':    -42, 'scaf5': 123230, 'strand5':    '-', 'dist5':    -40, 'scaf6': 123227, 'strand6':    '-', 'dist6':    196},
+        {'from':  41269, 'from_side':    'r', 'length':      5, 'scaf1':  51925, 'strand1':    '-', 'dist1':      4, 'scaf2': 123224, 'strand2':    '-', 'dist2':    965, 'scaf3': 123229, 'strand3':    '-', 'dist3':    179, 'scaf4': 123230, 'strand4':    '-', 'dist4':    590},
+        {'from':  51925, 'from_side':    'l', 'length':      6, 'scaf1': 123224, 'strand1':    '-', 'dist1':    965, 'scaf2': 123229, 'strand2':    '-', 'dist2':    179, 'scaf3': 123225, 'strand3':    '-', 'dist3':    -42, 'scaf4': 123230, 'strand4':    '-', 'dist4':    -40, 'scaf5': 123227, 'strand5':    '-', 'dist5':    196},
+        {'from':  51925, 'from_side':    'l', 'length':      4, 'scaf1': 123224, 'strand1':    '-', 'dist1':    965, 'scaf2': 123229, 'strand2':    '-', 'dist2':    179, 'scaf3': 123230, 'strand3':    '-', 'dist3':    590},
+        {'from':  51925, 'from_side':    'l', 'length':      4, 'scaf1': 123228, 'strand1':    '-', 'dist1':     55, 'scaf2': 123224, 'strand2':    '-', 'dist2':     43, 'scaf3':  41269, 'strand3':    '+', 'dist3':   -519},
+        {'from':  51925, 'from_side':    'r', 'length':      2, 'scaf1':  41269, 'strand1':    '-', 'dist1':      4},
+        {'from':  51925, 'from_side':    'r', 'length':      2, 'scaf1':  67414, 'strand1':    '+', 'dist1':     87},
+        {'from':  67414, 'from_side':    'l', 'length':      5, 'scaf1':  51925, 'strand1':    '-', 'dist1':     87, 'scaf2': 123228, 'strand2':    '-', 'dist2':     55, 'scaf3': 123224, 'strand3':    '-', 'dist3':     43, 'scaf4':  41269, 'strand4':    '+', 'dist4':   -519},
+        {'from': 123224, 'from_side':    'l', 'length':      2, 'scaf1':  41269, 'strand1':    '+', 'dist1':   -519},
+        {'from': 123224, 'from_side':    'l', 'length':      6, 'scaf1': 123229, 'strand1':    '-', 'dist1':    179, 'scaf2': 123225, 'strand2':    '-', 'dist2':    -42, 'scaf3': 123230, 'strand3':    '-', 'dist3':    -40, 'scaf4': 123227, 'strand4':    '-', 'dist4':    196, 'scaf5': 123237, 'strand5':    '-', 'dist5':    542},
+        {'from': 123224, 'from_side':    'l', 'length':      3, 'scaf1': 123229, 'strand1':    '-', 'dist1':    179, 'scaf2': 123230, 'strand2':    '-', 'dist2':    590},
+        {'from': 123224, 'from_side':    'r', 'length':      3, 'scaf1':  51925, 'strand1':    '+', 'dist1':    965, 'scaf2':  41269, 'strand2':    '-', 'dist2':      4},
+        {'from': 123224, 'from_side':    'r', 'length':      4, 'scaf1': 123228, 'strand1':    '+', 'dist1':     43, 'scaf2':  51925, 'strand2':    '+', 'dist2':     55, 'scaf3':  67414, 'strand3':    '+', 'dist3':     87},
+        {'from': 123225, 'from_side':    'l', 'length':      4, 'scaf1': 123230, 'strand1':    '-', 'dist1':    -40, 'scaf2': 123227, 'strand2':    '-', 'dist2':    196, 'scaf3': 123237, 'strand3':    '-', 'dist3':    542},
+        {'from': 123225, 'from_side':    'l', 'length':      4, 'scaf1': 123238, 'strand1':    '-', 'dist1':    -42, 'scaf2': 123226, 'strand2':    '-', 'dist2':      3, 'scaf3':   9064, 'strand3':    '+', 'dist3':     -5},
+        {'from': 123225, 'from_side':    'l', 'length':      4, 'scaf1': 123238, 'strand1':    '-', 'dist1':    -42, 'scaf2': 123226, 'strand2':    '-', 'dist2':    400, 'scaf3':   9064, 'strand3':    '+', 'dist3':     -5},
+        {'from': 123225, 'from_side':    'r', 'length':      5, 'scaf1': 123229, 'strand1':    '+', 'dist1':    -42, 'scaf2': 123224, 'strand2':    '+', 'dist2':    179, 'scaf3':  51925, 'strand3':    '+', 'dist3':    965, 'scaf4':  41269, 'strand4':    '-', 'dist4':      4},
+        {'from': 123225, 'from_side':    'r', 'length':      4, 'scaf1': 123231, 'strand1':    '+', 'dist1':    -42, 'scaf2': 123227, 'strand2':    '+', 'dist2':    549, 'scaf3': 123236, 'strand3':    '+', 'dist3':    224},
+        {'from': 123226, 'from_side':    'l', 'length':      2, 'scaf1':   9064, 'strand1':    '+', 'dist1':     -5},
+        {'from': 123226, 'from_side':    'l', 'length':      4, 'scaf1': 123236, 'strand1':    '-', 'dist1':      2, 'scaf2': 123227, 'strand2':    '-', 'dist2':    224, 'scaf3': 123231, 'strand3':    '-', 'dist3':    549},
+        {'from': 123226, 'from_side':    'r', 'length':      4, 'scaf1': 123237, 'strand1':    '+', 'dist1':      0, 'scaf2': 123227, 'strand2':    '+', 'dist2':    542, 'scaf3': 123230, 'strand3':    '+', 'dist3':    196},
+        {'from': 123226, 'from_side':    'r', 'length':      6, 'scaf1': 123238, 'strand1':    '+', 'dist1':      3, 'scaf2': 123225, 'strand2':    '+', 'dist2':    -42, 'scaf3': 123231, 'strand3':    '+', 'dist3':    -42, 'scaf4': 123227, 'strand4':    '+', 'dist4':    549, 'scaf5': 123236, 'strand5':    '+', 'dist5':    224},
+        {'from': 123226, 'from_side':    'r', 'length':      4, 'scaf1': 123238, 'strand1':    '+', 'dist1':      3, 'scaf2': 123231, 'strand2':    '+', 'dist2':    564, 'scaf3': 123227, 'strand3':    '+', 'dist3':    549},
+        {'from': 123226, 'from_side':    'r', 'length':      5, 'scaf1': 123238, 'strand1':    '+', 'dist1':    400, 'scaf2': 123225, 'strand2':    '+', 'dist2':    -42, 'scaf3': 123231, 'strand3':    '+', 'dist3':    -42, 'scaf4': 123227, 'strand4':    '+', 'dist4':    549},
+        {'from': 123227, 'from_side':    'l', 'length':      6, 'scaf1': 123231, 'strand1':    '-', 'dist1':    549, 'scaf2': 123225, 'strand2':    '-', 'dist2':    -42, 'scaf3': 123238, 'strand3':    '-', 'dist3':    -42, 'scaf4': 123226, 'strand4':    '-', 'dist4':      3, 'scaf5':   9064, 'strand5':    '+', 'dist5':     -5},
+        {'from': 123227, 'from_side':    'l', 'length':      6, 'scaf1': 123231, 'strand1':    '-', 'dist1':    549, 'scaf2': 123225, 'strand2':    '-', 'dist2':    -42, 'scaf3': 123238, 'strand3':    '-', 'dist3':    -42, 'scaf4': 123226, 'strand4':    '-', 'dist4':    400, 'scaf5':   9064, 'strand5':    '+', 'dist5':     -5},
+        {'from': 123227, 'from_side':    'l', 'length':      4, 'scaf1': 123231, 'strand1':    '-', 'dist1':    549, 'scaf2': 123238, 'strand2':    '-', 'dist2':    564, 'scaf3': 123226, 'strand3':    '-', 'dist3':      3},
+        {'from': 123227, 'from_side':    'l', 'length':      5, 'scaf1': 123237, 'strand1':    '-', 'dist1':    542, 'scaf2': 123226, 'strand2':    '-', 'dist2':      0, 'scaf3': 123236, 'strand3':    '-', 'dist3':      2, 'scaf4': 123227, 'strand4':    '-', 'dist4':    224},
+        {'from': 123227, 'from_side':    'r', 'length':      7, 'scaf1': 123230, 'strand1':    '+', 'dist1':    196, 'scaf2': 123225, 'strand2':    '+', 'dist2':    -40, 'scaf3': 123229, 'strand3':    '+', 'dist3':    -42, 'scaf4': 123224, 'strand4':    '+', 'dist4':    179, 'scaf5':  51925, 'strand5':    '+', 'dist5':    965, 'scaf6':  41269, 'strand6':    '-', 'dist6':      4},
+        {'from': 123227, 'from_side':    'r', 'length':      5, 'scaf1': 123236, 'strand1':    '+', 'dist1':    224, 'scaf2': 123226, 'strand2':    '+', 'dist2':      2, 'scaf3': 123237, 'strand3':    '+', 'dist3':      0, 'scaf4': 123227, 'strand4':    '+', 'dist4':    542},
+        {'from': 123228, 'from_side':    'l', 'length':      3, 'scaf1': 123224, 'strand1':    '-', 'dist1':     43, 'scaf2':  41269, 'strand2':    '+', 'dist2':   -519},
+        {'from': 123228, 'from_side':    'r', 'length':      3, 'scaf1':  51925, 'strand1':    '+', 'dist1':     55, 'scaf2':  67414, 'strand2':    '+', 'dist2':     87},
+        {'from': 123229, 'from_side':    'l', 'length':      5, 'scaf1': 123225, 'strand1':    '-', 'dist1':    -42, 'scaf2': 123230, 'strand2':    '-', 'dist2':    -40, 'scaf3': 123227, 'strand3':    '-', 'dist3':    196, 'scaf4': 123237, 'strand4':    '-', 'dist4':    542},
+        {'from': 123229, 'from_side':    'l', 'length':      2, 'scaf1': 123230, 'strand1':    '-', 'dist1':    590},
+        {'from': 123229, 'from_side':    'r', 'length':      4, 'scaf1': 123224, 'strand1':    '+', 'dist1':    179, 'scaf2':  51925, 'strand2':    '+', 'dist2':    965, 'scaf3':  41269, 'strand3':    '-', 'dist3':      4},
+        {'from': 123230, 'from_side':    'l', 'length':      4, 'scaf1': 123227, 'strand1':    '-', 'dist1':    196, 'scaf2': 123237, 'strand2':    '-', 'dist2':    542, 'scaf3': 123226, 'strand3':    '-', 'dist3':      0},
+        {'from': 123230, 'from_side':    'r', 'length':      6, 'scaf1': 123225, 'strand1':    '+', 'dist1':    -40, 'scaf2': 123229, 'strand2':    '+', 'dist2':    -42, 'scaf3': 123224, 'strand3':    '+', 'dist3':    179, 'scaf4':  51925, 'strand4':    '+', 'dist4':    965, 'scaf5':  41269, 'strand5':    '-', 'dist5':      4},
+        {'from': 123230, 'from_side':    'r', 'length':      5, 'scaf1': 123229, 'strand1':    '+', 'dist1':    590, 'scaf2': 123224, 'strand2':    '+', 'dist2':    179, 'scaf3':  51925, 'strand3':    '+', 'dist3':    965, 'scaf4':  41269, 'strand4':    '-', 'dist4':      4},
+        {'from': 123231, 'from_side':    'l', 'length':      5, 'scaf1': 123225, 'strand1':    '-', 'dist1':    -42, 'scaf2': 123238, 'strand2':    '-', 'dist2':    -42, 'scaf3': 123226, 'strand3':    '-', 'dist3':      3, 'scaf4':   9064, 'strand4':    '+', 'dist4':     -5},
+        {'from': 123231, 'from_side':    'l', 'length':      5, 'scaf1': 123225, 'strand1':    '-', 'dist1':    -42, 'scaf2': 123238, 'strand2':    '-', 'dist2':    -42, 'scaf3': 123226, 'strand3':    '-', 'dist3':    400, 'scaf4':   9064, 'strand4':    '+', 'dist4':     -5},
+        {'from': 123231, 'from_side':    'l', 'length':      3, 'scaf1': 123238, 'strand1':    '-', 'dist1':    564, 'scaf2': 123226, 'strand2':    '-', 'dist2':      3},
+        {'from': 123231, 'from_side':    'r', 'length':      4, 'scaf1': 123227, 'strand1':    '+', 'dist1':    549, 'scaf2': 123236, 'strand2':    '+', 'dist2':    224, 'scaf3': 123226, 'strand3':    '+', 'dist3':      2},
+        {'from': 123236, 'from_side':    'l', 'length':      7, 'scaf1': 123227, 'strand1':    '-', 'dist1':    224, 'scaf2': 123231, 'strand2':    '-', 'dist2':    549, 'scaf3': 123225, 'strand3':    '-', 'dist3':    -42, 'scaf4': 123238, 'strand4':    '-', 'dist4':    -42, 'scaf5': 123226, 'strand5':    '-', 'dist5':      3, 'scaf6':   9064, 'strand6':    '+', 'dist6':     -5},
+        {'from': 123236, 'from_side':    'l', 'length':      4, 'scaf1': 123227, 'strand1':    '-', 'dist1':    224, 'scaf2': 123231, 'strand2':    '-', 'dist2':    549, 'scaf3': 123238, 'strand3':    '-', 'dist3':    564},
+        {'from': 123236, 'from_side':    'r', 'length':      4, 'scaf1': 123226, 'strand1':    '+', 'dist1':      2, 'scaf2': 123237, 'strand2':    '+', 'dist2':      0, 'scaf3': 123227, 'strand3':    '+', 'dist3':    542},
+        {'from': 123237, 'from_side':    'l', 'length':      4, 'scaf1': 123226, 'strand1':    '-', 'dist1':      0, 'scaf2': 123236, 'strand2':    '-', 'dist2':      2, 'scaf3': 123227, 'strand3':    '-', 'dist3':    224},
+        {'from': 123237, 'from_side':    'r', 'length':      6, 'scaf1': 123227, 'strand1':    '+', 'dist1':    542, 'scaf2': 123230, 'strand2':    '+', 'dist2':    196, 'scaf3': 123225, 'strand3':    '+', 'dist3':    -40, 'scaf4': 123229, 'strand4':    '+', 'dist4':    -42, 'scaf5': 123224, 'strand5':    '+', 'dist5':    179},
+        {'from': 123238, 'from_side':    'l', 'length':      3, 'scaf1': 123226, 'strand1':    '-', 'dist1':      3, 'scaf2':   9064, 'strand2':    '+', 'dist2':     -5},
+        {'from': 123238, 'from_side':    'l', 'length':      3, 'scaf1': 123226, 'strand1':    '-', 'dist1':    400, 'scaf2':   9064, 'strand2':    '+', 'dist2':     -5},
+        {'from': 123238, 'from_side':    'r', 'length':      5, 'scaf1': 123225, 'strand1':    '+', 'dist1':    -42, 'scaf2': 123231, 'strand2':    '+', 'dist2':    -42, 'scaf3': 123227, 'strand3':    '+', 'dist3':    549, 'scaf4': 123236, 'strand4':    '+', 'dist4':    224},
+        {'from': 123238, 'from_side':    'r', 'length':      4, 'scaf1': 123231, 'strand1':    '+', 'dist1':    564, 'scaf2': 123227, 'strand2':    '+', 'dist2':    549, 'scaf3': 123236, 'strand3':    '+', 'dist3':    224}
+        ]) )
+    scaf_bridges.append( pd.DataFrame([
+        {'from':   9064, 'from_side':    'l', 'to': 123226, 'to_side':    'l', 'mean_dist':     -5, 'mapq':  60060, 'bcount':     16, 'min_dist':    -10, 'max_dist':      4, 'probability': 0.159802, 'to_alt':      2, 'from_alt':      1},
+        {'from':  41269, 'from_side':    'l', 'to': 123224, 'to_side':    'l', 'mean_dist':   -519, 'mapq':  60060, 'bcount':      9, 'min_dist':   -553, 'max_dist':   -501, 'probability': 0.027818, 'to_alt':      2, 'from_alt':      1},
+        {'from':  41269, 'from_side':    'r', 'to':  51925, 'to_side':    'r', 'mean_dist':      4, 'mapq':  60060, 'bcount':     14, 'min_dist':      1, 'max_dist':      9, 'probability': 0.104244, 'to_alt':      2, 'from_alt':      1},
+        {'from':  51925, 'from_side':    'l', 'to': 123224, 'to_side':    'r', 'mean_dist':    965, 'mapq':  60060, 'bcount':     12, 'min_dist':    917, 'max_dist':   1099, 'probability': 0.105770, 'to_alt':      2, 'from_alt':      2},
+        {'from':  51925, 'from_side':    'l', 'to': 123228, 'to_side':    'r', 'mean_dist':     55, 'mapq':  60060, 'bcount':      7, 'min_dist':     44, 'max_dist':     84, 'probability': 0.014765, 'to_alt':      1, 'from_alt':      2},
+        {'from':  51925, 'from_side':    'r', 'to':  41269, 'to_side':    'r', 'mean_dist':      4, 'mapq':  60060, 'bcount':     14, 'min_dist':      1, 'max_dist':      9, 'probability': 0.104244, 'to_alt':      1, 'from_alt':      2},
+        {'from':  51925, 'from_side':    'r', 'to':  67414, 'to_side':    'l', 'mean_dist':     87, 'mapq':  60060, 'bcount':      6, 'min_dist':     52, 'max_dist':    117, 'probability': 0.010512, 'to_alt':      1, 'from_alt':      2},
+        {'from':  67414, 'from_side':    'l', 'to':  51925, 'to_side':    'r', 'mean_dist':     87, 'mapq':  60060, 'bcount':      6, 'min_dist':     52, 'max_dist':    117, 'probability': 0.010512, 'to_alt':      2, 'from_alt':      1},
+        {'from': 123224, 'from_side':    'l', 'to':  41269, 'to_side':    'l', 'mean_dist':   -519, 'mapq':  60060, 'bcount':      9, 'min_dist':   -553, 'max_dist':   -501, 'probability': 0.027818, 'to_alt':      1, 'from_alt':      2},
+        {'from': 123224, 'from_side':    'l', 'to': 123229, 'to_side':    'r', 'mean_dist':    179, 'mapq':  60060, 'bcount':      9, 'min_dist':    162, 'max_dist':    207, 'probability': 0.027818, 'to_alt':      1, 'from_alt':      2},
+        {'from': 123224, 'from_side':    'r', 'to':  51925, 'to_side':    'l', 'mean_dist':    965, 'mapq':  60060, 'bcount':     12, 'min_dist':    917, 'max_dist':   1099, 'probability': 0.105770, 'to_alt':      2, 'from_alt':      2},
+        {'from': 123224, 'from_side':    'r', 'to': 123228, 'to_side':    'l', 'mean_dist':     43, 'mapq':  60060, 'bcount':     10, 'min_dist':     32, 'max_dist':     89, 'probability': 0.037322, 'to_alt':      1, 'from_alt':      2},
+        {'from': 123225, 'from_side':    'l', 'to': 123230, 'to_side':    'r', 'mean_dist':    -40, 'mapq':  60060, 'bcount':      8, 'min_dist':    -49, 'max_dist':    -20, 'probability': 0.020422, 'to_alt':      2, 'from_alt':      2},
+        {'from': 123225, 'from_side':    'l', 'to': 123238, 'to_side':    'r', 'mean_dist':    -42, 'mapq':  60060, 'bcount':      9, 'min_dist':    -48, 'max_dist':    -32, 'probability': 0.027818, 'to_alt':      2, 'from_alt':      2},
+        {'from': 123225, 'from_side':    'r', 'to': 123229, 'to_side':    'l', 'mean_dist':    -42, 'mapq':  60060, 'bcount':      7, 'min_dist':    -49, 'max_dist':    -36, 'probability': 0.014765, 'to_alt':      2, 'from_alt':      2},
+        {'from': 123225, 'from_side':    'r', 'to': 123231, 'to_side':    'l', 'mean_dist':    -42, 'mapq':  60060, 'bcount':      7, 'min_dist':    -47, 'max_dist':    -37, 'probability': 0.014765, 'to_alt':      2, 'from_alt':      2},
+        {'from': 123226, 'from_side':    'l', 'to':   9064, 'to_side':    'l', 'mean_dist':     -5, 'mapq':  60060, 'bcount':     16, 'min_dist':    -10, 'max_dist':      4, 'probability': 0.159802, 'to_alt':      1, 'from_alt':      2},
+        {'from': 123226, 'from_side':    'l', 'to': 123236, 'to_side':    'r', 'mean_dist':      2, 'mapq':  60060, 'bcount':      9, 'min_dist':      0, 'max_dist':      4, 'probability': 0.027818, 'to_alt':      1, 'from_alt':      2},
+        {'from': 123226, 'from_side':    'r', 'to': 123237, 'to_side':    'l', 'mean_dist':      0, 'mapq':  60060, 'bcount':      6, 'min_dist':     -3, 'max_dist':      9, 'probability': 0.010512, 'to_alt':      1, 'from_alt':      3},
+        {'from': 123226, 'from_side':    'r', 'to': 123238, 'to_side':    'l', 'mean_dist':      3, 'mapq':  60060, 'bcount':      8, 'min_dist':      1, 'max_dist':      9, 'probability': 0.020422, 'to_alt':      2, 'from_alt':      3},
+        {'from': 123226, 'from_side':    'r', 'to': 123238, 'to_side':    'l', 'mean_dist':    400, 'mapq':  60060, 'bcount':      7, 'min_dist':    381, 'max_dist':    425, 'probability': 0.023635, 'to_alt':      2, 'from_alt':      3},
+        {'from': 123227, 'from_side':    'l', 'to': 123231, 'to_side':    'r', 'mean_dist':    549, 'mapq':  60060, 'bcount':     13, 'min_dist':    488, 'max_dist':    605, 'probability': 0.135136, 'to_alt':      1, 'from_alt':      2},
+        {'from': 123227, 'from_side':    'l', 'to': 123237, 'to_side':    'r', 'mean_dist':    542, 'mapq':  60060, 'bcount':      8, 'min_dist':    523, 'max_dist':    560, 'probability': 0.033108, 'to_alt':      1, 'from_alt':      2},
+        {'from': 123227, 'from_side':    'r', 'to': 123230, 'to_side':    'l', 'mean_dist':    196, 'mapq':  60060, 'bcount':      5, 'min_dist':    185, 'max_dist':    202, 'probability': 0.007368, 'to_alt':      1, 'from_alt':      2},
+        {'from': 123227, 'from_side':    'r', 'to': 123236, 'to_side':    'l', 'mean_dist':    224, 'mapq':  60060, 'bcount':     12, 'min_dist':    191, 'max_dist':    374, 'probability': 0.064232, 'to_alt':      1, 'from_alt':      2},
+        {'from': 123228, 'from_side':    'l', 'to': 123224, 'to_side':    'r', 'mean_dist':     43, 'mapq':  60060, 'bcount':     10, 'min_dist':     32, 'max_dist':     89, 'probability': 0.037322, 'to_alt':      2, 'from_alt':      1},
+        {'from': 123228, 'from_side':    'r', 'to':  51925, 'to_side':    'l', 'mean_dist':     55, 'mapq':  60060, 'bcount':      7, 'min_dist':     44, 'max_dist':     84, 'probability': 0.014765, 'to_alt':      2, 'from_alt':      1},
+        {'from': 123229, 'from_side':    'l', 'to': 123225, 'to_side':    'r', 'mean_dist':    -42, 'mapq':  60060, 'bcount':      7, 'min_dist':    -49, 'max_dist':    -36, 'probability': 0.014765, 'to_alt':      2, 'from_alt':      2},
+        {'from': 123229, 'from_side':    'l', 'to': 123230, 'to_side':    'r', 'mean_dist':    590, 'mapq':  60060, 'bcount':      3, 'min_dist':    526, 'max_dist':    628, 'probability': 0.005063, 'to_alt':      2, 'from_alt':      2},
+        {'from': 123229, 'from_side':    'r', 'to': 123224, 'to_side':    'l', 'mean_dist':    179, 'mapq':  60060, 'bcount':      9, 'min_dist':    162, 'max_dist':    207, 'probability': 0.027818, 'to_alt':      2, 'from_alt':      1},
+        {'from': 123230, 'from_side':    'l', 'to': 123227, 'to_side':    'r', 'mean_dist':    196, 'mapq':  60060, 'bcount':      5, 'min_dist':    185, 'max_dist':    202, 'probability': 0.007368, 'to_alt':      2, 'from_alt':      1},
+        {'from': 123230, 'from_side':    'r', 'to': 123225, 'to_side':    'l', 'mean_dist':    -40, 'mapq':  60060, 'bcount':      8, 'min_dist':    -49, 'max_dist':    -20, 'probability': 0.020422, 'to_alt':      2, 'from_alt':      2},
+        {'from': 123230, 'from_side':    'r', 'to': 123229, 'to_side':    'l', 'mean_dist':    590, 'mapq':  60060, 'bcount':      3, 'min_dist':    526, 'max_dist':    628, 'probability': 0.005063, 'to_alt':      2, 'from_alt':      2},
+        {'from': 123231, 'from_side':    'l', 'to': 123225, 'to_side':    'r', 'mean_dist':    -42, 'mapq':  60060, 'bcount':      7, 'min_dist':    -47, 'max_dist':    -37, 'probability': 0.014765, 'to_alt':      2, 'from_alt':      2},
+        {'from': 123231, 'from_side':    'l', 'to': 123238, 'to_side':    'r', 'mean_dist':    564, 'mapq':  60060, 'bcount':      2, 'min_dist':    552, 'max_dist':    575, 'probability': 0.003280, 'to_alt':      2, 'from_alt':      2},
+        {'from': 123231, 'from_side':    'r', 'to': 123227, 'to_side':    'l', 'mean_dist':    549, 'mapq':  60060, 'bcount':     13, 'min_dist':    488, 'max_dist':    605, 'probability': 0.135136, 'to_alt':      2, 'from_alt':      1},
+        {'from': 123236, 'from_side':    'l', 'to': 123227, 'to_side':    'r', 'mean_dist':    224, 'mapq':  60060, 'bcount':     12, 'min_dist':    191, 'max_dist':    374, 'probability': 0.064232, 'to_alt':      2, 'from_alt':      1},
+        {'from': 123236, 'from_side':    'r', 'to': 123226, 'to_side':    'l', 'mean_dist':      2, 'mapq':  60060, 'bcount':      9, 'min_dist':      0, 'max_dist':      4, 'probability': 0.027818, 'to_alt':      2, 'from_alt':      1},
+        {'from': 123237, 'from_side':    'l', 'to': 123226, 'to_side':    'r', 'mean_dist':      0, 'mapq':  60060, 'bcount':      6, 'min_dist':     -3, 'max_dist':      9, 'probability': 0.010512, 'to_alt':      3, 'from_alt':      1},
+        {'from': 123237, 'from_side':    'r', 'to': 123227, 'to_side':    'l', 'mean_dist':    542, 'mapq':  60060, 'bcount':      8, 'min_dist':    523, 'max_dist':    560, 'probability': 0.033108, 'to_alt':      2, 'from_alt':      1},
+        {'from': 123238, 'from_side':    'l', 'to': 123226, 'to_side':    'r', 'mean_dist':      3, 'mapq':  60060, 'bcount':      8, 'min_dist':      1, 'max_dist':      9, 'probability': 0.020422, 'to_alt':      3, 'from_alt':      2},
+        {'from': 123238, 'from_side':    'l', 'to': 123226, 'to_side':    'r', 'mean_dist':    400, 'mapq':  60060, 'bcount':      7, 'min_dist':    381, 'max_dist':    425, 'probability': 0.023635, 'to_alt':      3, 'from_alt':      2},
+        {'from': 123238, 'from_side':    'r', 'to': 123225, 'to_side':    'l', 'mean_dist':    -42, 'mapq':  60060, 'bcount':      9, 'min_dist':    -48, 'max_dist':    -32, 'probability': 0.027818, 'to_alt':      2, 'from_alt':      2},
+        {'from': 123238, 'from_side':    'r', 'to': 123231, 'to_side':    'l', 'mean_dist':    564, 'mapq':  60060, 'bcount':      2, 'min_dist':    552, 'max_dist':    575, 'probability': 0.003280, 'to_alt':      2, 'from_alt':      2}
+        ]) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    600,    600,    600,    600,    600,    600,    600,    600,    600,    600,    600,    600,    600,    600,    600,    600,    600,    600,    600,    600],
+        'pos':      [      0,      1,      2,      3,      4,      5,      6,      7,      8,      9,     10,     11,     12,     13,     14,     15,     16,     17,     18,     19],
+        'phase0':   [    601,    601,    601,    601,    601,    601,    601,    601,    601,    601,    601,    601,    601,    601,    601,    601,    601,    601,    601,    601],
+        'scaf0':    [   9064, 123226, 123238, 123225, 123231, 123227, 123236, 123226, 123237, 123227, 123230, 123225, 123229, 123224,  51925,  41269, 123224, 123228,  51925,  67414],
+        'strand0':  [    '-',    '+',    '+',    '+',    '+',    '+',    '+',    '+',    '+',    '+',    '+',    '+',    '+',    '+',    '+',    '-',    '+',    '+',    '+',    '+'],
+        'dist0':    [      0,     -5,      3,    -42,    -42,    549,    224,      2,      0,    542,    196,    -40,    -42,    179,    965,      4,   -519,     43,     55,     87],
+        'phase1':   [   -602,   -602,    602,   -602,   -602,   -602,   -602,   -602,   -602,   -602,   -602,    602,    602,   -602,   -602,   -602,   -602,   -602,   -602,   -602],
+        'scaf1':    [     -1,     -1, 123238,     -1,     -1,     -1,     -1,     -1,     -1,     -1,     -1,     -1, 123229,     -1,     -1,     -1,     -1,     -1,     -1,     -1],
+        'strand1':  [     '',     '',    '+',     '',     '',     '',     '',     '',     '',     '',     '',     '',    '+',     '',     '',     '',     '',     '',     '',     ''],
+        'dist1':    [      0,      0,    400,      0,      0,      0,      0,      0,      0,      0,      0,      0,    590,      0,      0,      0,      0,      0,      0,      0]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    601,    601,    601],
+        'pos':      [      0,      1,      2],
+        'phase0':   [    603,    603,    603],
+        'scaf0':    [ 123238, 123231, 123227],
+        'strand0':  [    '+',    '+',    '+'],
+        'dist0':    [      0,    564,    549],
+        'phase1':   [   -604,   -604,   -604],
+        'scaf1':    [     -1,     -1,     -1],
+        'strand1':  [     '',     '',     ''],
+        'dist1':    [      0,      0,      0]
+        }) )
+#
+    # Test 7
+    scaffolds.append( pd.DataFrame({'case':7, 'scaffold':[17428, 48692, 123617]}) )
+    scaffold_graph.append( pd.DataFrame([
+        {'from':  17428, 'from_side':    'l', 'length':      2, 'scaf1':  17428, 'strand1':    '+', 'dist1':  28194},
+        {'from':  17428, 'from_side':    'r', 'length':      2, 'scaf1':  48692, 'strand1':    '-', 'dist1':   1916},
+        {'from':  17428, 'from_side':    'r', 'length':      3, 'scaf1': 123617, 'strand1':    '-', 'dist1':    -44, 'scaf2':  48692, 'strand2':    '-', 'dist2':    -38},
+        {'from':  48692, 'from_side':    'r', 'length':      2, 'scaf1':  17428, 'strand1':    '-', 'dist1':   1916},
+        {'from':  48692, 'from_side':    'r', 'length':      3, 'scaf1': 123617, 'strand1':    '+', 'dist1':    -38, 'scaf2':  17428, 'strand2':    '-', 'dist2':    -44},
+        {'from': 123617, 'from_side':    'l', 'length':      2, 'scaf1':  48692, 'strand1':    '-', 'dist1':    -38},
+        {'from': 123617, 'from_side':    'r', 'length':      2, 'scaf1':  17428, 'strand1':    '-', 'dist1':    -44}
+        ]) )
+    scaf_bridges.append( pd.DataFrame([
+        {'from':  17428, 'from_side':    'l', 'to':  17428, 'to_side':    'l', 'mean_dist':  28194, 'mapq':  60060, 'bcount':      2, 'min_dist':  28194, 'max_dist':  28194, 'probability': 0.500000, 'to_alt':      1, 'from_alt':      1},
+        {'from':  17428, 'from_side':    'r', 'to':  48692, 'to_side':    'r', 'mean_dist':   1916, 'mapq':  60060, 'bcount':      1, 'min_dist':   1916, 'max_dist':   1916, 'probability': 0.003098, 'to_alt':      2, 'from_alt':      2},
+        {'from':  17428, 'from_side':    'r', 'to': 123617, 'to_side':    'r', 'mean_dist':    -44, 'mapq':  60060, 'bcount':      6, 'min_dist':    -50, 'max_dist':    -28, 'probability': 0.010512, 'to_alt':      1, 'from_alt':      2},
+        {'from':  48692, 'from_side':    'r', 'to':  17428, 'to_side':    'r', 'mean_dist':   1916, 'mapq':  60060, 'bcount':      1, 'min_dist':   1916, 'max_dist':   1916, 'probability': 0.003098, 'to_alt':      2, 'from_alt':      2},
+        {'from':  48692, 'from_side':    'r', 'to': 123617, 'to_side':    'l', 'mean_dist':    -38, 'mapq':  60060, 'bcount':      5, 'min_dist':    -48, 'max_dist':    -17, 'probability': 0.007368, 'to_alt':      1, 'from_alt':      2},
+        {'from': 123617, 'from_side':    'l', 'to':  48692, 'to_side':    'r', 'mean_dist':    -38, 'mapq':  60060, 'bcount':      5, 'min_dist':    -48, 'max_dist':    -17, 'probability': 0.007368, 'to_alt':      2, 'from_alt':      1},
+        {'from': 123617, 'from_side':    'r', 'to':  17428, 'to_side':    'r', 'mean_dist':    -44, 'mapq':  60060, 'bcount':      6, 'min_dist':    -50, 'max_dist':    -28, 'probability': 0.010512, 'to_alt':      2, 'from_alt':      1}
+        ]) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    700,    700,    700],
+        'pos':      [      0,      1,      2],
+        'phase0':   [    701,    701,    701],
+        'scaf0':    [  48692, 123617,  17428],
+        'strand0':  [    '+',    '+',    '-'],
+        'dist0':    [      0,    -38,    -44],
+        'phase1':   [   -702,    702,    702],
+        'scaf1':    [     -1,     -1,  17428],
+        'strand1':  [     '',     '',    '-'],
+        'dist1':    [      0,      0,   1916]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    701,    701],
+        'pos':      [      0,      1],
+        'phase0':   [    703,    703],
+        'scaf0':    [  17428,  17428],
+        'strand0':  [    '-',    '+'],
+        'dist0':    [      0,  28194],
+        'phase1':   [   -704,   -704],
+        'scaf1':    [     -1,     -1],
+        'strand1':  [     '',     ''],
+        'dist1':    [      0,      0]
+        }) )
+#
+    # Test 8
+    scaffolds.append( pd.DataFrame({'case':8, 'scaffold':[197, 198, 199, 39830]}) )
+    scaffold_graph.append( pd.DataFrame([
+        {'from':    197, 'from_side':    'r', 'length':      4, 'scaf1':    198, 'strand1':    '+', 'dist1':      0, 'scaf2':    199, 'strand2':    '+', 'dist2':   -616, 'scaf3':    198, 'strand3':    '+', 'dist3':      3},
+        {'from':    198, 'from_side':    'l', 'length':      2, 'scaf1':    197, 'strand1':    '-', 'dist1':      0},
+        {'from':    198, 'from_side':    'l', 'length':      4, 'scaf1':    199, 'strand1':    '-', 'dist1':      3, 'scaf2':    198, 'strand2':    '-', 'dist2':   -616, 'scaf3':    197, 'strand3':    '-', 'dist3':      0},
+        {'from':    198, 'from_side':    'r', 'length':      3, 'scaf1':    199, 'strand1':    '+', 'dist1':   -616, 'scaf2':    198, 'strand2':    '+', 'dist2':      3},
+        {'from':    198, 'from_side':    'r', 'length':      2, 'scaf1':  39830, 'strand1':    '-', 'dist1':      0},
+        {'from':    199, 'from_side':    'l', 'length':      3, 'scaf1':    198, 'strand1':    '-', 'dist1':   -616, 'scaf2':    197, 'strand2':    '-', 'dist2':      0},
+        {'from':    199, 'from_side':    'r', 'length':      3, 'scaf1':    198, 'strand1':    '+', 'dist1':      3, 'scaf2':  39830, 'strand2':    '-', 'dist2':      0},
+        {'from':  39830, 'from_side':    'r', 'length':      3, 'scaf1':    198, 'strand1':    '-', 'dist1':      0, 'scaf2':    199, 'strand2':    '-', 'dist2':      3}
+        ]) )
+    scaf_bridges.append( pd.DataFrame([
+        {'from':    197, 'from_side':    'r', 'to':    198, 'to_side':    'l', 'mean_dist':      0, 'mapq':  60060, 'bcount':     15, 'min_dist':      0, 'max_dist':      0, 'probability': 0.129976, 'to_alt':      2, 'from_alt':      1},
+        {'from':    198, 'from_side':    'l', 'to':    197, 'to_side':    'r', 'mean_dist':      0, 'mapq':  60060, 'bcount':     15, 'min_dist':      0, 'max_dist':      0, 'probability': 0.129976, 'to_alt':      1, 'from_alt':      2},
+        {'from':    198, 'from_side':    'l', 'to':    199, 'to_side':    'r', 'mean_dist':      3, 'mapq':  60060, 'bcount':     13, 'min_dist':     -1, 'max_dist':      5, 'probability': 0.082422, 'to_alt':      1, 'from_alt':      2},
+        {'from':    198, 'from_side':    'r', 'to':    199, 'to_side':    'l', 'mean_dist':   -616, 'mapq':  60060, 'bcount':     12, 'min_dist':   -713, 'max_dist':   -568, 'probability': 0.064232, 'to_alt':      1, 'from_alt':      2},
+        {'from':    198, 'from_side':    'r', 'to':  39830, 'to_side':    'r', 'mean_dist':      0, 'mapq':  60060, 'bcount':     13, 'min_dist':      0, 'max_dist':      0, 'probability': 0.082422, 'to_alt':      1, 'from_alt':      2},
+        {'from':    199, 'from_side':    'l', 'to':    198, 'to_side':    'r', 'mean_dist':   -616, 'mapq':  60060, 'bcount':     12, 'min_dist':   -713, 'max_dist':   -568, 'probability': 0.064232, 'to_alt':      2, 'from_alt':      1},
+        {'from':    199, 'from_side':    'r', 'to':    198, 'to_side':    'l', 'mean_dist':      3, 'mapq':  60060, 'bcount':     13, 'min_dist':     -1, 'max_dist':      5, 'probability': 0.082422, 'to_alt':      2, 'from_alt':      1},
+        {'from':  39830, 'from_side':    'r', 'to':    198, 'to_side':    'r', 'mean_dist':      0, 'mapq':  60060, 'bcount':     13, 'min_dist':      0, 'max_dist':      0, 'probability': 0.082422, 'to_alt':      2, 'from_alt':      1}
+        ]) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    800,    800,    800,    800,    800],
+        'pos':      [      0,      1,      2,      3,      4],
+        'phase0':   [    801,    801,    801,    801,    801],
+        'scaf0':    [    197,    198,    199,    198,  39830],
+        'strand0':  [    '+',    '+',    '+',    '+',    '-'],
+        'dist0':    [      0,      0,   -616,      3,      0],
+        'phase1':   [   -802,   -802,   -802,   -802,   -802],
+        'scaf1':    [     -1,     -1,     -1,     -1,     -1],
+        'strand1':  [     '',     '',     '',     '',     ''],
+        'dist1':    [      0,      0,      0,      0,      0]
+        }) )
+#
+    # Combine tests
+    scaffolds = pd.concat(scaffolds, ignore_index=True)
+    scaffolds.index = scaffolds['scaffold'].values
+    scaffolds['left'] = scaffolds['scaffold']
+    scaffolds['right'] = scaffolds['scaffold']
+    scaffolds[['lside','rside','lextendible','rextendible','circular','size']] = ['l','r',True,True,False,1]
+    scaffold_graph = pd.concat(scaffold_graph, ignore_index=True)
+    scaf_bridges = pd.concat(scaf_bridges, ignore_index=True)
+    org_scaf_conns = pd.concat(org_scaf_conns, ignore_index=True)
+    result_paths = pd.concat(result_paths, ignore_index=True)
+#
+    # Consistency tests
+    if len(scaffolds.drop_duplicates()) != len(scaffolds):
+        check = scaffolds.groupby(['scaffold']).size()
+        check = check[check > 1].reset_index()['scaffold'].values
+        print("Warning: Double usage of scaffolds in test: {check}")
+    inconsistent = []
+    for l in np.unique(scaffold_graph['length']):
+        if f'scaf{l-1}' not in scaffold_graph.columns:
+            inconsistent.append( scaffold_graph[scaffold_graph['length'] == l].copy() ) # If the column does not exist all entries with this length are wrong
+        else:
+            inconsistent.append( scaffold_graph[(scaffold_graph['length'] == l) & np.isnan(scaffold_graph[f'scaf{l-1}'])].copy() )
+        if f'scaf{l}' in scaffold_graph.columns:
+            inconsistent.append( scaffold_graph[(scaffold_graph['length'] == l) & (np.isnan(scaffold_graph[f'scaf{l}']) == False)].copy() )
+    if len(inconsistent):
+        inconsistent = pd.concat(inconsistent, ignore_index=False)
+    if len(inconsistent):
+        print("Warning: Inconsistent entries in scaffold_graph for test:")
+        print(inconsistent)
+#
+    # Run function
+    scaffold_paths = TraverseScaffoldingGraph(scaffolds.drop(columns=['case']), scaffold_graph, scaf_bridges, org_scaf_conns, ploidy, max_loop_units)
+#
+    # Compare and report failed tests
+    failed = False
+    for t in np.unique(scaffolds['case']):
+        correct_paths = result_paths[np.isin(result_paths['pid'], np.unique(result_paths.loc[np.isin(result_paths['scaf0'], scaffolds.loc[scaffolds['case'] == t, 'scaffold'].values),'pid'].values))].copy()
+        reversed_paths = correct_paths.copy()
+        correct_paths['reverse'] = False
+        reversed_paths['reverse'] = True
+        reversed_paths = ReverseScaffolds(reversed_paths, reversed_paths['reverse'] , ploidy)
+        tmp_paths = pd.concat([correct_paths, reversed_paths], ignore_index=True)
+        correct_haps = []
+        for h in range(ploidy):
+            tmp_paths.loc[tmp_paths[f'phase{h}'] < 0, [f'scaf{h}',f'strand{h}',f'dist{h}']] = tmp_paths.loc[tmp_paths[f'phase{h}'] < 0, ['scaf0','strand0','dist0']].values
+            correct_haps.append( tmp_paths.loc[tmp_paths[f'scaf{h}'] >= 0, ['pid','reverse',f'scaf{h}',f'strand{h}',f'dist{h}']].rename(columns={'pid':'cpid',f'scaf{h}':'scaf',f'strand{h}':'strand',f'dist{h}':'dist'}) )
+            correct_haps[-1]['hap'] = h
+        correct_haps = pd.concat(correct_haps, ignore_index=True)
+        correct_haps['pos'] = correct_haps.groupby(['cpid','hap','reverse'], sort=False).cumcount()
+        obtained_paths = scaffold_paths[np.isin(scaffold_paths['pid'], np.unique(scaffold_paths.loc[np.isin(scaffold_paths['scaf0'], scaffolds.loc[scaffolds['case'] == t, 'scaffold'].values),'pid'].values))].copy()
+        tmp_paths = obtained_paths.copy()
+        obtained_haps = []
+        for h in range(ploidy):
+            tmp_paths.loc[tmp_paths[f'phase{h}'] < 0, [f'scaf{h}',f'strand{h}',f'dist{h}']] = tmp_paths.loc[tmp_paths[f'phase{h}'] < 0, ['scaf0','strand0','dist0']].values
+            obtained_haps.append( tmp_paths.loc[tmp_paths[f'scaf{h}'] >= 0, ['pid',f'scaf{h}',f'strand{h}',f'dist{h}']].rename(columns={'pid':'opid',f'scaf{h}':'scaf',f'strand{h}':'strand',f'dist{h}':'dist'}) )
+            obtained_haps[-1]['hap'] = h
+        obtained_haps = pd.concat(obtained_haps, ignore_index=True)
+        obtained_haps['pos'] = obtained_haps.groupby(['opid','hap'], sort=False).cumcount()
+        comp = correct_haps.merge(obtained_haps, on=['hap','pos','scaf','strand','dist'], how='inner')
+        comp = comp.groupby(['cpid','opid','hap','reverse']).size().reset_index(name='bcount').groupby(['cpid','opid','hap'])[['bcount']].max().reset_index()
+        comp = correct_haps[correct_haps['reverse']].groupby(['cpid','hap']).size().reset_index(name='ccount').merge(comp, on=['cpid','hap'], how='inner')
+        comp = comp[comp['ccount'] == comp['bcount']].merge( obtained_haps.groupby(['opid','hap']).size().reset_index(name='ocount'), on=['opid','hap'], how='left')
+        comp = comp[comp['ccount'] == comp['ocount']].groupby(['cpid','hap']).first().reset_index()
+        comp = comp.groupby(['cpid','opid']).size().reset_index(name='nhaps')
+        comp = comp[comp['nhaps'] == ploidy].copy()
+        correct_paths = correct_paths[np.isin(correct_paths['pid'], comp['cpid']) == False].drop(columns=['reverse'])
+        obtained_paths = obtained_paths[np.isin(obtained_paths['pid'], comp['opid']) == False].copy()
+        if len(correct_paths) | len(obtained_paths):
+            print(f"TestTraverseScaffoldingGraph: Test case {t} failed.")
+            print("Unmatched correct paths:")
+            print(correct_paths)
+            print("Unmatched obtained paths:")
+            print(obtained_paths)
+            failed = True
+#
+    return failed
+
 def MiniGapTest():
-    # contigs, contig_ids = ReadContigs(assembly_file)
-    # contigs, center_repeats = MaskRepeatEnds(contigs, repeat_file, contig_ids, max_repeat_extension, min_len_repeat_connection, repeat_len_factor_unique, remove_duplicated_contigs, pdf)
+    failed_tests = 0
+    failed_tests += TestDuplicationConflictResolution()
+    failed_tests += TestTraverseScaffoldingGraph()
     
-    pass
+    if failed_tests == 0:
+        print("All tests succeeded.")
+    else:
+        print(failed_tests, "tests failed.")
     
 def Usage(module=""):
     if "" == module:
