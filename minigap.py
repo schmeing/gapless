@@ -616,15 +616,6 @@ def BreakReadsAtAdapters(mappings, adapter_signal_max_dist, keep_all_subreads):
 
     return mappings
 
-def CallAllBreaksSpurious(mappings, contigs, max_dist_contig_end, min_length_contig_break, min_extension, pdf):
-    left_breaks, right_breaks = GetBrokenMappings(mappings, max_dist_contig_end, min_length_contig_break, pdf)
-
-    break_groups = []
-    spurious_break_indexes = np.unique(np.concatenate([left_breaks.index, right_breaks.index]))
-    non_informative_mappings = GetNonInformativeMappings(mappings, contigs, min_extension, break_groups, left_breaks, right_breaks)
-
-    return break_groups, spurious_break_indexes, non_informative_mappings
-
 def GetBrokenMappings(mappings, max_dist_contig_end, min_length_contig_break, pdf):
     # Find reads that have a break point and map on the left/right side(contig orientation) of it
     pot_breaks = mappings.copy()
@@ -648,6 +639,8 @@ def GetBrokenMappings(mappings, max_dist_contig_end, min_length_contig_break, pd
     pot_breaks = pd.concat([left_breaks, right_breaks], ignore_index=False)
     pot_breaks = pot_breaks.reset_index().rename(columns={'index':'map_index', 't_id':'contig_id'}).drop(columns=['t_name','matches','alignment_length'])
     pot_breaks['position'] = np.where('l' == pot_breaks['side'], pot_breaks['t_end'], pot_breaks['t_start'])
+    pot_breaks['read_pos'] = np.where(('+' == pot_breaks['strand']) == ('l' == pot_breaks['side']), pot_breaks['q_end'], pot_breaks['q_start'])
+    pot_breaks['read_side'] = np.where(('+' == pot_breaks['strand']) == ('l' == pot_breaks['side']), 'r', 'l')
     pot_breaks['map_len'] = np.where('l' == pot_breaks['side'], pot_breaks['t_end']-pot_breaks['t_start'], pot_breaks['t_end']-pot_breaks['t_start'])
     pot_breaks['con'] = np.where(('+' == pot_breaks['strand']) == ('l' == pot_breaks['side']), pot_breaks['next_con'], pot_breaks['prev_con'])
     pot_breaks['con_strand'] = np.where(('+' == pot_breaks['strand']) == ('l' == pot_breaks['side']), pot_breaks['next_strand'], pot_breaks['prev_strand'])
@@ -664,17 +657,6 @@ def GetBrokenMappings(mappings, max_dist_contig_end, min_length_contig_break, pd
             PlotHist(pdf, "Distance to contig end", "# Potential contig breaks", dists_contig_ends, threshold=max_dist_contig_end, logx=True)
 
     return pot_breaks
-
-def NormCDFCapped(x, mu, sigma):
-    return np.minimum(0.5, NormCDF(x, mu, sigma)) # Cap it at the mean so that repeats do not get a bonus
-
-def GetConProb(cov_probs, req_length, counts):
-    probs = pd.DataFrame({'length':req_length, 'counts':counts, 'mu':0.0, 'sigma':1.0})
-    for plen, mu, sigma in zip(reversed(cov_probs['length']), reversed(cov_probs['mu']), reversed(cov_probs['sigma'])):
-        probs.loc[plen >= probs['length'], 'mu'] = mu
-        probs.loc[plen >= probs['length'], 'sigma'] = sigma
-
-    return NormCDFCapped(probs['counts'],probs['mu'], probs['sigma'])      
 
 def GetNonInformativeMappings(mappings, contigs, min_extension, break_groups, pot_breaks):
     # All reads that are not extending contigs enough and do not have multiple mappings are non informative (except they overlap breaks)
@@ -700,7 +682,27 @@ def GetNonInformativeMappings(mappings, contigs, min_extension, break_groups, po
 
     return non_informative_mappings
 
-def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, min_length_contig_break, max_break_point_distance, min_num_reads, min_extension, merge_block_length, org_scaffold_trust, cov_probs, prob_factor, pdf):
+def CallAllBreaksSpurious(mappings, contigs, max_dist_contig_end, min_length_contig_break, min_extension, pdf):
+    pot_breaks = GetBrokenMappings(mappings, max_dist_contig_end, min_length_contig_break, pdf)
+
+    break_groups = []
+    spurious_break_indexes = pot_breaks[['map_index','q_name','read_side','q_start','q_end']].drop_duplicates()
+    non_informative_mappings = GetNonInformativeMappings(mappings, contigs, min_extension, break_groups, pot_breaks)
+
+    return break_groups, spurious_break_indexes, non_informative_mappings
+
+def NormCDFCapped(x, mu, sigma):
+    return np.minimum(0.5, NormCDF(x, mu, sigma)) # Cap it at the mean so that repeats do not get a bonus
+
+def GetConProb(cov_probs, req_length, counts):
+    probs = pd.DataFrame({'length':req_length, 'counts':counts, 'mu':0.0, 'sigma':1.0})
+    for plen, mu, sigma in zip(reversed(cov_probs['length']), reversed(cov_probs['mu']), reversed(cov_probs['sigma'])):
+        probs.loc[plen >= probs['length'], 'mu'] = mu
+        probs.loc[plen >= probs['length'], 'sigma'] = sigma
+
+    return NormCDFCapped(probs['counts'],probs['mu'], probs['sigma'])      
+
+def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, min_length_contig_break, max_break_point_distance, min_num_reads, min_extension, merge_block_length, org_scaffold_trust, cov_probs, prob_factor, allow_same_contig_breaks, pdf):
     if pdf:
         loose_reads_ends = mappings[(mappings['t_start'] > max_dist_contig_end) & np.where('+' == mappings['strand'], -1 == mappings['prev_con'], -1 == mappings['next_con'])]
         loose_reads_ends_length = np.where('+' == loose_reads_ends['strand'], loose_reads_ends['q_start']-loose_reads_ends['read_start'], loose_reads_ends['read_end']-loose_reads_ends['q_end'])
@@ -710,7 +712,7 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
             if np.sum(loose_reads_ends_length < 10*min_length_contig_break):
                 PlotHist(pdf, "Loose end length", "# Ends", np.extract(loose_reads_ends_length < 10*min_length_contig_break, loose_reads_ends_length), threshold=min_length_contig_break, logy=True)
             PlotHist(pdf, "Loose end length", "# Ends", loose_reads_ends_length, threshold=min_length_contig_break, logx=True)
-
+#
     pot_breaks = GetBrokenMappings(mappings, max_dist_contig_end, min_length_contig_break, pdf)
     break_points = pot_breaks[['contig_id','side','position','mapq','map_len']].copy()
     break_points['connected'] = 0 <= pot_breaks['con']
@@ -719,14 +721,14 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
     break_points.sort_values(['contig_id','position'], inplace=True)
     if min_num_reads > 1:
         break_points = break_points[ ((break_points['contig_id'] == break_points['contig_id'].shift(-1, fill_value=-1)) & (break_points['position']+max_break_point_distance >= break_points['position'].shift(-1, fill_value=-1))) | ((break_points['contig_id'] == break_points['contig_id'].shift(1, fill_value=-1)) & (break_points['position']-max_break_point_distance <= break_points['position'].shift(1, fill_value=-1))) ].copy() # require at least one supporting break within +- max_break_point_distance
-
+#
     if pdf:
         break_point_dist = (break_points['position'] - break_points['position'].shift(1, fill_value=0))[break_points['contig_id'] == break_points['contig_id'].shift(1, fill_value=-1)]
         if len(break_point_dist):
             if np.sum(break_point_dist <= 10*max_break_point_distance):
                 PlotHist(pdf, "Break point distance", "# Break point pairs", break_point_dist[break_point_dist <= 10*max_break_point_distance], threshold=max_break_point_distance )
             PlotHist(pdf, "Break point distance", "# Break point pairs", break_point_dist, threshold=max_break_point_distance, logx=True )
-
+#
     if len(break_points):
         # Check how many reads support a break_point with breaks within +- max_break_point_distance
         break_points['support'] = 1
@@ -754,7 +756,7 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
         break_supp = break_supp[break_supp['position'] != break_supp['supp_pos']].copy() # If we are at the same position we would multicount the values, when we do a cumsum later
         break_supp['position'] = break_supp['supp_pos']
         break_supp.drop(columns=['supp_pos'], inplace=True)
-
+#
         break_points = pd.concat([break_points, break_supp], ignore_index=True).groupby(['contig_id','position','mapq']).sum().reset_index()
         break_points.sort_values(['contig_id','position','mapq'], ascending=[True,True,False], inplace=True)
         # Add support from higher mapping qualities to lower mapping qualities
@@ -763,7 +765,7 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
         # Require a support of at least min_num_reads at some mapping quality level
         max_support = break_points.groupby(['contig_id','position'], sort=False)['support'].agg(['max','size'])
         break_points = break_points[ np.repeat(max_support['max'].values, max_support['size'].values) >= min_num_reads].copy()
-
+#
     if len(break_points):
         # Check how many reads veto a break (continuously map over the break region position +- (min_mapping_length+max_break_point_distance))
         break_pos = break_points[['contig_id','position']].drop_duplicates()
@@ -782,26 +784,26 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
             break_list.append( tmp_breaks[(tmp_breaks['t_start']+min_mapping_length+max_break_point_distance <= tmp_breaks['position']) &
                                           (tmp_breaks['t_end']-min_mapping_length-max_break_point_distance >= tmp_breaks['position'])].\
                                    groupby(['contig_id','position','mapq']).size().reset_index(name='vetos') )
-
+#
         break_points = break_points.merge(pd.concat(break_list, ignore_index=True), on=['contig_id','position','mapq'], how='outer').fillna(0)
         break_points.sort_values(['contig_id','position','mapq'], ascending=[True,True,False], inplace=True)
         break_points.reset_index(inplace=True, drop=True)
         break_points[['support', 'con_supp']] = break_points.groupby(['contig_id','position'], sort=False)[['support', 'con_supp']].cummax().astype(int)
         break_points['vetos'] = break_points.groupby(['contig_id','position'], sort=False)['vetos'].cumsum().astype(int)
-
+#
         # Remove breaks where the vetos are much more likely than the breaks
         break_points['break_prob'] = GetConProb(cov_probs, min_mapping_length+max_break_point_distance+min_length_contig_break, break_points['support'])
         break_points['veto_prob'] = GetConProb(cov_probs, 2*(min_mapping_length+max_break_point_distance), break_points['vetos'])
         break_points['vetoed'] = (break_points['vetos'] >= min_num_reads) & (break_points['veto_prob'] >= prob_factor*break_points['break_prob']) # Always make sure that vetos reach min_num_reads, before removing something based on their probability
         break_points['vetoed'] = break_points.groupby(['contig_id','position'], sort=False)['vetoed'].cumsum().astype(bool) # Propagate vetos to lower mapping qualities
         break_points = break_points[break_points['vetoed'] == False].copy()
-
+#
         # Remove break points that will reconnected anyways
         break_points['vetoed'] = (break_points['vetos'] >= min_num_reads) & (break_points['con_supp'] < min_num_reads) # If we have enough support, but not enough con_supp the bridge finding step would anyways reseal the break with a unique bridge, so don't even break it
         break_points['vetoed'] = break_points.groupby(['contig_id','position'], sort=False)['vetoed'].cummax() # Propagate vetos to lower mapping qualities
         unconnected_break_points = [break_points[break_points['vetoed'] == True].copy()] # Store unconnected break points to later check if we can insert additional sequence to provide a connection in a second run
         break_points = break_points[break_points['vetoed'] == False].copy()
-
+#
         # Remove break points with not enough consistent breaks
         break_pos = break_points[['contig_id','position']].drop_duplicates()
         break_pos['merge_block'] = break_pos['position'] // merge_block_length
@@ -823,7 +825,7 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
         break_points['vetoed'] = break_points.groupby(['contig_id','position'], sort=False)['vetoed'].cummax() # Propagate vetos to lower mapping qualities
         unconnected_break_points.append( break_points[break_points['vetoed'] == True].copy() )
         break_points = break_points[break_points['vetoed'] == False].copy()
-
+#
         # Remove break points with not enough consistent breaks to be likely enough
         break_pos['con_prob'] = GetConProb(cov_probs, np.where(0 <= break_pos['mean_dist'], break_pos['mean_dist']+2*min_mapping_length, min_mapping_length-break_pos['mean_dist']), break_pos['count'])
         break_points = break_points.merge(break_pos.groupby(['contig_id','position','mapq'])['con_prob'].max().reset_index(name='con_prob'), on=['contig_id','position','mapq'], how='left')
@@ -832,11 +834,11 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
         break_points['vetoed'] = break_points.groupby(['contig_id','position'], sort=False)['vetoed'].cummax() # Propagate vetos to lower mapping qualities
         unconnected_break_points.append( break_points[break_points['vetoed'] == True].drop(columns=['con_prob']) )
         break_points = break_points[break_points['vetoed'] == False].copy()
-
+#
         # Remove breaks that do not fullfil requirements and reduce accepted ones to a single entry per break_id
         break_points = break_points[break_points['support'] >= min_num_reads].copy()
         break_points = break_points.groupby(['contig_id','position'], sort=False).first().reset_index()
-
+#
     if len(break_points):
         # Cluster break_points into groups, so that groups have a maximum length of 2*max_break_point_distance
         break_points['dist'] = np.where( break_points['contig_id'] != break_points['contig_id'].shift(1, fill_value=-1), -1, break_points['position'] - break_points['position'].shift(1, fill_value=0) )
@@ -850,7 +852,7 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
                                                         (break_points['dist'] < np.repeat(break_points.groupby(['contig_id','group'], sort=False)['dist'].max().values, break_groups['size'].values)), break_points['group'], break_points['break_id'])).cummax()
             break_points.loc[break_points['group'] != break_points['group'].shift(1, fill_value=-1), 'dist'] = -1
             break_groups = break_points.groupby(['contig_id','group'], sort=False)['position'].agg(['min','max','size']).reset_index()
-
+#
         break_groups.drop(columns=['group','size'], inplace=True)
         break_groups.rename(columns={'min':'start', 'max':'end'}, inplace=True)
         break_groups['end'] += 1 # Set end to one position after the last included one to be consistent with other ends (like q_end, t_end)
@@ -858,31 +860,39 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
         break_groups['num'] = break_groups.groupby(['contig_id'], sort=False).cumcount()
     else:
         break_groups = []
-
+#
     if len(break_groups):
-        # Find mappings belonging to accepted breaks
+        # Find mappings belonging to accepted breaks and mappings that have a connection to the same part of the contig (not split by breaks)
         pot_breaks['keep'] = False
+        pot_breaks['self'] = allow_same_contig_breaks & (pot_breaks['contig_id'] == pot_breaks['con']) & (pot_breaks['strand'] == pot_breaks['con_strand'])
         for i in range(break_groups['num'].max()+1):
-            breaks = pd.DataFrame({'contig':np.arange(len(contigs)), 'start':sys.maxsize, 'end':-1})
-            breaks.iloc[break_groups.loc[i==break_groups['num'], 'contig_id'], [breaks.columns.get_loc('start'), breaks.columns.get_loc('end')]] = break_groups.loc[i==break_groups['num'], ['start', 'end']].values
-            breaks = breaks.iloc[pot_breaks['contig_id']]
-            pot_breaks['keep'] = pot_breaks['keep'] | np.where('l' == pot_breaks['side'], (breaks['start'].values <= pot_breaks['t_end'].values) & (pot_breaks['t_end'].values <= breaks['end'].values),
-                                                                                          (breaks['start'].values <= pot_breaks['t_start'].values) & (pot_breaks['t_start'].values <= breaks['end'].values))
+            breaks = pd.DataFrame({'contig':np.arange(len(contigs)), 'start':sys.maxsize, 'end':-1, 'pos':-1})
+            breaks.loc[break_groups.loc[i==break_groups['num'], 'contig_id'].values, ['start','end','pos']] = break_groups.loc[i==break_groups['num'], ['start','end','pos']].values
+            breaks = breaks.iloc[pot_breaks['contig_id'].values]
+            pot_breaks['keep'] = ( pot_breaks['keep'] | ( (pot_breaks['side'] == 'l') & (breaks['pos'].values - max_dist_contig_end <= pot_breaks['position'].values) & (pot_breaks['position'].values <= breaks['end'].values) )
+                                                      | ( (pot_breaks['side'] == 'r') & (breaks['start'].values <= pot_breaks['position'].values) & (pot_breaks['position'].values <= breaks['pos'].values + max_dist_contig_end) ) )
+            pot_breaks['self'] = pot_breaks['self'] & ( ((pot_breaks['position'].values < breaks['pos'].values + np.where((pot_breaks['side'] == 'l'), 1, -1)*min_mapping_length) & (pot_breaks['con_pos'].values < breaks['pos'].values + np.where((pot_breaks['side'] == 'l'), -1, 1)*min_mapping_length)) |
+                                                        ((pot_breaks['position'].values > breaks['pos'].values + np.where((pot_breaks['side'] == 'l'), 1, -1)*min_mapping_length) & (pot_breaks['con_pos'].values > breaks['pos'].values + np.where((pot_breaks['side'] == 'l'), -1, 1)*min_mapping_length)) )
 
-        # Find reads where all mappings are either connected to itself or belong to accepted breaks
-        pot_breaks['self'] = pot_breaks['keep'] | (pot_breaks['contig_id'] == pot_breaks['con'])
-        self_con = pot_breaks.groupby(['q_name','contig_id'])['self'].agg(['sum','size']).reset_index()
-        self_con = self_con.loc[self_con['sum'] == self_con['size'], ['q_name','contig_id']].drop_duplicates()
-        pot_breaks['keep'] = pot_breaks['keep'] | (pot_breaks.merge(self_con, on=['q_name','contig_id'], how='left', indicator=True)['_merge'] == "both").values
+        # A read is only correct in between two valid breaks/contig ends if all breaks in that region connect to another position inside that region (or has no breaks at all if allow_same_contig_breaks==False)
+        pot_breaks.sort_values(['q_name','q_start','q_end','read_pos'], inplace=True)
+        pot_breaks['group_id'] = ( (pot_breaks['q_name'] != pot_breaks['q_name'].shift(1)) | (pot_breaks['read_start'] != pot_breaks['read_start'].shift(1)) |
+                                   (pot_breaks['contig_id'] != pot_breaks['contig_id'].shift(1)) |
+                                   (pot_breaks['keep'] & (pot_breaks['read_pos'] == pot_breaks['q_start'])) |
+                                   (pot_breaks['keep'] & (pot_breaks['read_pos'] == pot_breaks['q_end'])).shift(1, fill_value=False) ).cumsum()
+        pot_breaks['self'] = pot_breaks['keep'] | pot_breaks['self']
+        self_con = pot_breaks.groupby(['group_id'])['self'].agg(['sum','size']).reset_index()
+        self_con = np.unique(self_con.loc[self_con['sum'] == self_con['size'], ['group_id']].values)
+        pot_breaks['keep'] = np.isin(pot_breaks['group_id'], self_con)
 
         # Mappings not belonging to accepted breaks or connecting to itself are spurious
-        spurious_break_indexes = np.unique(pot_breaks.loc[pot_breaks['keep'] == False, 'map_index'].values)
+        spurious_break_indexes = pot_breaks.loc[pot_breaks['keep'] == False, ['map_index','q_name','read_side','q_start','q_end']].drop_duplicates()
     else:
         # We don't have breaks, so all are spurious
-        spurious_break_indexes = np.unique(pot_breaks['map_index'].values)
+        spurious_break_indexes = pot_breaks[['map_index','q_name','read_side','q_start','q_end']].drop_duplicates()
 
     non_informative_mappings = GetNonInformativeMappings(mappings, contigs, min_extension, break_groups, pot_breaks)
-
+#
     # Filter unconnected break points that overlap a break_group (probably from vetoed low mapping qualities, where the high mapping quality was not vetoed)
     unconnected_break_points = pd.concat(unconnected_break_points, ignore_index=True)[['contig_id','position']].sort_values(['contig_id','position']).drop_duplicates()
     unconnected_break_points['remove'] = False
@@ -892,14 +902,14 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
         breaks = breaks.iloc[unconnected_break_points['contig_id']]
         unconnected_break_points['remove'] = unconnected_break_points['remove'] | ( (breaks['start'].values-max_break_point_distance <= unconnected_break_points['position'].values) & (unconnected_break_points['position'].values <= breaks['end'].values+max_break_point_distance) )
     unconnected_break_points = unconnected_break_points[unconnected_break_points['remove'] == False].drop(columns=['remove'])
-
+#
     # Handle unconnected break points
     unconnected_break_points['dist'] = np.where( unconnected_break_points['contig_id'] != unconnected_break_points['contig_id'].shift(1, fill_value=-1), -1, unconnected_break_points['position'] - unconnected_break_points['position'].shift(1, fill_value=0) )
     unconnected_break_points['group'] = ((unconnected_break_points['dist'] > max_break_point_distance) | (-1 == unconnected_break_points['dist'])).cumsum()
     unconnected_break_points = unconnected_break_points.groupby(['contig_id','group'])['position'].agg(['min','max']).reset_index().rename(columns={'min':'bfrom','max':'bto'}).drop(columns=['group'])
     unconnected_break_points = unconnected_break_points.merge(pot_breaks, on=['contig_id'], how='left')
     unconnected_break_points = unconnected_break_points[(unconnected_break_points['position'] >= unconnected_break_points['bfrom'] - max_break_point_distance) & (unconnected_break_points['position'] <= unconnected_break_points['bto'] + max_break_point_distance)].copy()
-
+#
     # If the unconnected break points are connected to another contig on the other side, the extension will likely take care of it and we don't need to do anything
     unconnected_break_points.sort_values(['contig_id','bfrom','bto','side','opos_con'], inplace=True)
     count_breaks = unconnected_break_points.groupby(['contig_id','bfrom','bto','side','opos_con'], sort=False).size()
@@ -909,6 +919,35 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
     unconnected_break_points = unconnected_break_points[(unconnected_break_points['ocon_count'] < min_num_reads) & (np.repeat(count_breaks['size'].values, count_breaks['size'].values) >= min_num_reads)].copy()
 
     return break_groups, spurious_break_indexes, non_informative_mappings, unconnected_break_points
+
+def SplitReadsAtSpuriousBreakIndexes(mappings, spurious_break_indexes):
+    if len(spurious_break_indexes):
+        # Handle multiple breaks in the same read one after another
+        split_reads = spurious_break_indexes[['q_name','read_side','q_start','q_end']].sort_values(['q_name','q_start'])
+        split_reads.drop_duplicates(inplace=True)
+        split_reads.rename(columns={'read_side':'split_side','q_start':'split_start','q_end':'split_end'}, inplace=True)
+        split_reads['bcount'] = split_reads.groupby(['q_name'], sort=False).cumcount()
+        split_reads = split_reads.merge(mappings[['q_name']].drop_duplicates(), on=['q_name'], how='inner')
+        for b in range(split_reads['bcount'].max()+1):
+            # Split reads at split_pos
+            mappings[['split_side','split_start','split_end']] = mappings[['q_name']].merge(split_reads.loc[split_reads['bcount'] == b, ['q_name','split_side','split_start','split_end']], on=['q_name'], how='left')[['split_side','split_start','split_end']].values
+            cur = ((mappings['split_side'] == 'l') & (mappings['q_start'] < mappings['split_start'])) | ((mappings['split_side'] == 'r') & (mappings['q_end'] <= mappings['split_end']))
+            if np.sum(cur):
+                mappings.loc[cur, 'read_end'] = np.minimum(mappings.loc[cur, 'read_end'].values, mappings.loc[cur, 'split_end'].astype(int).values)
+            cur = ((mappings['split_side'] == 'l') & (mappings['q_start'] >= mappings['split_start'])) | ((mappings['split_side'] == 'r') & (mappings['q_end'] > mappings['split_end']))
+            if np.sum(cur):
+                mappings.loc[cur, 'read_start'] = np.maximum(mappings.loc[cur, 'read_start'].values, mappings.loc[cur, 'split_start'].astype(int).values)
+            # Make sure mappings do not reach over read start/end
+            splitted = mappings.loc[np.isnan(mappings['split_start']) == False, ['q_name','q_start','q_end','read_start','read_end']].groupby(['q_name','read_start','read_end']).agg({'q_start':['min'],'q_end':['max']}).droplevel(axis=1,level=1).reset_index()
+            splitted = splitted[(splitted['read_start'] > splitted['q_start']) | (splitted['read_end'] < splitted['q_end'])].rename(columns={'q_start':'new_start','q_end':'new_end'})
+            splitted['new_start'] = np.minimum(splitted['new_start'], splitted['read_start'])
+            splitted['new_end'] = np.maximum(splitted['new_end'], splitted['read_end'])
+            mappings[['new_start','new_end']] = mappings[['q_name','read_start','read_end']].merge(splitted, on=['q_name','read_start','read_end'], how='left')[['new_start','new_end']].values
+            mappings.loc[np.isnan(mappings['new_start']) == False, 'read_start'] =  mappings.loc[np.isnan(mappings['new_start']) == False, 'new_start'].astype(int)
+            mappings.loc[np.isnan(mappings['new_end']) == False, 'read_end'] =  mappings.loc[np.isnan(mappings['new_end']) == False, 'new_end'].astype(int)
+        mappings.drop(columns=['split_side','split_start','split_end','new_start','new_end'], inplace=True)
+#
+    return mappings
 
 def GetContigParts(contigs, break_groups, remove_short_contigs, min_mapping_length, alignment_precision, pdf):
     # Create a dataframe with the contigs being split into parts and contigs scheduled for removal not included
@@ -6426,6 +6465,7 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
 #
     min_num_reads = 2
     borderline_removal = False
+    allow_same_contig_breaks = True
     min_factor_alternatives = 1.1
     cov_bin_fraction = 0.01
     num_read_len_groups = 10
@@ -6476,8 +6516,9 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
         # Do not break contigs
         break_groups, spurious_break_indexes, non_informative_mappings = CallAllBreaksSpurious(mappings, contigs, max_dist_contig_end, min_length_contig_break, min_extension, pdf)
     else:
-        break_groups, spurious_break_indexes, non_informative_mappings, unconnected_breaks = FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, min_length_contig_break, max_break_point_distance, min_num_reads, min_extension, merge_block_length, org_scaffold_trust, cov_probs, prob_factor, pdf)
-    mappings.drop(np.concatenate([spurious_break_indexes, non_informative_mappings]), inplace=True) # Remove not-accepted breaks from mappings and mappings that do not contain any information (mappings inside of contigs that do not overlap with breaks)
+        break_groups, spurious_break_indexes, non_informative_mappings, unconnected_breaks = FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, min_length_contig_break, max_break_point_distance, min_num_reads, min_extension, merge_block_length, org_scaffold_trust, cov_probs, prob_factor, allow_same_contig_breaks, pdf)
+    mappings.drop(np.concatenate([np.unique(spurious_break_indexes['map_index'].values), non_informative_mappings]), inplace=True) # Remove not-accepted breaks from mappings and mappings that do not contain any information (mappings inside of contigs that do not overlap with breaks)
+    #SplitReadsAtSpuriousBreakIndexes(mappings, spurious_break_indexes)
     del spurious_break_indexes, non_informative_mappings
 #
     contig_parts, contigs = GetContigParts(contigs, break_groups, remove_short_contigs, min_mapping_length, alignment_precision, pdf)
