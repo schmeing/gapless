@@ -1661,14 +1661,14 @@ def GetLongRangeConnections(bridges, mappings):
         interesting_reads = long_range_mappings[['read_name','read_start','conpart','right_con','left_con']].merge(alternative_connections, on=['conpart'], how='inner')
         interesting_reads = interesting_reads[ ((interesting_reads['side'] == 'r') & (interesting_reads['right_con'] >= 0)) | ((interesting_reads['side'] == 'l') & (interesting_reads['left_con'] >= 0)) ].copy() # Only keep reads that have a connection in the interesting direction
         long_range_mappings = long_range_mappings.merge(interesting_reads[['read_name','read_start']].drop_duplicates(), on=['read_name','read_start'], how='inner')
-
+#
     if len(long_range_mappings):
         # Get long_range_connections that are supported by reads
         long_range_connections = long_range_mappings[['conpart','strand','left_con_dist','right_con_dist','left_con','right_con']].copy()
         long_range_connections['conn_id'] = ((long_range_mappings['read_name'] != long_range_mappings['read_name'].shift(1, fill_value='')) | (long_range_mappings['read_start'] != long_range_mappings['read_start'].shift(1, fill_value=-1))).cumsum()
     else:
         long_range_connections = []
-
+#
     if len(long_range_connections):
         # If a long_range_connections goes through the same contig part multiple times without a proper repeat signature, merge those entries
         long_range_connections = GetConnectionFromTo(long_range_connections)
@@ -1683,7 +1683,7 @@ def GetLongRangeConnections(bridges, mappings):
         selection = long_range_connections['fake_rep'] & (long_range_connections['from_side'] == 'l')
         long_range_connections.loc[selection.shift(-1, fill_value=False), 'left_con_dist'] = np.where(long_range_connections.loc[selection, 'to_side'] == 'l', long_range_connections.loc[selection, 'right_con_dist'], long_range_connections.loc[selection, 'left_con_dist']) # Fill in the other side that does not point towards the previous entry
         long_range_connections = long_range_connections[long_range_connections['fake_rep'] == False].drop(columns = ['left_con','right_con','fake_rep'])
-
+#
     if len(long_range_connections):
         # Break long_range_mappings when they go through invalid bridges and get number of prev alternatives (how many alternative to the connection of a mapping with its previous mapping exist)
         long_range_connections = GetConnectionFromTo(long_range_connections)
@@ -1696,11 +1696,11 @@ def GetLongRangeConnections(bridges, mappings):
         long_range_connections = long_range_connections.sort_values(['index','prev_alt'], ascending=[True,False]).groupby(['index'], sort=False).first().reset_index() # Remove duplications from multiple possible bridge distances
         long_range_connections.drop(columns=['min_dist','max_dist'], inplace=True)
         long_range_connections['conn_id'] = (long_range_connections['prev_alt'] == 0).cumsum()
-
+#
         # Remove connections that do not include at least 3 mappings anymore
         long_range_connections = GetSizeAndEnumeratePositionsForLongRangeConnections(long_range_connections)
         long_range_connections = long_range_connections[ long_range_connections['size'] >= 3 ].copy()
-
+#
     if len(long_range_connections):
         # Get number of next alternatives
         long_range_connections['from'] = long_range_connections['conpart']
@@ -1715,7 +1715,7 @@ def GetLongRangeConnections(bridges, mappings):
         long_range_connections.loc[(long_range_connections['min_dist'] > long_range_connections['dist']) | (long_range_connections['dist'] > long_range_connections['max_dist']),'next_alt'] = 0 # Mark wrong distances, so we can remove them and only keep the correct ones
         long_range_connections = long_range_connections.sort_values(['index','next_alt'], ascending=[True,False]).groupby(['index'], sort=False).first().reset_index(drop=True) # Remove duplications from multiple possible bridge distances
         long_range_connections.drop(columns=['from','from_side','to','to_side','dist','min_dist','max_dist','left_con_dist','right_con_dist'], inplace=True)
-
+#
         # Trim parts at the beginning or end that do not include alternative connections
         long_range_connections['trim'] = ( ((long_range_connections['pos'] == 0) & (long_range_connections['next_alt'] == 1) & (long_range_connections['prev_alt'].shift(-1, fill_value=-1) == 1)) |
                                            ((long_range_connections['pos'] == long_range_connections['size']-1) & (long_range_connections['prev_alt'] == 1) & (long_range_connections['next_alt'].shift(1, fill_value=-1) == 1)) )
@@ -1725,31 +1725,31 @@ def GetLongRangeConnections(bridges, mappings):
             long_range_connections = long_range_connections[ long_range_connections['size'] >= 3 ].copy()
             long_range_connections['trim'] = ( ((long_range_connections['pos'] == 0) & (long_range_connections['next_alt'] == 1) & (long_range_connections['prev_alt'].shift(-1, fill_value=-1) == 1)) |
                                                ((long_range_connections['pos'] == long_range_connections['size']-1) & (long_range_connections['prev_alt'] == 1) & (long_range_connections['next_alt'].shift(1, fill_value=-1) == 1)) )
-
+#
     if len(long_range_connections):
         long_range_connections.drop(columns=['trim'], inplace=True)
         long_range_connections.loc[long_range_connections['pos'] == 0, ['prev_alt','prev_dist']] = 0 # Make sure that reads look similar independent if they were trimmed or not
         long_range_connections.loc[long_range_connections['pos'] == long_range_connections['size']-1, ['next_alt','next_dist']] = 0
-
+#
         # Add all connections also in the reverse direction
         long_range_connections = long_range_connections.loc[np.repeat(long_range_connections.index.values, 2)].copy()
         long_range_connections['reverse'] = [False,True] * (len(long_range_connections)//2)
         long_range_connections.loc[long_range_connections['reverse'], 'strand'] = np.where(long_range_connections.loc[long_range_connections['reverse'], 'strand'] == '+', '-', '+')
-        long_range_connections.loc[long_range_connections['reverse'], 'conn_id'] = long_range_connections.loc[long_range_connections['reverse'], 'conn_id'] + long_range_connections['conn_id'].max()
-        tmp_alt = long_range_connections.loc[long_range_connections['reverse'], 'prev_alt']
-        long_range_connections.loc[long_range_connections['reverse'], 'prev_alt'] = long_range_connections.loc[long_range_connections['reverse'], 'next_alt']
-        long_range_connections.loc[long_range_connections['reverse'], 'next_alt'] = tmp_alt
-        tmp_dist = long_range_connections.loc[long_range_connections['reverse'], 'prev_dist']
-        long_range_connections.loc[long_range_connections['reverse'], 'prev_dist'] = long_range_connections.loc[long_range_connections['reverse'], 'next_dist']
-        long_range_connections.loc[long_range_connections['reverse'], 'next_dist'] = tmp_dist
+        long_range_connections['conn_id'] *= 2
+        long_range_connections.loc[long_range_connections['reverse'], 'conn_id'] += 1
+        long_range_connections.loc[long_range_connections['reverse'], ['prev_alt','next_alt']] = long_range_connections.loc[long_range_connections['reverse'], ['next_alt','prev_alt']].values
+        long_range_connections.loc[long_range_connections['reverse'], ['prev_dist','next_dist']] = long_range_connections.loc[long_range_connections['reverse'], ['next_dist','prev_dist']].values
         long_range_connections.loc[long_range_connections['reverse'], 'pos'] = long_range_connections.loc[long_range_connections['reverse'], 'size'] - long_range_connections.loc[long_range_connections['reverse'], 'pos'] - 1
-        long_range_connections.drop(columns=['reverse'], inplace=True)
         long_range_connections.sort_values(['conn_id', 'pos'], inplace=True)
-
-        # Summarize identical long_range_connections
-        long_range_connections['conn_code'] = long_range_connections['conpart'].astype(str) + long_range_connections['strand'] + '(' + long_range_connections['next_dist'].astype(str) + ')'
+#
+        # Remove the duplicate created in the previous step for connections that are identical in both directions (to have accurate counts)
+        long_range_connections['conn_code'] = long_range_connections['conpart'].astype(str) + long_range_connections['strand'] + np.where(long_range_connections['pos']+1 < long_range_connections['size'], '(' + long_range_connections['next_dist'].astype(str) + ')', '')
         codes = long_range_connections.groupby(['conn_id'], sort=False)['conn_code'].apply(''.join)
         long_range_connections['conn_code'] = codes.loc[long_range_connections['conn_id'].values].values
+        rem = long_range_connections.loc[long_range_connections['reverse'] & (long_range_connections['pos'] == 0) & (long_range_connections['conn_code'] == long_range_connections['conn_code'].shift(1)), 'conn_id'].values
+        long_range_connections = long_range_connections[np.isin(long_range_connections['conn_id'], rem) == False].drop(columns=['reverse'])
+#
+        # Summarize identical long_range_connections
         long_range_connections = long_range_connections.groupby(['conn_code','pos','size','conpart','strand','prev_alt','next_alt','prev_dist','next_dist']).size().reset_index(name='count')
         long_range_connections['conn_code'] = (long_range_connections['conn_code'] != long_range_connections['conn_code'].shift(1)).cumsum()
         long_range_connections.rename(columns={'conn_code':'conn_id'}, inplace=True)
@@ -1757,10 +1757,7 @@ def GetLongRangeConnections(bridges, mappings):
     return long_range_connections
 
 def TransformContigConnectionsToScaffoldConnections(long_range_connections, scaffold_parts):
-    long_range_connections['scaffold'] = scaffold_parts.loc[long_range_connections['conpart'].values,'scaffold'].values
-    long_range_connections['scaf_pos'] = scaffold_parts.loc[long_range_connections['conpart'].values,'pos'].values
-    long_range_connections['reverse'] = scaffold_parts.loc[long_range_connections['conpart'].values,'reverse'].values
-    #long_range_connections[['scaffold','scaf_pos','reverse']] = scaffold_parts.loc[long_range_connections['conpart'].values,['scaffold','pos','reverse']].values
+    long_range_connections[['scaffold','scaf_pos','reverse']] = scaffold_parts.loc[long_range_connections['conpart'].values,['scaffold','pos','reverse']].values
     # Reverse strand of contigs that are reversed in the scaffold to get the scaffold strand
     long_range_connections.loc[long_range_connections['reverse'], 'strand'] = np.where(long_range_connections.loc[long_range_connections['reverse'], 'strand'] == '+', '-', '+')
     # Group and combine contigs which are all part of the same scaffold (and are following it's order, so are not a repeat)
@@ -1771,8 +1768,61 @@ def TransformContigConnectionsToScaffoldConnections(long_range_connections, scaf
     # Get size and pos again
     con_size = long_range_connections.groupby(['conn_id']).size().reset_index(name='size')
     long_range_connections['size'] = np.repeat(con_size['size'].values, con_size['size'].values)
+    long_range_connections = long_range_connections[long_range_connections['size'] > 2].copy()
     long_range_connections['pos'] = long_range_connections.groupby(['conn_id'], sort=False).cumcount()
 
+    return long_range_connections
+
+def GetScaffoldLength(scaffold_parts, contig_parts):
+    scaf_len = scaffold_parts[['scaffold','conpart','prev_dist']].rename(columns={'prev_dist':'length'})
+    scaf_len['length'] += contig_parts.loc[scaf_len['conpart'].values, 'end'] - contig_parts.loc[scaf_len['conpart'].values, 'start']
+    scaf_len = scaf_len.groupby(['scaffold'])['length'].sum().reset_index()
+    scaf_len.index = scaf_len['scaffold'].values
+#
+    return scaf_len
+
+def FilterLongRangeConnections(long_range_connections, scaffold_parts, contig_parts, cov_probs, prob_factor, min_mapping_length):
+    scaf_len = GetScaffoldLength(scaffold_parts, contig_parts)
+    for l in range(3,long_range_connections['size'].max()+1):
+        # Get count for all connections of length l (this includes the counts they have within longer connections)
+        long_range_connections.reset_index(drop=True, inplace=True)
+        cons = long_range_connections.loc[long_range_connections['pos'] + l <= long_range_connections['size'], ['scaffold','strand','count']].reset_index()
+        cons.rename(columns={'index':'cindex', 'scaffold':'scaf0', 'strand':'strand0'}, inplace=True)
+        for i in range(1,l):
+            cons[[f'scaf{i}',f'strand{i}',f'dist{i}']] = long_range_connections.loc[cons['cindex']+i, ['scaffold','strand','prev_dist']].values
+        counts = cons.groupby(['scaf0','strand0']+[f'{n}{s}' for s in range(1,l) for n in ['scaf','strand','dist']])['count'].sum().reset_index()
+        # Get minimum length of a read to span that connection
+        counts['min_length'] = 2*min_mapping_length + np.maximum(0, counts['dist1']) + np.maximum(0, counts[f'dist{l-1}'])
+        for i in range(1,l-1):
+            counts['min_length'] += scaf_len.loc[counts[f'scaf{i}'].values, 'length'].values
+            if i > 1:
+                counts['min_length'] += counts[f'dist{i}']
+        # Get probability of observing this number of counts or lower
+        counts['probability'] = GetConProb(cov_probs, counts['min_length'], counts['count'])
+        # Compare probability between long_range_connections that are identical except for the first scaffold
+        counts.sort_values(['scaf1','strand1']+[f'{n}{s}' for s in range(2,l) for n in ['scaf','strand','dist']], inplace=True)
+        max_prob = counts.groupby(['scaf1','strand1']+[f'{n}{s}' for s in range(2,l) for n in ['scaf','strand','dist']], sort=False)['probability'].agg(['size','max'])
+        counts['max_prob2'] = np.repeat(max_prob['max'].values, max_prob['size'].values)
+        # Compare probability between long_range_connections that are identical except for the last scaffold
+        counts.sort_values(['scaf0','strand0']+[f'{n}{s}' for s in range(1,l-1) for n in ['scaf','strand','dist']], inplace=True)
+        max_prob = counts.groupby(['scaf0','strand0']+[f'{n}{s}' for s in range(1,l-1) for n in ['scaf','strand','dist']], sort=False)['probability'].agg(['size','max'])
+        counts['max_prob'] = np.repeat(max_prob['max'].values, max_prob['size'].values)
+        # Delete connections that are unprobable in both directions (since we keep the shorter connections, removing only one direction would keep the problematic split, but throw away information how to proceed after the split, while in the case of a two-sided removal on both sides are better alternatives and we can savely remove it)
+        counts['del'] = (counts['probability']*prob_factor < np.minimum(counts['max_prob'],counts['max_prob2']))
+        counts = counts[counts['del']].drop(columns=['count','min_length','probability','max_prob','max_prob2','del'])
+        cons = cons.merge(counts, on=list(counts.columns), how='inner')
+        split_index = np.concatenate([cons['cindex'].values, cons['cindex'].values+l-2])
+        long_range_connections['split'] = long_range_connections['conn_id'] != long_range_connections['conn_id'].shift(-1)
+        long_range_connections.loc[split_index, 'split'] = True
+        long_range_connections['split'] = long_range_connections['split'].shift(1, fill_value=True)
+        long_range_connections[['conn_id']] = long_range_connections['split'].cumsum()
+        long_range_connections['pos'] = long_range_connections.groupby(['conn_id']).cumcount()
+        con_size = long_range_connections.groupby(['conn_id'], sort=False).size().values
+        long_range_connections['size'] = np.repeat(con_size, con_size)
+        long_range_connections = long_range_connections[long_range_connections['size'] > 2].drop(columns=['split'])
+        long_range_connections.loc[long_range_connections['pos'] == 0, ['prev_alt','prev_dist']] = 0
+        long_range_connections.loc[long_range_connections['pos'] == long_range_connections['size']-1, ['next_alt','next_dist']] = 0
+#
     return long_range_connections
 
 def RemoveRedundantEntriesInScaffoldGraph(scaffold_graph):
@@ -5866,7 +5916,7 @@ def OrderByUnbrokenOriginalScaffolds(scaffold_paths, contig_parts, ploidy):
 
     return scaffold_paths
 
-def ScaffoldContigs(contig_parts, bridges, mappings, ploidy, max_loop_units):
+def ScaffoldContigs(contig_parts, bridges, mappings, cov_probs, prob_factor, min_mapping_length, ploidy, max_loop_units):
     # Each contig starts with being its own scaffold
     scaffold_parts = pd.DataFrame({'conpart': contig_parts.index.values, 'scaffold': contig_parts.index.values, 'pos': 0, 'reverse': False})
     scaffolds = pd.DataFrame({'scaffold': contig_parts.index.values, 'left': contig_parts.index.values, 'lside':'l', 'right': contig_parts.index.values, 'rside':'r', 'lextendible':True, 'rextendible':True, 'circular':False, 'size':1})
@@ -5886,6 +5936,7 @@ def ScaffoldContigs(contig_parts, bridges, mappings, ploidy, max_loop_units):
     # Build scaffold graph to find unique bridges over scaffolds with alternative connections
     long_range_connections = GetLongRangeConnections(bridges, mappings)
     long_range_connections = TransformContigConnectionsToScaffoldConnections(long_range_connections, scaffold_parts)
+    long_range_connections = FilterLongRangeConnections(long_range_connections, scaffold_parts, contig_parts, cov_probs, prob_factor, min_mapping_length)
     scaffold_graph = BuildScaffoldGraph(long_range_connections, scaf_bridges)
     graph_ext = FindValidExtensionsInScaffoldGraph(scaffold_graph)
     scaffold_paths = TraverseScaffoldingGraph(scaffolds, scaffold_graph, graph_ext, scaf_bridges, org_scaf_conns, ploidy, max_loop_units)
@@ -6676,7 +6727,7 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     bridges = GetBridges(mappings, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, cov_probs, prob_factor, min_mapping_length, min_distance_tolerance, rel_distance_tolerance, prematurity_threshold, max_dist_contig_end, pdf)
 #
     print( str(timedelta(seconds=clock())), "Scaffold the contigs")
-    scaffold_paths = ScaffoldContigs(contig_parts, bridges, mappings, ploidy, max_loop_units)
+    scaffold_paths = ScaffoldContigs(contig_parts, bridges, mappings, cov_probs, prob_factor, min_mapping_length, ploidy, max_loop_units)
 #
     print( str(timedelta(seconds=clock())), "Fill gaps")
     mappings, scaffold_paths = MapReadsToScaffolds(mappings, scaffold_paths, bridges, ploidy) # Might break apart scaffolds again, if we cannot find a mapping read for a connection
