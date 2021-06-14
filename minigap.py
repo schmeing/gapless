@@ -690,9 +690,20 @@ def CallAllBreaksSpurious(mappings, contigs, max_dist_contig_end, min_length_con
 
     return break_groups, spurious_break_indexes, non_informative_mappings
 
+def CalculateReadExtensionAfterMappingEnd(cur_mappings):
+    cur_mappings['q_left'] = cur_mappings['q_start'] - cur_mappings['read_start']
+    cur_mappings['q_right'] = cur_mappings['read_end'] - cur_mappings['q_end']
+    cur_mappings.loc[cur_mappings['strand'] == '-', ['q_left','q_right']] = cur_mappings.loc[cur_mappings['strand'] == '-', ['q_right','q_left']].values # Switch the values in case of negative strand, so that they represent the extension on the left/right side of the break after mapping ends
+    cur_mappings['q_right'] = cur_mappings['q_right'].astype(int) # No clue why it switches from int to float in the previous command, cannot detect something that is going wrong
+#
+    return cur_mappings
+
 def PreparePotBreakPoints(pot_breaks, max_break_point_distance, min_mapping_length, min_num_reads):
-    break_points = pot_breaks[['contig_id','side','position','mapq','map_len','map_index']].copy()
+    break_points = pot_breaks[['contig_id','side','position','mapq','map_len','map_index','q_start','read_start','q_end','read_end','strand']].copy()
     break_points['connected'] = 0 <= pot_breaks['con']
+    break_points = CalculateReadExtensionAfterMappingEnd(break_points)
+    break_points['ext_len'] = np.where(break_points['side'] == 'l', break_points['q_left'], break_points['q_right']) + break_points['map_len']
+    break_points.drop(columns=['q_start','q_end','strand','read_start','read_end','q_left','q_right'], inplace=True)
     break_points = break_points[ break_points['map_len'] >= min_mapping_length+max_break_point_distance ].copy() # require half the mapping length for breaks as we will later require for continuously mapping reads that veto breaks, since breaking reads only map on one side
     break_points.sort_values(['contig_id','position','mapq'], ascending=[True,True,False], inplace=True)
     if min_num_reads > 1:
@@ -701,7 +712,7 @@ def PreparePotBreakPoints(pot_breaks, max_break_point_distance, min_mapping_leng
     break_points.reset_index(drop=True,inplace=True)
     break_points['bindex'] = break_points.index.values
     bp_map_len = break_points.drop(columns=['connected','mapq'])
-    break_points.drop(columns=['map_len','map_index'], inplace=True)
+    break_points.drop(columns=['map_len','map_index','ext_len'], inplace=True)
 #
     return break_points, bp_map_len
 
@@ -785,7 +796,11 @@ def CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_map_len, cov_
         break_pos = break_points[['contig_id','position']].drop_duplicates()
         break_pos['merge_block'] = break_pos['position'] // merge_block_length
         break_pos['num'] = break_pos.groupby(['contig_id','merge_block'], sort=False).cumcount()
-        tmp_mappings = mappings.loc[ np.isin(mappings['t_id'], break_pos['contig_id'].values) & (mappings['t_end'] - mappings['t_start'] >= 2*min_mapping_length + 2*max_break_point_distance), ['t_id','t_start','t_end','mapq'] ].copy() # Do not consider mappings that cannot fullfil veto requirements because they are too short
+        tmp_mappings = mappings.loc[ np.isin(mappings['t_id'], break_pos['contig_id'].values) & (mappings['t_end'] - mappings['t_start'] >= 2*min_mapping_length + 2*max_break_point_distance), ['t_id','t_start','t_end','mapq','q_start','q_end','strand','read_start','read_end'] ].copy() # Do not consider mappings that cannot fullfil veto requirements because they are too short
+        tmp_mappings = CalculateReadExtensionAfterMappingEnd(tmp_mappings)
+        tmp_mappings.drop(columns=['q_start','q_end','strand','read_start','read_end'], inplace=True)
+        tmp_mappings['q_left'] = tmp_mappings['t_start'] - tmp_mappings['q_left']  # Set them on the contig scale, so we can later treat them like t_start and t_end
+        tmp_mappings['q_right'] += tmp_mappings['t_end']
         tmp_mappings = tmp_mappings.loc[ np.repeat( tmp_mappings.index.values, tmp_mappings['t_end']//merge_block_length - tmp_mappings['t_start']//merge_block_length + 1 ) ].copy()
         tmp_mappings['merge_block'] = tmp_mappings.reset_index().groupby(['index']).cumcount().values + tmp_mappings['t_start']//merge_block_length
         tmp_mappings.rename(columns={'t_id':'contig_id'}, inplace=True)
@@ -799,7 +814,7 @@ def CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_map_len, cov_
             tmp_breaks = tmp_breaks[(tmp_breaks['t_start']+min_mapping_length+max_break_point_distance <= tmp_breaks['position']) &
                                     (tmp_breaks['t_end']-min_mapping_length-max_break_point_distance >= tmp_breaks['position'])].copy()
             break_list.append( tmp_breaks.groupby(['contig_id','position','mapq']).size().reset_index(name='vetos') )
-            veto_map_len.append( tmp_breaks.groupby(['contig_id','position']).agg({'t_start':'min', 't_end':'max', 'mapq':'size'}).reset_index().rename(columns={'mapq':'count'}) )
+            veto_map_len.append( tmp_breaks.groupby(['contig_id','position']).agg({'t_start':'min', 't_end':'max', 'q_left':'min', 'q_right':'max', 'mapq':'size'}).reset_index().rename(columns={'mapq':'count'}) )
         break_points = break_points.merge(pd.concat(break_list, ignore_index=True), on=['contig_id','position','mapq'], how='outer').fillna(0)
         break_points.sort_values(['contig_id','position','mapq'], ascending=[True,True,False], inplace=True)
         break_points.reset_index(inplace=True, drop=True)
@@ -810,7 +825,6 @@ def CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_map_len, cov_
         # Find vetos that potentially have premature stops
         veto_map_len = pd.concat(veto_map_len, ignore_index=True)
         veto_map_len['t_len'] = veto_map_len[['contig_id']].merge(pot_breaks[['contig_id','t_len']].drop_duplicates(), on=['contig_id'], how='left')['t_len'].values
-        veto_map_len = veto_map_len[(veto_map_len['t_start'] > max_dist_contig_end) | (veto_map_len['t_end'] < veto_map_len['t_len']-max_dist_contig_end)].copy()
         veto_map_len.loc[veto_map_len['t_start'] <= max_dist_contig_end, 't_start'] = 0 # Disable the sides that are within max_dist_contig_end from and end, so that they are not considered a premature stop
         veto_map_len['t_end'] = np.where(veto_map_len['t_end'] < veto_map_len['t_len']-max_dist_contig_end, veto_map_len['t_end'], veto_map_len['t_len'])
         veto_map_len[['ifrom','ito']] = veto_map_len[['contig_id','position']].merge(break_points.groupby(['contig_id','position'])[['ifrom','ito']].max().reset_index(), on=['contig_id','position'], how='left')[['ifrom','ito']].values
@@ -822,21 +836,24 @@ def CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_map_len, cov_
             break_map_len = break_map_len.merge(bp_map_len, on=['bindex'], how='left')
             break_map_len['bstart'] = break_map_len['position'] - np.where(break_map_len['side'] == 'l', break_map_len['map_len'], 0)
             break_map_len['bend'] = break_map_len['position'] + np.where(break_map_len['side'] == 'r', break_map_len['map_len'], 0)
-            break_map_len = break_map_len[['ifrom','ito','bstart','bend','side']].copy()
+            break_map_len['bstart2'] = break_map_len['position'] - np.where(break_map_len['side'] == 'l', break_map_len['ext_len'], 0)
+            break_map_len['bend2'] = break_map_len['position'] + np.where(break_map_len['side'] == 'r', break_map_len['ext_len'], 0)
+            break_map_len = break_map_len[['ifrom','ito','bstart','bend','bstart2','bend2','side']].copy()
             # Only keep break positions where the breaks map longer than the veto
-            veto_map_len[['bstart','bend']] = veto_map_len[['ifrom','ito']].merge(break_map_len.groupby(['ifrom','ito']).agg({'bstart':'min', 'bend':'max'}).reset_index(), on=['ifrom','ito'], how='left')[['bstart','bend']].values
-            veto_map_len = veto_map_len[(veto_map_len['bstart'] < veto_map_len['t_start']) | (veto_map_len['t_end'] < veto_map_len['bend'])].copy()
+            veto_map_len[['bstart','bend','bstart2','bend2']] = veto_map_len[['ifrom','ito']].merge(break_map_len.groupby(['ifrom','ito']).agg({'bstart':'min', 'bend':'max', 'bstart2':'min', 'bend2':'max'}).reset_index(), on=['ifrom','ito'], how='left')[['bstart','bend','bstart2','bend2']].values
+            veto_map_len = veto_map_len[(veto_map_len['bstart'] < veto_map_len['t_start']) | (veto_map_len['t_end'] < veto_map_len['bend']) | (veto_map_len['bstart2'] < veto_map_len['q_left']) | (veto_map_len['q_right'] < veto_map_len['bend2'])].copy()
         if len(veto_map_len):
             # Count how many breaks are longer than the vetos and check if this is likely due to chance
-            break_map_len = veto_map_len[['contig_id','position','t_start','t_end','ifrom','ito']].merge(break_map_len, on=['ifrom','ito'], how='left')
+            break_map_len = veto_map_len[['contig_id','position','t_start','t_end','q_left','q_right','ifrom','ito']].merge(break_map_len, on=['ifrom','ito'], how='left')
             break_map_len['longer'] = np.where(break_map_len['side'] == 'r', break_map_len['bend'] > break_map_len['t_end'], break_map_len['t_start'] > break_map_len['bstart'])
+            break_map_len['longer2'] = np.where(break_map_len['side'] == 'r', break_map_len['bend2'] > break_map_len['q_right'], break_map_len['q_left'] > break_map_len['bstart2'])
             for s in ['l','r']:
-                veto_map_len[[f'{s}bcount',f'{s}blonger']] = veto_map_len[['contig_id','position']].merge(break_map_len[break_map_len['side'] == s].groupby(['contig_id','position'])['longer'].agg(['size','sum']).reset_index(), on=['contig_id','position'], how='left')[['size','sum']].fillna(0).astype(int).values
-                veto_map_len.loc[veto_map_len[f'{s}bcount'] < min_num_reads, f'{s}blonger'] = 0 # Filter out cases that not exceed min_num_reads
-            veto_map_len = veto_map_len[(veto_map_len['lbcount'] >= min_num_reads) | (veto_map_len['rbcount'] >= min_num_reads)].copy()
+                veto_map_len[[f'{s}bcount',f'{s}blonger',f'{s}blonger2']] = veto_map_len[['contig_id','position']].merge(break_map_len[break_map_len['side'] == s].groupby(['contig_id','position']).agg({'side':'size','longer':'sum','longer2':'sum'}).reset_index(), on=['contig_id','position'], how='left')[['side','longer','longer2']].fillna(0).astype(int).values
+                veto_map_len.loc[veto_map_len[f'{s}bcount'] < min_num_reads, [f'{s}blonger',f'{s}blonger2']] = 0 # Filter out cases that not exceed min_num_reads
+            veto_map_len = veto_map_len[veto_map_len[['lblonger','lblonger2','rblonger','rblonger2']].sum(axis=1) > 0].copy()
         if len(veto_map_len):
             for s in ['l','r']:
-                veto_map_len[f'{s}broken_veto_prob'] = GetPrematureStopProb(veto_map_len['count'].values, veto_map_len[f'{s}bcount'].values, veto_map_len[f'{s}blonger'].values)
+                veto_map_len[f'{s}broken_veto_prob'] = GetPrematureStopProb(veto_map_len['count'].values, veto_map_len[f'{s}bcount'].values, np.maximum(veto_map_len[f'{s}blonger'].values, veto_map_len[f'{s}blonger2'].values))
             veto_map_len = veto_map_len[np.minimum(veto_map_len['lbroken_veto_prob'], veto_map_len['rbroken_veto_prob']) <= prematurity_threshold].copy()
         if len(veto_map_len) == 0:
             break_points[['lg_broken_veto','rg_broken_veto']] = -1
@@ -975,7 +992,7 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
                                                       | ( (pot_breaks['side'] == 'r') & (breaks['start'].values <= pot_breaks['position'].values) & (pot_breaks['position'].values <= breaks['pos'].values + max_dist_contig_end) ) )
             pot_breaks['self'] = pot_breaks['self'] & ( ((pot_breaks['position'].values < breaks['pos'].values + np.where((pot_breaks['side'] == 'l'), 1, -1)*min_mapping_length) & (pot_breaks['con_pos'].values < breaks['pos'].values + np.where((pot_breaks['side'] == 'l'), -1, 1)*min_mapping_length)) |
                                                         ((pot_breaks['position'].values > breaks['pos'].values + np.where((pot_breaks['side'] == 'l'), 1, -1)*min_mapping_length) & (pot_breaks['con_pos'].values > breaks['pos'].values + np.where((pot_breaks['side'] == 'l'), -1, 1)*min_mapping_length)) )
-
+#
         # A read is only correct in between two valid breaks/contig ends if all breaks in that region connect to another position inside that region (or has no breaks at all if allow_same_contig_breaks==False)
         pot_breaks.sort_values(['q_name','q_start','q_end','read_pos'], inplace=True)
         pot_breaks['group_id'] = ( (pot_breaks['q_name'] != pot_breaks['q_name'].shift(1)) | (pot_breaks['read_start'] != pot_breaks['read_start'].shift(1)) |
@@ -986,13 +1003,13 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
         self_con = pot_breaks.groupby(['group_id'])['self'].agg(['sum','size']).reset_index()
         self_con = np.unique(self_con.loc[self_con['sum'] == self_con['size'], ['group_id']].values)
         pot_breaks['keep'] = np.isin(pot_breaks['group_id'], self_con)
-
+#
         # Mappings not belonging to accepted breaks or connecting to itself are spurious
         spurious_break_indexes = pot_breaks.loc[pot_breaks['keep'] == False, ['map_index','q_name','read_side','q_start','q_end']].drop_duplicates()
     else:
         # We don't have breaks, so all are spurious
         spurious_break_indexes = pot_breaks[['map_index','q_name','read_side','q_start','q_end']].drop_duplicates()
-
+#
     non_informative_mappings = GetNonInformativeMappings(mappings, contigs, min_extension, break_groups, pot_breaks)
 #
     # Filter unconnected break points that overlap a break_group (probably from vetoed low mapping qualities, where the high mapping quality was not vetoed)
@@ -1347,38 +1364,46 @@ def FilterBridges(bridges, bridge_maplen, borderline_removal, min_factor_alterna
     bridges = bridges[bridges['low_q'] == False].copy()
     bridges.drop(columns=['low_q'], inplace=True)
     
-    # Get longest mapping for every bridge and summarise that for every starting conting end
-    maplen_sum = bridge_maplen.groupby(['from','from_side','to','to_side','mean_dist']).agg({'from_maplen':'max','from_atend':'max','to_maplen':'max','to_atend':'max', 'distance':'size'}).reset_index().rename(columns={'distance':'counts'})
-    maplen_sum = maplen_sum.merge(bridges[['from','from_side','to','to_side','mean_dist']].drop_duplicates(), on=['from','from_side','to','to_side','mean_dist'], how='inner') # Remove already filtered bridges
-    max_maplen = maplen_sum.groupby(['from','from_side']).agg({'from_maplen':'max', 'from_atend':'min', 'to_maplen':'max', 'to_atend':'min'}).reset_index()
-    
-    # Set premature flag for all bridges that are likely ending prematurely compared to the longest mapping, conflicting bridge (for the bridge side on the same contig (from) and the other side, where contigs can be different (to))
-    for e in ['from','to']:
-        cur_maplen = maplen_sum[['from','from_side','to','to_side','mean_dist',f'{e}_maplen',f'{e}_atend','counts']].merge(max_maplen.loc[max_maplen[f'{e}_atend'] == False, ['from','from_side',f'{e}_maplen']].rename(columns={f'{e}_maplen':'max_maplen'}), on=['from','from_side'], how='inner') # Bridges where all alternatives reach the end do not need to be handled
-        cur_maplen.rename(columns={f'{e}_maplen':'maplen'}, inplace=True)
-        cur_max = cur_maplen.loc[cur_maplen['maplen'] == cur_maplen['max_maplen'], ['from','from_side','to','to_side','mean_dist', 'counts']].copy()
-        cur_maplen = cur_maplen[(cur_maplen[f'{e}_atend'] == False) & (cur_maplen['maplen'] < cur_maplen['max_maplen'])].drop(columns=[f'{e}_atend','max_maplen']) # If the bridge maps till the other end of the contig or has the longest mapping it cannot end prematurely
-        gaplen = bridge_maplen[['from','from_side','to','to_side','mean_dist',f'{e}_maplen',f'{e}_gaplen']].rename(columns={f'{e}_maplen':'maplen',f'{e}_gaplen':'gaplen'}).merge(cur_maplen[['from','from_side','to','to_side','mean_dist','maplen']].reset_index(), on=['from','from_side','to','to_side','mean_dist','maplen'], how='inner')
-        gaplen = gaplen.groupby(['index'])['gaplen'].max().reset_index()
-        cur_maplen.loc[gaplen['index'].values, 'gaplen'] = gaplen['gaplen'].values
-        cur_maplen.rename(columns={col:f'test_{col}' for col in ['to','to_side','mean_dist','counts']}, inplace=True)
-        cur_maplen = cur_maplen.merge(cur_max, on=['from','from_side'], how='left') # If multiple longest mapping exist test against all of them
-        longer_mappings = cur_maplen[['from','from_side','to','to_side','mean_dist','maplen','gaplen']].drop_duplicates().merge(bridge_maplen[['from','from_side','to','to_side','mean_dist',f'{e}_maplen',f'{e}_gaplen']], on=['from','from_side','to','to_side','mean_dist'], how='left')
-        longer_mappings = longer_mappings[longer_mappings['maplen'] + np.maximum(0, longer_mappings['gaplen']-longer_mappings[f'{e}_gaplen']) < longer_mappings[f'{e}_maplen']].groupby(['from','from_side','to','to_side','mean_dist','maplen','gaplen']).size().reset_index(name='longer')
-        cur_maplen['longer'] = cur_maplen[['from','from_side','to','to_side','mean_dist','maplen','gaplen']].merge(longer_mappings, on=['from','from_side','to','to_side','mean_dist','maplen','gaplen'], how='left')['longer'].fillna(0).astype(int)
-        cur_maplen.drop(columns=['maplen','gaplen','to','to_side','mean_dist'], inplace=True)
-        cur_maplen['premat_prob'] = GetPrematureStopProb(cur_maplen['test_counts'], cur_maplen['counts'], cur_maplen['longer'])
-        cur_maplen = cur_maplen[cur_maplen['premat_prob'] <= prematurity_threshold].drop(columns=['test_counts','counts','longer','premat_prob'])
-        cur_maplen.drop_duplicates(inplace=True) # Since we tested against all longest mappings, some might have been rejected multiple times
-        cur_maplen.rename(columns={f'test_{col}':col for col in ['to','to_side','mean_dist']}, inplace=True)
-        cur_maplen['premature'] = True
-        bridges['same_premature' if e == 'from' else 'diff_premature'] = ( bridges[['from','from_side','to','to_side','mean_dist']].merge(cur_maplen, on=['from','from_side','to','to_side','mean_dist'], how='left')['premature'].fillna(False).values |
-                                                                           bridges[['from','from_side','to','to_side','mean_dist']].merge(cur_maplen.rename(columns={'from':'to','to':'from','from_side':'to_side','to_side':'from_side'}), on=['from','from_side','to','to_side','mean_dist'], how='left')['premature'].fillna(False).values )
-
+    # Check for prematurely ending bridges first with mapping length and then with read length after the gap (extension length)
+    for c in ['maplen','extlen']:
+    #for c in ['maplen']:
+        # Get longest mapping for every bridge and summarise that for every starting conting end
+        maplen_sum = bridge_maplen.groupby(['from','from_side','to','to_side','mean_dist']).agg({f'from_{c}':'max','from_atend':'max',f'to_{c}':'max','to_atend':'max', 'distance':'size'}).reset_index().rename(columns={'distance':'counts'})
+        maplen_sum = maplen_sum.merge(bridges[['from','from_side','to','to_side','mean_dist']].drop_duplicates(), on=['from','from_side','to','to_side','mean_dist'], how='inner') # Remove already filtered bridges
+        max_maplen = maplen_sum.groupby(['from','from_side']).agg({f'from_{c}':'max', 'from_atend':'min', f'to_{c}':'max', 'to_atend':'min'}).reset_index()
+        if c == 'extlen':
+            maplen_sum[['from_atend','to_atend']] = False
+            max_maplen[['from_atend','to_atend']] = False # Disable this check for the extension length, because we do the extension length check precisely to test bridges that cannot be tested with mapping length due to the contig length limitation
+#
+        # Get probability that they do not end prematurely for all bridges compared to the longest mapping/extension, conflicting bridge (for the bridge side on the same contig (from) and the other side, where contigs can be different (to))
+        for e in ['from','to']:
+            cur_maplen = maplen_sum[['from','from_side','to','to_side','mean_dist',f'{e}_{c}',f'{e}_atend','counts']].merge(max_maplen.loc[max_maplen[f'{e}_atend'] == False, ['from','from_side',f'{e}_{c}']].rename(columns={f'{e}_{c}':f'max_{c}'}), on=['from','from_side'], how='inner') # Bridges where all alternatives reach the end do not need to be handled
+            cur_maplen.rename(columns={f'{e}_{c}':c}, inplace=True)
+            cur_max = cur_maplen.loc[cur_maplen[c] == cur_maplen[f'max_{c}'], ['from','from_side','to','to_side','mean_dist', 'counts']].copy()
+            cur_maplen = cur_maplen[(cur_maplen[f'{e}_atend'] == False) & (cur_maplen[c] < cur_maplen[f'max_{c}'])].drop(columns=[f'{e}_atend',f'max_{c}']) # If the bridge maps till the other end of the contig or has the longest mapping it cannot end prematurely
+            gaplen = bridge_maplen[['from','from_side','to','to_side','mean_dist',f'{e}_{c}',f'{e}_gaplen']].rename(columns={f'{e}_{c}':c,f'{e}_gaplen':'gaplen'}).merge(cur_maplen[['from','from_side','to','to_side','mean_dist',c]].reset_index(), on=['from','from_side','to','to_side','mean_dist',c], how='inner')
+            gaplen = gaplen.groupby(['index'])['gaplen'].max().reset_index()
+            cur_maplen.loc[gaplen['index'].values, 'gaplen'] = gaplen['gaplen'].values
+            cur_maplen.rename(columns={col:f'test_{col}' for col in ['to','to_side','mean_dist','counts']}, inplace=True)
+            cur_maplen = cur_maplen.merge(cur_max, on=['from','from_side'], how='left') # If multiple longest mapping exist test against all of them
+            longer_mappings = cur_maplen[['from','from_side','to','to_side','mean_dist',c,'gaplen']].drop_duplicates().merge(bridge_maplen[['from','from_side','to','to_side','mean_dist',f'{e}_{c}',f'{e}_gaplen']], on=['from','from_side','to','to_side','mean_dist'], how='left')
+            longer_mappings = longer_mappings[longer_mappings[c] + np.maximum(0, longer_mappings['gaplen']-longer_mappings[f'{e}_gaplen']) < longer_mappings[f'{e}_{c}']].groupby(['from','from_side','to','to_side','mean_dist',c,'gaplen']).size().reset_index(name='longer')
+            cur_maplen['longer'] = cur_maplen[['from','from_side','to','to_side','mean_dist',c,'gaplen']].merge(longer_mappings, on=['from','from_side','to','to_side','mean_dist',c,'gaplen'], how='left')['longer'].fillna(0).astype(int)
+            cur_maplen.drop(columns=[c,'gaplen','to','to_side','mean_dist'], inplace=True)
+            cur_maplen['premat_prob'] = GetPrematureStopProb(cur_maplen['test_counts'], cur_maplen['counts'], cur_maplen['longer'])
+            cur_maplen = cur_maplen.groupby(['from','from_side','test_to','test_to_side','test_mean_dist'])['premat_prob'].min().reset_index()  # Since we tested against all longest mappings, take the lowest probability
+            cur_maplen.rename(columns={f'test_{col}':col for col in ['to','to_side','mean_dist']}, inplace=True)
+            bridges[f'same_from_{c}_premat' if e == 'from' else f'diff_from_{c}_premat'] = bridges[['from','from_side','to','to_side','mean_dist']].merge(cur_maplen, on=['from','from_side','to','to_side','mean_dist'], how='left')['premat_prob'].fillna(1.0).values
+            bridges[f'same_to_{c}_premat' if e == 'from' else f'diff_to_{c}_premat'] = bridges[['from','from_side','to','to_side','mean_dist']].merge(cur_maplen.rename(columns={'from':'to','to':'from','from_side':'to_side','to_side':'from_side'}), on=['from','from_side','to','to_side','mean_dist'], how='left')['premat_prob'].fillna(1.0).values
+#
     # Remove prematurely ending bridges
-    bridges = bridges[(bridges['same_premature'] == False) & (bridges['diff_premature'] == False)].copy()
-    bridges.drop(columns=['same_premature','diff_premature'], inplace=True)
-
+    bridges['premat_prob'] = bridges[['same_from_extlen_premat','same_to_extlen_premat','diff_from_extlen_premat','diff_to_extlen_premat','same_from_maplen_premat','same_to_maplen_premat','diff_from_maplen_premat','diff_to_maplen_premat']].min(axis=1)
+    bridges.drop(columns=['same_from_extlen_premat','same_to_extlen_premat','diff_from_extlen_premat','diff_to_extlen_premat','same_from_maplen_premat','same_to_maplen_premat','diff_from_maplen_premat','diff_to_maplen_premat'], inplace=True)
+    bridges['not_premat'] = bridges['premat_prob'] > prematurity_threshold
+    bridges[['max_premat_from','not_premat_from']] = bridges[['from','from_side']].merge(bridges.groupby(['from','from_side']).agg({'premat_prob':'max','not_premat':'sum'}).reset_index(), on=['from','from_side'], how='left')[['premat_prob','not_premat']].values
+    bridges[['max_premat_to','not_premat_to']] = bridges[['to','to_side']].merge(bridges.groupby(['to','to_side']).agg({'premat_prob':'max','not_premat':'sum'}).reset_index(), on=['to','to_side'], how='left')[['premat_prob','not_premat']].values
+    bridges = bridges[bridges['not_premat'] | ((bridges['not_premat_from'] == 0) & (bridges['not_premat_to'] == 0) & ((bridges['premat_prob'] == bridges['max_premat_from']) | (bridges['premat_prob'] == bridges['max_premat_to'])))].drop(columns=['premat_prob','max_premat_from','not_premat','not_premat_from','max_premat_to','not_premat_to'])
+#
     # Set highq flags for the most likely bridges and the ones within prob_factor of the most likely
     bridges['probability'] = GetConProb(cov_probs, np.where(0 <= bridges['mean_dist'], bridges['mean_dist']+2*min_mapping_length, min_mapping_length+np.maximum(min_mapping_length,-bridges['mean_dist'])), bridges['cumcount'])
     bridges.sort_values(['to','to_side','mapq'], inplace=True)
@@ -1388,11 +1413,11 @@ def FilterBridges(bridges, bridge_maplen, borderline_removal, min_factor_alterna
     alternatives = bridges.groupby(['from','from_side','mapq'], sort=False)['probability'].agg(['max','size'])
     bridges['from_max_prob'] = np.repeat(alternatives['max'].values, alternatives['size'].values)
     bridges['highq'] = ((bridges['probability']*prob_factor >= bridges['from_max_prob']) & (bridges['probability']*prob_factor >= bridges['to_max_prob']))
-
+#
     # Only keep high quality bridges
     bridges = bridges[bridges['highq']].copy()
     bridges.drop(columns=['highq','from_max_prob','to_max_prob'], inplace=True)
-
+#
     # Remove bridges that compete with a bridge with a higher trust level
     bridges.sort_values(['from','from_side','mapq'], ascending=[True, True, False], inplace=True)
     bridges['max_mapq'] = bridges.groupby(['from','from_side'], sort=False)['mapq'].cummax()
@@ -1400,7 +1425,7 @@ def FilterBridges(bridges, bridge_maplen, borderline_removal, min_factor_alterna
     bridges['max_mapq2'] = bridges.groupby(['to','to_side'], sort=False)['mapq'].cummax()
     bridges = bridges[np.maximum(bridges['max_mapq'], bridges['max_mapq2']) <= bridges['mapq']].copy()
     bridges.drop(columns=['max_mapq','max_mapq2'], inplace=True)
-
+#
     if "full" == org_scaffold_trust:
         # Remove ambiguous bridges that compeat with the original scaffold
         bridges.sort_values(['from','from_side','to','to_side'], inplace=True)
@@ -1410,35 +1435,39 @@ def FilterBridges(bridges, bridge_maplen, borderline_removal, min_factor_alterna
         org_scaffolds = bridges.groupby(['to','to_side'], sort=False)['org_scaffold'].agg(['size','sum'])
         bridges['org_to'] = np.repeat(org_scaffolds['sum'].values, org_scaffolds['size'].values)
         bridges = bridges[ bridges['org_scaffold'] | ((0 == bridges['org_from']) & (0 == bridges['org_to'])) ].copy()
-
+#
     # Count alternatives
     bridges.drop(columns=['org_scaffold'], inplace=True)
     bridges = CountAlternatives(bridges)
     bridges['from'] = bridges['from'].astype(int)
     bridges['to'] = bridges['to'].astype(int)
     bridges.rename(columns={'cumcount':'bcount'}, inplace=True)
-
+#
     return bridges
 
 def GetBridges(mappings, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, cov_probs, prob_factor, min_mapping_length, min_distance_tolerance, rel_distance_tolerance, prematurity_threshold, max_dist_contig_end, pdf):
     # Get bridges
     for s in ['left','right']:
-        cur_bridge = mappings.loc[mappings[f'{s}_con'] >= 0, ['conpart',f'{s}_con',f'{s}_con_side',f'{s}_con_dist','mapq','con_from','con_to']].copy()
+        cur_bridge = mappings.loc[mappings[f'{s}_con'] >= 0, ['conpart',f'{s}_con',f'{s}_con_side',f'{s}_con_dist','mapq','con_from','con_to','read_start','read_end','read_from','read_to','strand']].copy()
         cur_bridge.rename(columns={'conpart':'from',f'{s}_con':'to',f'{s}_con_side':'to_side','mapq':'from_mapq',f'{s}_con_dist':'distance'}, inplace=True)
         cur_bridge['from_side'] = s[0]
         cur_bridge['to_mapq'] = np.where(('+' if s == 'left' else '-') == mappings['strand'], mappings['mapq'].shift(1, fill_value = -1), mappings['mapq'].shift(-1, fill_value = -1))[mappings[f'{s}_con'] >= 0]
         cur_bridge['mapq'] = np.where(cur_bridge['to_mapq'] < cur_bridge['from_mapq'], cur_bridge['to_mapq'].astype(int)*1000+cur_bridge['from_mapq'], cur_bridge['from_mapq'].astype(int)*1000+cur_bridge['to_mapq'])
         cur_bridge.drop(columns=['from_mapq','to_mapq'], inplace=True)
         for e in ['from','to']:
+            # Get maplen, gaplen, atend
             cur_bridge[f'{e}_maplen'] = cur_bridge['con_to'] - cur_bridge['con_from']
             cur_bridge['con_from'] -= contig_parts.loc[cur_bridge[e].values, 'start'].values
             cur_bridge['con_to'] = contig_parts.loc[cur_bridge[e].values, 'end'].values - cur_bridge['con_to']
             cur_bridge[f'{e}_gaplen'] = np.where(cur_bridge['distance'] >= 0, cur_bridge['distance']+min_mapping_length, np.maximum(-cur_bridge['distance'], min_mapping_length)) - np.where(cur_bridge[f'{e}_side'] == 'l', cur_bridge['con_from'], cur_bridge['con_to'])
             cur_bridge[f'{e}_atend'] = np.where(cur_bridge[f'{e}_side'] == 'l', cur_bridge['con_to'], cur_bridge['con_from']) <= max_dist_contig_end
+            # Get extlen
+            cur_bridge[f'{e}_extlen'] = np.where((cur_bridge[f'{e}_side'] == 'l') == (cur_bridge['strand'] == '+'), cur_bridge['read_end']-cur_bridge['read_to'], cur_bridge['read_from']-cur_bridge['read_start']) + cur_bridge[f'{e}_maplen']
+            # Prepare to side
             if e == 'from':
-                cur_bridge[['con_from','con_to']] = np.where(('+' if s == 'left' else '-') == mappings[['strand','strand']].values, mappings[['con_from','con_to']].shift(1, fill_value = -1).values, mappings[['con_from','con_to']].shift(-1, fill_value = -1).values)[mappings[f'{s}_con'].values >= 0]
+                cur_bridge[['con_from','con_to','read_start','read_end','read_from','read_to','strand']] = np.where(('+' if s == 'left' else '-') == mappings[['strand','strand','strand','strand','strand','strand','strand']].values, mappings[['con_from','con_to','read_start','read_end','read_from','read_to','strand']].shift(1, fill_value = -1).values, mappings[['con_from','con_to','read_start','read_end','read_from','read_to','strand']].shift(-1, fill_value = -1).values)[mappings[f'{s}_con'].values >= 0]
             else:
-                cur_bridge.drop(columns=['con_from','con_to'], inplace=True)
+                cur_bridge.drop(columns=['con_from','con_to','read_start','read_end','read_from','read_to','strand'], inplace=True)
         if s == 'left':
             left_bridge = cur_bridge[['from','from_side','to','to_side','distance','mapq']].copy()
             bridge_maplen = cur_bridge.drop(columns=['mapq'])
@@ -4520,9 +4549,11 @@ def GetDeduplicatedHaplotypesAtPathEnds(path_sides, scaffold_paths, scaffold_gra
                 vpaths.rename(columns={'scaf0':'from','strand0':'from_side'}, inplace=True)
                 vpaths['from_side'] = np.where(vpaths['from_side'] == '+', 'r', 'l')
                 vpaths['slen'] = -1
-                for l in np.unique(vpaths['length']):
+                for l in range(2,vpaths['length'].max()+1):
+                    vpaths['slen2'] = np.nan
                     mcols = ['from','from_side']+[f'{n}{s}' for s in range(1,l) for n in ['scaf','strand','dist']]
-                    vpaths.loc[vpaths['length'] == l, 'slen'] = vpaths.loc[vpaths['length'] == l, mcols].merge(scaffold_graph.groupby(mcols)['length'].max().reset_index(), on=mcols, how='left')['length'].values
+                    vpaths.loc[vpaths['length'] >= l, 'slen2'] = vpaths.loc[vpaths['length'] >= l, mcols].merge(scaffold_graph.groupby(mcols)['length'].max().reset_index(), on=mcols, how='left')['length'].values
+                    vpaths.loc[np.isnan(vpaths['slen2']) == False, 'slen'] = vpaths.loc[np.isnan(vpaths['slen2']) == False, 'slen2']
                 cur_dedups = cur_dedups.merge(vpaths.loc[vpaths['length'] < np.maximum(vpaths['slen'],vpaths['matches']+1), ['pid','side','matches']].drop_duplicates(), on=['pid','side','matches'], how='inner')
             # Store the haplotypes that are different to all other haplotypes
             dedup_haps.append(cur_dedups)
