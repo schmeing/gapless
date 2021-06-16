@@ -289,138 +289,14 @@ def PlotXY(pdf, xtitle, ytitle, x, y, category=[], count=[], logx=False, linex=[
 
     return
 
-def MaskRepeatEnds(contigs, repeat_file, contig_ids, max_repeat_extension, min_len_repeat_connection, repeat_len_factor_unique, remove_duplicated_contigs, pdf):
-    # Read in minimap 2 repeat table (.paf)
-    repeat_table = ReadPaf(repeat_file)
-    
-    repeat_table = repeat_table[(repeat_table['q_name'] != repeat_table['t_name']) | (repeat_table['q_start'] != repeat_table['t_start'])].copy()  # Ignore repeats on same contig and same position
-     
-    if pdf and len(repeat_table):
-        tmp_dist = np.minimum(repeat_table['q_start'], repeat_table['q_len']-repeat_table['q_end']) # Repeat distance to contig end
-        PlotHist(pdf, "Repeat distance to contig end", "# Repeat mappings", tmp_dist, logx=True, threshold=max_repeat_extension)
-        if np.sum(tmp_dist < 10*max_repeat_extension):
-            PlotHist(pdf, "Repeat distance to contig end", "# Repeat mappings", np.extract(tmp_dist < 10*max_repeat_extension, tmp_dist), threshold=max_repeat_extension)
-
-    # We can do everything on query as all mappings are also reversed in the table
-    # Check if the repeat belongs to a contig end
-    repeat_table['left_repeat'] = repeat_table['q_start'] <= max_repeat_extension
-    repeat_table['right_repeat'] = repeat_table['q_len'] - repeat_table['q_end'] <= max_repeat_extension
-    
-    repeat_table['q_id'] = itemgetter(*repeat_table['q_name'])(contig_ids)
-    repeat_table['t_id'] = itemgetter(*repeat_table['t_name'])(contig_ids)
-    
-    contigs['repeat_mask_left'] = int(0)
-    contigs['repeat_mask_right'] = contigs['length']
-    contigs['remove'] = False
-    
-    # Complete duplicate -> Schedule for removal
-    # If the target is also a complete duplicate, keep the longer one or at same length decide by name
-    complete_repeats = np.unique(repeat_table.loc[repeat_table['left_repeat'] & repeat_table['right_repeat'] &
-             ((repeat_table['t_start'] > max_repeat_extension) |
-              (repeat_table['q_len'] - repeat_table['q_end'] > max_repeat_extension) |
-              (repeat_table['t_len'] > repeat_table['q_len']) |
-              ((repeat_table['t_len'] == repeat_table['q_len']) & (repeat_table['t_name'] < repeat_table['q_name']))), 'q_id'])
-    if remove_duplicated_contigs:
-        contigs.iloc[complete_repeats, contigs.columns.get_loc('remove')] = True
-    
-    ## Handle complete repeats, complexity contigs and tandem repeats
-    # Remove the complete_repeats from the repeat table, as the repeat won't exist anymore after the removal of the contigs (sp we don't want to count those contigs for repeats in other contigs)
-    repeat_table = repeat_table[np.logical_not(np.isin(repeat_table['q_id'], complete_repeats)) & np.logical_not(np.isin(repeat_table['t_id'], complete_repeats))].copy()
-    
-    # Add low complexity contigs and tandem repeats to complete_repeats, where you get a similar sequence when shifting the frame a bit
-    # We want to keep them as they are no duplications but don't do anything with them afterwards, because the mappings cannot be anchored and are therefore likely at the wrong place
-    # The idea is to run minigap multiple times until another contig with a proper anchor is extended enough to overlap this contig and then it is removed as a duplicate
-    complete_repeats = np.unique(np.concatenate([ complete_repeats, np.unique(repeat_table.loc[repeat_table['left_repeat'] & repeat_table['right_repeat'] & (repeat_table['q_id'] == repeat_table['t_id']), 'q_id'])]))
-    # Mask the whole read, so mappings to it will be ignored, as we remove it anyways
-    contigs.iloc[complete_repeats, contigs.columns.get_loc('repeat_mask_right')] = 0
-    contigs.iloc[complete_repeats, contigs.columns.get_loc('repeat_mask_left')] = contigs.iloc[complete_repeats, contigs.columns.get_loc('length')]
-    
-    # Remove the low complexity contigs and tandem repeats from the repeat table
-    repeat_table = repeat_table[np.logical_not(repeat_table['left_repeat'] & repeat_table['right_repeat'])].copy()
-    
-    ## Check for repeat connections
-    con_search = repeat_table[repeat_table['left_repeat'] | repeat_table['right_repeat']].copy()
-    con_search['rep_len'] = con_search['q_end'] - con_search['q_start']
-    con_search['con_left'] = con_search['t_start'] <= max_repeat_extension
-    con_search['con_right'] = con_search['t_len'] - con_search['t_end'] <= max_repeat_extension
-    
-    # Only keep longest for one type of connection to not undermine the validity of a repeat connection with a repeat between the same contigs
-    con_search.sort_values(['q_id','left_repeat','right_repeat','t_id','con_left','con_right','rep_len'], inplace=True)
-    con_search = con_search.groupby(['q_id','left_repeat','right_repeat','t_id','con_left','con_right'], sort=False).last().reset_index()
-    
-    # Get second longest repeats to potentially veto repeat connections
-    con_search.sort_values(['q_id','left_repeat','right_repeat','rep_len'], inplace=True)
-    con_search['longest'] = (con_search['q_id'] != con_search['q_id'].shift(-1, fill_value=-1)) | (con_search['left_repeat'] != con_search['left_repeat'].shift(-1, fill_value=-1))
-    second_longest = con_search[con_search['longest']==False].groupby(['q_id','left_repeat','right_repeat'], sort=False)['rep_len'].last().reset_index(name="len_second")
-    
-    # Get potential repeat connections
-    con_search = con_search.loc[con_search['longest'] & (con_search['con_left'] | con_search['con_right']) & (con_search['q_id'] != con_search['t_id']), ['q_id','left_repeat','right_repeat','t_id','con_left','con_right','rep_len','strand']].copy()
-    con_search = con_search[np.logical_not(con_search['con_left'] & con_search['con_right'])].copy() # Remove complete duplicates
-    con_search = con_search[(con_search['left_repeat'] != con_search['con_left']) & (con_search['strand'] == '+') | (con_search['left_repeat'] == con_search['con_left']) & (con_search['strand'] == '-')].copy() # Strand must match a connection
-    
-    # Apply filter
-    if len(con_search):
-        con_search = con_search.merge(second_longest, on=['q_id','left_repeat','right_repeat'], how='left').fillna(0)
-        con_search['accepted'] = (con_search['rep_len'] >= min_len_repeat_connection) & (con_search['len_second']*repeat_len_factor_unique < con_search['rep_len'])
-        if pdf:
-            PlotHist(pdf, "Connection length", "# Potential repeat connections", con_search['rep_len'], logx=True, threshold=min_len_repeat_connection)
-            if np.sum(con_search['rep_len'] < 10*min_len_repeat_connection):
-                PlotHist(pdf, "Connection length", "# Potential repeat connections", np.extract(con_search['rep_len'] < 10*min_len_repeat_connection, con_search['rep_len']), threshold=min_len_repeat_connection)
-            PlotXY(pdf, "Longest repeat connection", "Second longest connection", con_search['rep_len'], con_search['len_second'], category=np.where(con_search['accepted'], "accepted", "declined"))
-            #PlotXY(pdf, "Longest repeat connection", "Second longest connection", con_search['rep_len'], con_search['len_second'], category=con_search['accepted'], logx=True)
-        con_search = con_search[con_search['accepted']].copy()
-        
-        # Check that partner sides also survived all filters
-        con_search = con_search[(con_search.merge(con_search, left_on=['t_id','con_left','con_right'], right_on=['q_id','left_repeat','right_repeat'], how='left', indicator=True)['_merge'] == "both").values].copy()
-    
-    # Store repeat connections
-    contigs['rep_con_left'] = -1
-    contigs['rep_con_side_left'] = ''
-    contigs['rep_con_right'] = -1
-    contigs['rep_con_side_right'] = ''
-    if len(con_search):
-        contigs.iloc[con_search.loc[con_search['left_repeat'], 'q_id'], contigs.columns.get_loc('rep_con_left')] = con_search.loc[con_search['left_repeat'], 't_id'].values
-        contigs.iloc[con_search.loc[con_search['left_repeat'], 'q_id'], contigs.columns.get_loc('rep_con_side_left')] = np.where(con_search.loc[con_search['left_repeat'], 'con_left'].values, 'l', 'r')
-        contigs.iloc[con_search.loc[con_search['right_repeat'], 'q_id'], contigs.columns.get_loc('rep_con_right')] = con_search.loc[con_search['right_repeat'], 't_id'].values
-        contigs.iloc[con_search.loc[con_search['right_repeat'], 'q_id'], contigs.columns.get_loc('rep_con_side_right')] = np.where(con_search.loc[con_search['right_repeat'], 'con_left'].values, 'l', 'r')
-
-    ## Mask repeat ends
-    # Keep only repeat positions and sort repeats by contig and start position to merge everything that is closer than max_repeat_extension
-    repeat_table = repeat_table[['q_id','q_len','q_start','q_end']].copy()
-    repeat_table.sort_values(['q_id','q_start','q_end'], inplace=True)
-    repeat_table['group'] = (repeat_table['q_id'] != repeat_table['q_id'].shift(1, fill_value=-1)) | (repeat_table['q_start'] > repeat_table['q_end'].shift(1, fill_value=-1) + max_repeat_extension)
-    while np.sum(repeat_table['group']) < len(repeat_table):
-        repeat_table['group'] = repeat_table['group'].cumsum()
-        repeat_table = repeat_table.groupby('group').agg(['min','max']).reset_index()[[('q_id','min'),('q_len','min'),('q_start','min'),('q_end','max')]].copy()
-        repeat_table.columns = repeat_table.columns.droplevel(-1)
-        repeat_table['group'] = (repeat_table['q_id'] != repeat_table['q_id'].shift(1, fill_value=-1)) | (repeat_table['q_start'] > repeat_table['q_end'].shift(1, fill_value=-1) + max_repeat_extension)
-    
-    # Mask contig ends with repeats
-    repeat_table['left_repeat'] = repeat_table['q_start'] <= max_repeat_extension
-    mask = repeat_table[repeat_table['left_repeat']].groupby('q_id')['q_end'].max().reset_index()
-    contigs.iloc[mask['q_id'].values, contigs.columns.get_loc('repeat_mask_left')] = mask['q_end'].values
-    repeat_table['right_repeat'] = repeat_table['q_len'] - repeat_table['q_end'] <= max_repeat_extension
-    mask = repeat_table[repeat_table['right_repeat']].groupby('q_id')['q_start'].max().reset_index()
-    contigs.iloc[mask['q_id'].values, contigs.columns.get_loc('repeat_mask_right')] = mask['q_start'].values
-
-    # If we had a full repeat after the combination mask it completely (but don't remove it, same strategy as for low complexity contigs and tandem repeats)
-    contigs.loc[contigs['repeat_mask_left'] > contigs['repeat_mask_right'], 'repeat_mask_left'] = contigs.loc[contigs['repeat_mask_left'] > contigs['repeat_mask_right'], 'length']
-    contigs.loc[contigs['repeat_mask_left'] > contigs['repeat_mask_right'], 'repeat_mask_right'] = 0
-    
-    # Only keep center repeats (repeats not at the contig ends)
-    repeat_table = repeat_table.loc[np.logical_not(repeat_table['left_repeat'] | repeat_table['right_repeat']), ['q_id','q_start','q_end']].copy()
-    repeat_table.rename(columns={'q_id':'con_id', 'q_start':'start', 'q_end':'end'}, inplace=True)
-
-    if pdf:
-        masked = ((contigs.loc[contigs['remove'] == False, 'repeat_mask_left']+contigs.loc[contigs['remove'] == False, 'length']-contigs.loc[contigs['remove'] == False, 'repeat_mask_right'])/contigs.loc[contigs['remove'] == False, 'length']).values*100
-        masked[masked > 100] = 100 # Fully masked the way it's done would be 200, which does not make sense
-        category = np.log10(contigs.loc[contigs['remove'] == False, 'length']).values.astype(int)
-        category = [''.join(['>',a," bases"]) for a in np.power(10,category).astype(str)]
-
-        if len(masked):
-            PlotHist(pdf, "% of bases masked", "# Contigs", masked, category=category, catname='length', logy=True)
-
-    return contigs, repeat_table
+def LoadRepeats(repeat_file, contig_ids):
+    repeats = ReadPaf(repeat_file)
+    repeats.drop(columns=['matches','alignment_length','mapq'], inplace=True)
+    repeats['q_name'] = itemgetter(*repeats['q_name'])(contig_ids)
+    repeats['t_name'] = itemgetter(*repeats['t_name'])(contig_ids)
+    repeats.rename(columns={'q_name':'q_id','t_name':'t_id'}, inplace=True)
+#
+    return repeats
 
 def GetThresholdsFromReadLenDist(mappings, num_read_len_groups):
     # Get read length distribution
@@ -461,7 +337,7 @@ def NormCDF(x, mu, sigma):
 def CovChi2(par, df): #, expo
     return np.sum((NormCDF(df['x'], par[0], par[1]) - df['y'])**2)
     
-def GetCoverageProbabilities(cov_counts, min_num_reads, cov_bin_fraction, pdf):
+def GetCoverageProbabilities(cov_counts, cov_bin_fraction, pdf):
     probs = cov_counts.groupby(['bin_size','count']).size().reset_index(name='nbins')
     probs['nbin_cumsum'] = probs.groupby(['bin_size'], sort=False)['nbins'].cumsum()
     cov_bins = probs.groupby(['bin_size'])['nbins'].agg(['sum','size']).reset_index()
@@ -507,12 +383,12 @@ def GetBestSubreads(mappings, alignment_precision):
     
     return mappings
 
-def ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, alignment_precision, min_num_reads, cov_bin_fraction, num_read_len_groups, pdf):
+def ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, alignment_precision, cov_bin_fraction, num_read_len_groups, pdf):
     mappings = ReadPaf(mapping_file)
 
     length_thresholds = GetThresholdsFromReadLenDist(mappings, num_read_len_groups)
     cov_counts = GetBinnedCoverage(mappings, length_thresholds)
-    cov_probs = GetCoverageProbabilities(cov_counts, min_num_reads, cov_bin_fraction, pdf)
+    cov_probs = GetCoverageProbabilities(cov_counts, cov_bin_fraction, pdf)
     cov_counts.rename(columns={'count':'count_all'}, inplace=True)
 
     # Filter low mapping qualities
@@ -535,41 +411,27 @@ def ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, alignmen
 def RemoveUnmappedContigs(contigs, mappings, remove_zero_hit_contigs):
     # Schedule contigs for removal that don't have any high quality reads mapping to it
     contigs['remove'] = False
-    mapped_reads = np.bincount(mappings['t_id'], minlength=len(contigs))
     if remove_zero_hit_contigs:
+        mapped_reads = np.bincount(mappings['t_id'], minlength=len(contigs))
         contigs.loc[0==mapped_reads, 'remove'] = True
+#
+        # Get covered regions for all contigs
+        covered_regions = mappings[['t_id','t_start','t_end']].rename(columns={'t_id':'con_id','t_start':'from','t_end':'to'})
+        covered_regions.sort_values(['con_id','from','to'], inplace=True)
+        old_len = 0
+        while old_len != len(covered_regions):
+            old_len  = len(covered_regions)
+            covered_regions['group'] = ((covered_regions['con_id'] != covered_regions['con_id'].shift(1)) | (covered_regions['from'] > covered_regions['to'].shift(1))).cumsum()
+            covered_regions = covered_regions.groupby(['group','con_id']).agg({'from':'min','to':'max'}).reset_index()
+        covered_regions.drop(columns=['group'], inplace=True)
+    else:
+        # Set all contigs to full coverage
+        covered_regions = contigs[['length']].rename(columns={'length':'to'})
+        covered_regions['con_id'] = covered_regions.index.values
+        covered_regions['from'] = 0
+        covered_regions = covered_regions[['con_id','from','to']].copy()
 
-    return contigs
-
-def RemoveUnanchoredMappings(mappings, contigs, center_repeats, min_mapping_length, pdf, max_dist_contig_end):
-    # Filter reads only mapping to repeat ends
-    mapping_lengths = np.minimum(
-                mappings['t_end'].values - np.maximum(mappings['t_start'].values, contigs['repeat_mask_left'].iloc[mappings['t_id']].values),
-                np.minimum(mappings['t_end'].values, contigs['repeat_mask_right'].iloc[mappings['t_id']].values) - mappings['t_start'].values )
-    mappings = mappings[min_mapping_length <= mapping_lengths].copy()
-
-    if pdf:
-        mapping_lengths[ 0 > mapping_lengths ] = 0 # Set negative values to zero (Only mapping to repeat)
-        if np.sum(mapping_lengths < 10*min_mapping_length):
-            PlotHist(pdf, "Mapping length", "# Mappings", np.extract(mapping_lengths < 10*min_mapping_length, mapping_lengths), threshold=min_mapping_length)
-        PlotHist(pdf, "Mapping length", "# Mappings", mapping_lengths, threshold=min_mapping_length, logx=True)
-                 
-        # Plot distance of mappings from contig ends, where the continuing read is longer than the continuing contig
-        dists_contig_ends = mappings.loc[mappings['t_start'] < np.where('+' == mappings['strand'], mappings['q_start'], mappings['q_len']-mappings['q_end']), 't_start']
-        dists_contig_ends = np.concatenate([dists_contig_ends, 
-                                            np.extract( mappings['t_len']-mappings['t_end'] < np.where('+' == mappings['strand'], mappings['q_len']-mappings['q_end'], mappings['q_start']), mappings['t_len']-mappings['t_end'] )] )
-        if len(dists_contig_ends):
-            if np.sum(dists_contig_ends < 10*max_dist_contig_end):
-                PlotHist(pdf, "Distance to contig end", "# Reads reaching over contig ends", np.extract(dists_contig_ends < 10*max_dist_contig_end, dists_contig_ends), threshold=max_dist_contig_end, logy=True)
-            PlotHist(pdf, "Distance to contig end", "# Reads reaching over contig ends", dists_contig_ends, threshold=max_dist_contig_end, logx=True)
-
-    # Find and remove reads only mapping to center repeats (Distance to merge repeats should be larger than min_mapping_length, so we can consider here one repeat at a time)
-    repeats = center_repeats.merge(mappings, left_on=['con_id'], right_on=['t_id'], how='inner')
-    repeats = repeats[ (repeats['start']-min_mapping_length < repeats['t_start']) & (repeats['end']+min_mapping_length > repeats['t_end']) ].copy()
-    mappings.sort_values(['q_name','q_start'], inplace=True)
-    mappings = mappings[(mappings.merge(repeats[['q_name','q_start']].drop_duplicates(), on=['q_name','q_start'], how='left', indicator=True)['_merge'] == "left_only").values].copy()
-
-    return mappings
+    return contigs, covered_regions
 
 def BreakReadsAtAdapters(mappings, adapter_signal_max_dist, keep_all_subreads):
     # Sort mappings by starting position and provide information on next/previous mapping (if from same read)
@@ -615,7 +477,7 @@ def BreakReadsAtAdapters(mappings, adapter_signal_max_dist, keep_all_subreads):
 
     return mappings
 
-def GetBrokenMappings(mappings, max_dist_contig_end, min_length_contig_break, pdf):
+def GetBrokenMappings(mappings, covered_regions, max_dist_contig_end, min_length_contig_break, pdf):
     # Find reads that have a break point and map on the left/right side(contig orientation) of it
     pot_breaks = mappings.copy()
     pot_breaks['next_pos'] = np.where(0 > pot_breaks['next_con'], -1, np.where(pot_breaks['next_strand'] == '+', pot_breaks['t_start'].shift(-1, fill_value=-1), pot_breaks['t_end'].shift(-1, fill_value=0)-1))
@@ -623,13 +485,14 @@ def GetBrokenMappings(mappings, max_dist_contig_end, min_length_contig_break, pd
     pot_breaks['next_dist'] = np.where(0 > pot_breaks['next_con'], 0, pot_breaks['q_start'].shift(-1, fill_value=0) - pot_breaks['q_end'])
     pot_breaks['prev_dist'] = np.where(0 > pot_breaks['prev_con'], 0, pot_breaks['q_start'] - pot_breaks['q_end'].shift(1, fill_value=0))
 
-    left_breaks = pot_breaks[ (pot_breaks['t_len']-pot_breaks['t_end'] > max_dist_contig_end) &
+    cov_reg = covered_regions.groupby(['con_id']).agg({'from':'min','to':'max'}).reset_index().rename(columns={'con_id':'t_id'})
+    left_breaks = pot_breaks[ (pot_breaks[['t_id']].merge(cov_reg, on=['t_id'], how='left')['to'].values - pot_breaks['t_end'] > max_dist_contig_end) &
                              np.where('+' == pot_breaks['strand'],
                                       (0 <= pot_breaks['next_con']) | (pot_breaks['read_end']-pot_breaks['q_end'] > min_length_contig_break),
                                       (0 <= pot_breaks['prev_con']) | (pot_breaks['q_start']-pot_breaks['read_start'] > min_length_contig_break)) ].copy()
     left_breaks['side'] = 'l'
 
-    right_breaks = pot_breaks[ (pot_breaks['t_start'] > max_dist_contig_end) &
+    right_breaks = pot_breaks[ (pot_breaks['t_start'] - pot_breaks[['t_id']].merge(cov_reg, on=['t_id'], how='left')['from'].values > max_dist_contig_end) &
                               np.where('+' == pot_breaks['strand'],
                                        (0 <= pot_breaks['prev_con']) | (pot_breaks['q_start']-pot_breaks['read_start'] > min_length_contig_break),
                                        (0 <= pot_breaks['next_con']) | (pot_breaks['read_end']-pot_breaks['q_end'] > min_length_contig_break)) ].copy()
@@ -681,8 +544,8 @@ def GetNonInformativeMappings(mappings, contigs, min_extension, break_groups, po
 
     return non_informative_mappings
 
-def CallAllBreaksSpurious(mappings, contigs, max_dist_contig_end, min_length_contig_break, min_extension, pdf):
-    pot_breaks = GetBrokenMappings(mappings, max_dist_contig_end, min_length_contig_break, pdf)
+def CallAllBreaksSpurious(mappings, contigs, covered_regions, max_dist_contig_end, min_length_contig_break, min_extension, pdf):
+    pot_breaks = GetBrokenMappings(mappings, covered_regions, max_dist_contig_end, min_length_contig_break, pdf)
 
     break_groups = []
     spurious_break_indexes = pot_breaks[['map_index','q_name','read_side','q_start','q_end']].drop_duplicates()
@@ -790,7 +653,7 @@ def GetConProb(cov_probs, req_length, counts):
 
     return NormCDFCapped(probs['counts'],probs['mu'], probs['sigma'])
 
-def CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_map_len, cov_probs, max_dist_contig_end, max_break_point_distance, min_mapping_length, min_num_reads, min_length_contig_break, prob_factor, merge_block_length, prematurity_threshold):
+def CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_map_len, cov_probs, covered_regions, max_dist_contig_end, max_break_point_distance, min_mapping_length, min_num_reads, min_length_contig_break, prob_factor, merge_block_length, prematurity_threshold):
     if len(break_points):
         # Check how many reads veto a break (continuously map over the break region position +- (min_mapping_length+max_break_point_distance))
         break_pos = break_points[['contig_id','position']].drop_duplicates()
@@ -825,8 +688,9 @@ def CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_map_len, cov_
         # Find vetos that potentially have premature stops
         veto_map_len = pd.concat(veto_map_len, ignore_index=True)
         veto_map_len['t_len'] = veto_map_len[['contig_id']].merge(pot_breaks[['contig_id','t_len']].drop_duplicates(), on=['contig_id'], how='left')['t_len'].values
-        veto_map_len.loc[veto_map_len['t_start'] <= max_dist_contig_end, 't_start'] = 0 # Disable the sides that are within max_dist_contig_end from and end, so that they are not considered a premature stop
-        veto_map_len['t_end'] = np.where(veto_map_len['t_end'] < veto_map_len['t_len']-max_dist_contig_end, veto_map_len['t_end'], veto_map_len['t_len'])
+        cov_reg = covered_regions.groupby(['con_id']).agg({'from':'min','to':'max'}).reset_index().rename(columns={'con_id':'contig_id'})
+        veto_map_len.loc[veto_map_len['t_start'] - veto_map_len[['contig_id']].merge(cov_reg, on=['contig_id'], how='left')['from'].values <= max_dist_contig_end, 't_start'] = 0 # Disable the sides that are within max_dist_contig_end from and end, so that they are not considered a premature stop
+        veto_map_len['t_end'] = np.where(veto_map_len['t_end'] < veto_map_len[['contig_id']].merge(cov_reg, on=['contig_id'], how='left')['to'].values - max_dist_contig_end, veto_map_len['t_end'], veto_map_len['t_len'])
         veto_map_len[['ifrom','ito']] = veto_map_len[['contig_id','position']].merge(break_points.groupby(['contig_id','position'])[['ifrom','ito']].max().reset_index(), on=['contig_id','position'], how='left')[['ifrom','ito']].values
         if len(veto_map_len):
             # Get start and end of breaking reads
@@ -934,7 +798,7 @@ def CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_map_len, cov_
 #
     return break_points, unconnected_break_points
 
-def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, min_length_contig_break, max_break_point_distance, min_num_reads, min_extension, merge_block_length, org_scaffold_trust, cov_probs, prob_factor, allow_same_contig_breaks, prematurity_threshold, pdf):
+def FindBreakPoints(mappings, contigs, covered_regions, max_dist_contig_end, min_mapping_length, min_length_contig_break, max_break_point_distance, min_num_reads, min_extension, merge_block_length, org_scaffold_trust, cov_probs, prob_factor, allow_same_contig_breaks, prematurity_threshold, pdf):
     if pdf:
         loose_reads_ends = mappings[(mappings['t_start'] > max_dist_contig_end) & np.where('+' == mappings['strand'], -1 == mappings['prev_con'], -1 == mappings['next_con'])]
         loose_reads_ends_length = np.where('+' == loose_reads_ends['strand'], loose_reads_ends['q_start']-loose_reads_ends['read_start'], loose_reads_ends['read_end']-loose_reads_ends['q_end'])
@@ -945,7 +809,7 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
                 PlotHist(pdf, "Loose end length", "# Ends", np.extract(loose_reads_ends_length < 10*min_length_contig_break, loose_reads_ends_length), threshold=min_length_contig_break, logy=True)
             PlotHist(pdf, "Loose end length", "# Ends", loose_reads_ends_length, threshold=min_length_contig_break, logx=True)
 
-    pot_breaks = GetBrokenMappings(mappings, max_dist_contig_end, min_length_contig_break, pdf)
+    pot_breaks = GetBrokenMappings(mappings, covered_regions, max_dist_contig_end, min_length_contig_break, pdf)
     break_points, bp_map_len = PreparePotBreakPoints(pot_breaks, max_break_point_distance, min_mapping_length, min_num_reads)
     
     if pdf:
@@ -956,7 +820,7 @@ def FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, 
             PlotHist(pdf, "Break point distance", "# Break point pairs", break_point_dist, threshold=max_break_point_distance, logx=True )
 
     break_points = CountBreakSupport(break_points, max_break_point_distance, min_num_reads)
-    break_points, unconnected_break_points = CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_map_len, cov_probs, max_dist_contig_end, max_break_point_distance, min_mapping_length, min_num_reads, min_length_contig_break, prob_factor, merge_block_length, prematurity_threshold)
+    break_points, unconnected_break_points = CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_map_len, cov_probs, covered_regions, max_dist_contig_end, max_break_point_distance, min_mapping_length, min_num_reads, min_length_contig_break, prob_factor, merge_block_length, prematurity_threshold)
 
     if len(break_points):
         # Cluster break_points into groups, so that groups have a maximum length of 2*max_break_point_distance
@@ -1068,7 +932,7 @@ def SplitReadsAtSpuriousBreakIndexes(mappings, spurious_break_indexes):
 #
     return mappings
 
-def GetContigParts(contigs, break_groups, remove_short_contigs, min_mapping_length, alignment_precision, pdf):
+def GetContigParts(contigs, break_groups, covered_regions, remove_short_contigs, remove_zero_hit_contigs, min_mapping_length, alignment_precision, pdf):
     # Create a dataframe with the contigs being split into parts and contigs scheduled for removal not included
     if 0 == len(break_groups):
         # We do not have break points, so we don't need to split
@@ -1099,6 +963,17 @@ def GetContigParts(contigs, break_groups, remove_short_contigs, min_mapping_leng
     contig_parts['end'] = contig_parts['start'].shift(-1,fill_value=0)
     contig_parts.loc[contig_parts['end']==0, 'end'] = contigs.iloc[contig_parts.loc[contig_parts['end']==0, 'contig'], contigs.columns.get_loc('length')].values
     contig_parts['name'] = contigs.iloc[contig_parts['contig'], contigs.columns.get_loc('name')].values
+
+    # Trim unmapped part on ends of contig_parts
+    if remove_zero_hit_contigs:
+        cov_reg = contig_parts[['contig','part','start']].merge(covered_regions.rename(columns={'con_id':'contig'}), on='contig', how='left')
+        cov_reg = cov_reg[cov_reg['to'] > cov_reg['start'] + (min_mapping_length if remove_short_contigs else 0)].copy()
+        cov_reg = cov_reg.groupby(['contig','part'])['from'].min().reset_index()
+        contig_parts['start'] = np.maximum(contig_parts['start'], contig_parts[['contig','part']].merge(cov_reg, on=['contig','part'], how='left')['from'].fillna(sys.maxsize*0.9).astype(int).values)
+        cov_reg = contig_parts[['contig','part','end']].merge(covered_regions.rename(columns={'con_id':'contig'}), on='contig', how='left')
+        cov_reg = cov_reg[cov_reg['from'] < cov_reg['end'] - (min_mapping_length if remove_short_contigs else 0)].copy()
+        cov_reg = cov_reg.groupby(['contig','part'])['to'].max().reset_index()
+        contig_parts['end'] = np.minimum(contig_parts['end'], contig_parts[['contig','part']].merge(cov_reg, on=['contig','part'], how='left')['to'].fillna(0).astype(int).values)
 
     # Remove short contig_parts < min_mapping_length + alignment_precision (adding alignment_precision gives a buffer so that a mapping to a short contig is not removed in one read and not removed in another based on a single base mapping or not)
     if remove_short_contigs:
@@ -1256,6 +1131,169 @@ def UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length, max_
     mappings['num_mappings'] = np.repeat(num_mappings, num_mappings)
 
     return mappings
+
+def MaskRepeatEnds(contigs, repeat_file, contig_ids, max_repeat_extension, min_len_repeat_connection, repeat_len_factor_unique, remove_duplicated_contigs, pdf):
+    # Read in minimap 2 repeat table (.paf)
+    repeat_table = ReadPaf(repeat_file)
+    
+    repeat_table = repeat_table[(repeat_table['q_name'] != repeat_table['t_name']) | (repeat_table['q_start'] != repeat_table['t_start'])].copy()  # Ignore repeats on same contig and same position
+     
+    if pdf and len(repeat_table):
+        tmp_dist = np.minimum(repeat_table['q_start'], repeat_table['q_len']-repeat_table['q_end']) # Repeat distance to contig end
+        PlotHist(pdf, "Repeat distance to contig end", "# Repeat mappings", tmp_dist, logx=True, threshold=max_repeat_extension)
+        if np.sum(tmp_dist < 10*max_repeat_extension):
+            PlotHist(pdf, "Repeat distance to contig end", "# Repeat mappings", np.extract(tmp_dist < 10*max_repeat_extension, tmp_dist), threshold=max_repeat_extension)
+
+    # We can do everything on query as all mappings are also reversed in the table
+    # Check if the repeat belongs to a contig end
+    repeat_table['left_repeat'] = repeat_table['q_start'] <= max_repeat_extension
+    repeat_table['right_repeat'] = repeat_table['q_len'] - repeat_table['q_end'] <= max_repeat_extension
+    
+    repeat_table['q_id'] = itemgetter(*repeat_table['q_name'])(contig_ids)
+    repeat_table['t_id'] = itemgetter(*repeat_table['t_name'])(contig_ids)
+    
+    contigs['repeat_mask_left'] = int(0)
+    contigs['repeat_mask_right'] = contigs['length']
+    contigs['remove'] = False
+    
+    # Complete duplicate -> Schedule for removal
+    # If the target is also a complete duplicate, keep the longer one or at same length decide by name
+    complete_repeats = np.unique(repeat_table.loc[repeat_table['left_repeat'] & repeat_table['right_repeat'] &
+             ((repeat_table['t_start'] > max_repeat_extension) |
+              (repeat_table['q_len'] - repeat_table['q_end'] > max_repeat_extension) |
+              (repeat_table['t_len'] > repeat_table['q_len']) |
+              ((repeat_table['t_len'] == repeat_table['q_len']) & (repeat_table['t_name'] < repeat_table['q_name']))), 'q_id'])
+    if remove_duplicated_contigs:
+        contigs.iloc[complete_repeats, contigs.columns.get_loc('remove')] = True
+    
+    ## Handle complete repeats, complexity contigs and tandem repeats
+    # Remove the complete_repeats from the repeat table, as the repeat won't exist anymore after the removal of the contigs (sp we don't want to count those contigs for repeats in other contigs)
+    repeat_table = repeat_table[np.logical_not(np.isin(repeat_table['q_id'], complete_repeats)) & np.logical_not(np.isin(repeat_table['t_id'], complete_repeats))].copy()
+    
+    # Add low complexity contigs and tandem repeats to complete_repeats, where you get a similar sequence when shifting the frame a bit
+    # We want to keep them as they are no duplications but don't do anything with them afterwards, because the mappings cannot be anchored and are therefore likely at the wrong place
+    # The idea is to run minigap multiple times until another contig with a proper anchor is extended enough to overlap this contig and then it is removed as a duplicate
+    complete_repeats = np.unique(np.concatenate([ complete_repeats, np.unique(repeat_table.loc[repeat_table['left_repeat'] & repeat_table['right_repeat'] & (repeat_table['q_id'] == repeat_table['t_id']), 'q_id'])]))
+    # Mask the whole read, so mappings to it will be ignored, as we remove it anyways
+    contigs.iloc[complete_repeats, contigs.columns.get_loc('repeat_mask_right')] = 0
+    contigs.iloc[complete_repeats, contigs.columns.get_loc('repeat_mask_left')] = contigs.iloc[complete_repeats, contigs.columns.get_loc('length')]
+    
+    # Remove the low complexity contigs and tandem repeats from the repeat table
+    repeat_table = repeat_table[np.logical_not(repeat_table['left_repeat'] & repeat_table['right_repeat'])].copy()
+    
+    ## Check for repeat connections
+    con_search = repeat_table[repeat_table['left_repeat'] | repeat_table['right_repeat']].copy()
+    con_search['rep_len'] = con_search['q_end'] - con_search['q_start']
+    con_search['con_left'] = con_search['t_start'] <= max_repeat_extension
+    con_search['con_right'] = con_search['t_len'] - con_search['t_end'] <= max_repeat_extension
+    
+    # Only keep longest for one type of connection to not undermine the validity of a repeat connection with a repeat between the same contigs
+    con_search.sort_values(['q_id','left_repeat','right_repeat','t_id','con_left','con_right','rep_len'], inplace=True)
+    con_search = con_search.groupby(['q_id','left_repeat','right_repeat','t_id','con_left','con_right'], sort=False).last().reset_index()
+    
+    # Get second longest repeats to potentially veto repeat connections
+    con_search.sort_values(['q_id','left_repeat','right_repeat','rep_len'], inplace=True)
+    con_search['longest'] = (con_search['q_id'] != con_search['q_id'].shift(-1, fill_value=-1)) | (con_search['left_repeat'] != con_search['left_repeat'].shift(-1, fill_value=-1))
+    second_longest = con_search[con_search['longest']==False].groupby(['q_id','left_repeat','right_repeat'], sort=False)['rep_len'].last().reset_index(name="len_second")
+    
+    # Get potential repeat connections
+    con_search = con_search.loc[con_search['longest'] & (con_search['con_left'] | con_search['con_right']) & (con_search['q_id'] != con_search['t_id']), ['q_id','left_repeat','right_repeat','t_id','con_left','con_right','rep_len','strand']].copy()
+    con_search = con_search[np.logical_not(con_search['con_left'] & con_search['con_right'])].copy() # Remove complete duplicates
+    con_search = con_search[(con_search['left_repeat'] != con_search['con_left']) & (con_search['strand'] == '+') | (con_search['left_repeat'] == con_search['con_left']) & (con_search['strand'] == '-')].copy() # Strand must match a connection
+    
+    # Apply filter
+    if len(con_search):
+        con_search = con_search.merge(second_longest, on=['q_id','left_repeat','right_repeat'], how='left').fillna(0)
+        con_search['accepted'] = (con_search['rep_len'] >= min_len_repeat_connection) & (con_search['len_second']*repeat_len_factor_unique < con_search['rep_len'])
+        if pdf:
+            PlotHist(pdf, "Connection length", "# Potential repeat connections", con_search['rep_len'], logx=True, threshold=min_len_repeat_connection)
+            if np.sum(con_search['rep_len'] < 10*min_len_repeat_connection):
+                PlotHist(pdf, "Connection length", "# Potential repeat connections", np.extract(con_search['rep_len'] < 10*min_len_repeat_connection, con_search['rep_len']), threshold=min_len_repeat_connection)
+            PlotXY(pdf, "Longest repeat connection", "Second longest connection", con_search['rep_len'], con_search['len_second'], category=np.where(con_search['accepted'], "accepted", "declined"))
+            #PlotXY(pdf, "Longest repeat connection", "Second longest connection", con_search['rep_len'], con_search['len_second'], category=con_search['accepted'], logx=True)
+        con_search = con_search[con_search['accepted']].copy()
+        
+        # Check that partner sides also survived all filters
+        con_search = con_search[(con_search.merge(con_search, left_on=['t_id','con_left','con_right'], right_on=['q_id','left_repeat','right_repeat'], how='left', indicator=True)['_merge'] == "both").values].copy()
+    
+    # Store repeat connections
+    contigs['rep_con_left'] = -1
+    contigs['rep_con_side_left'] = ''
+    contigs['rep_con_right'] = -1
+    contigs['rep_con_side_right'] = ''
+    if len(con_search):
+        contigs.iloc[con_search.loc[con_search['left_repeat'], 'q_id'], contigs.columns.get_loc('rep_con_left')] = con_search.loc[con_search['left_repeat'], 't_id'].values
+        contigs.iloc[con_search.loc[con_search['left_repeat'], 'q_id'], contigs.columns.get_loc('rep_con_side_left')] = np.where(con_search.loc[con_search['left_repeat'], 'con_left'].values, 'l', 'r')
+        contigs.iloc[con_search.loc[con_search['right_repeat'], 'q_id'], contigs.columns.get_loc('rep_con_right')] = con_search.loc[con_search['right_repeat'], 't_id'].values
+        contigs.iloc[con_search.loc[con_search['right_repeat'], 'q_id'], contigs.columns.get_loc('rep_con_side_right')] = np.where(con_search.loc[con_search['right_repeat'], 'con_left'].values, 'l', 'r')
+
+    ## Mask repeat ends
+    # Keep only repeat positions and sort repeats by contig and start position to merge everything that is closer than max_repeat_extension
+    repeat_table = repeat_table[['q_id','q_len','q_start','q_end']].copy()
+    repeat_table.sort_values(['q_id','q_start','q_end'], inplace=True)
+    repeat_table['group'] = (repeat_table['q_id'] != repeat_table['q_id'].shift(1, fill_value=-1)) | (repeat_table['q_start'] > repeat_table['q_end'].shift(1, fill_value=-1) + max_repeat_extension)
+    while np.sum(repeat_table['group']) < len(repeat_table):
+        repeat_table['group'] = repeat_table['group'].cumsum()
+        repeat_table = repeat_table.groupby('group').agg(['min','max']).reset_index()[[('q_id','min'),('q_len','min'),('q_start','min'),('q_end','max')]].copy()
+        repeat_table.columns = repeat_table.columns.droplevel(-1)
+        repeat_table['group'] = (repeat_table['q_id'] != repeat_table['q_id'].shift(1, fill_value=-1)) | (repeat_table['q_start'] > repeat_table['q_end'].shift(1, fill_value=-1) + max_repeat_extension)
+    
+    # Mask contig ends with repeats
+    repeat_table['left_repeat'] = repeat_table['q_start'] <= max_repeat_extension
+    mask = repeat_table[repeat_table['left_repeat']].groupby('q_id')['q_end'].max().reset_index()
+    contigs.iloc[mask['q_id'].values, contigs.columns.get_loc('repeat_mask_left')] = mask['q_end'].values
+    repeat_table['right_repeat'] = repeat_table['q_len'] - repeat_table['q_end'] <= max_repeat_extension
+    mask = repeat_table[repeat_table['right_repeat']].groupby('q_id')['q_start'].max().reset_index()
+    contigs.iloc[mask['q_id'].values, contigs.columns.get_loc('repeat_mask_right')] = mask['q_start'].values
+
+    # If we had a full repeat after the combination mask it completely (but don't remove it, same strategy as for low complexity contigs and tandem repeats)
+    contigs.loc[contigs['repeat_mask_left'] > contigs['repeat_mask_right'], 'repeat_mask_left'] = contigs.loc[contigs['repeat_mask_left'] > contigs['repeat_mask_right'], 'length']
+    contigs.loc[contigs['repeat_mask_left'] > contigs['repeat_mask_right'], 'repeat_mask_right'] = 0
+    
+    # Only keep center repeats (repeats not at the contig ends)
+    repeat_table = repeat_table.loc[np.logical_not(repeat_table['left_repeat'] | repeat_table['right_repeat']), ['q_id','q_start','q_end']].copy()
+    repeat_table.rename(columns={'q_id':'con_id', 'q_start':'start', 'q_end':'end'}, inplace=True)
+
+    if pdf:
+        masked = ((contigs.loc[contigs['remove'] == False, 'repeat_mask_left']+contigs.loc[contigs['remove'] == False, 'length']-contigs.loc[contigs['remove'] == False, 'repeat_mask_right'])/contigs.loc[contigs['remove'] == False, 'length']).values*100
+        masked[masked > 100] = 100 # Fully masked the way it's done would be 200, which does not make sense
+        category = np.log10(contigs.loc[contigs['remove'] == False, 'length']).values.astype(int)
+        category = [''.join(['>',a," bases"]) for a in np.power(10,category).astype(str)]
+
+        if len(masked):
+            PlotHist(pdf, "% of bases masked", "# Contigs", masked, category=category, catname='length', logy=True)
+
+    return contigs, repeat_table
+
+def FindDuplicatedContigPartEnds(repeats, contig_parts, max_dist_contig_end, proportion_duplicated):
+    repeat_ends = repeats.copy()
+    for s in ['q','t']:
+        # Update repeats to contig_parts
+        repeat_ends = repeat_ends.merge(contig_parts[['contig','start','end']].reset_index().rename(columns={'index':f'{s}_con','contig':f'{s}_id', 'start':f'{s}_confrom', 'end':f'{s}_conto'}), on=[f'{s}_id'], how='inner')
+        repeat_ends.drop(columns=[f'{s}_id',f'{s}_len'], inplace=True)
+        repeat_ends = repeat_ends[(repeat_ends[f'{s}_start'] < repeat_ends[f'{s}_conto']) & (repeat_ends[f'{s}_confrom'] < repeat_ends[f'{s}_end'])].copy()
+        repeat_ends[f'{s}_start'] = np.maximum(repeat_ends[f'{s}_start'], repeat_ends[f'{s}_confrom'])
+        repeat_ends[f'{s}_end'] = np.minimum(repeat_ends[f'{s}_end'], repeat_ends[f'{s}_conto'])
+    repeat_ends = repeat_ends[['q_con','q_confrom','q_conto','q_start','q_end','strand','t_con','t_confrom','t_conto','t_start','t_end']].copy()
+    # Find repeats at the left side of contig_parts
+    cur_repeats = repeat_ends.sort_values(['q_con','t_con','q_start'])
+    cur_repeats = cur_repeats[cur_repeats['q_start']-cur_repeats['q_confrom'] <= max_dist_contig_end].copy()
+    cur_repeats = cur_repeats[(cur_repeats['q_end']-cur_repeats['q_start']) / (cur_repeats['q_end']-cur_repeats['q_confrom']) >= proportion_duplicated].copy()
+    cur_repeats['side'] = 'l'
+    # Check if the left repeats extend to a full repeat of the whole contig
+    full_reps = cur_repeats[cur_repeats['q_conto']-cur_repeats['q_end'] <= max_dist_contig_end].copy()
+    full_reps = full_reps[(full_reps['q_end']-full_reps['q_start']) / (full_reps['q_conto']-full_reps['q_confrom']) >= proportion_duplicated].copy()
+    cur_repeats.loc[full_reps.index.values, 'side'] = 'lr'
+    # Find repeats at right side of contig_parts
+    right_repeats = repeat_ends.sort_values(['q_con','t_con','q_end'], ascending=[True,True,False])
+    right_repeats = right_repeats[right_repeats['q_conto']-right_repeats['q_end'] <= max_dist_contig_end].copy()
+    right_repeats = right_repeats[(right_repeats['q_end']-right_repeats['q_start']) / (right_repeats['q_conto']-right_repeats['q_start']) >= proportion_duplicated].copy()
+    right_repeats.drop(full_reps.index.values, inplace=True)
+    right_repeats['side'] = 'r'
+    repeat_ends = pd.concat([cur_repeats,right_repeats], ignore_index=True)
+    repeat_ends.sort_values(['q_con','t_con','side'], inplace=True)
+#
+    return repeat_ends
 
 def CreateBridges(left_bridge, right_bridge, min_distance_tolerance, rel_distance_tolerance):
     bridges = pd.concat([left_bridge,right_bridge], ignore_index=True, sort=False)
@@ -6054,6 +6092,67 @@ def ScaffoldContigs(contig_parts, bridges, mappings, cov_probs, prob_factor, min
 
     return scaffold_paths
 
+def RemoveUnconnectedLowlyMappedOrDuplicatedContigs(scaffold_paths, result_info, mappings, contig_parts, cov_probs, repeats, ploidy, lowmap_threshold):
+    # Find unconnected scaffolds
+    unconnected = scaffold_paths.groupby(['scaf']).size()
+    unconnected = unconnected[unconnected == 1].reset_index()['scaf'].values
+    unconnected = scaffold_paths.loc[np.isin(scaffold_paths['scaf'], unconnected) & (scaffold_paths[[f'con{h}' for h in range(1,ploidy)]].max(axis=1) < 0), ['scaf','con0']].rename(columns={'con0':'con'})
+#    
+    # Check unconnected for lowly mapped contigs
+    unconnected['nmapped'] = unconnected[['con']].merge(mappings.groupby(['conpart']).size().reset_index(name='nmapped').rename(columns={'conpart':'con'}), on='con', how='left')['nmapped'].fillna(0).astype(int).values
+    unconnected['lowmap'] = GetConProb(cov_probs, 1, unconnected['nmapped']) <= lowmap_threshold
+#
+    # check unconnected for completely duplicated contigs
+    unconnected['fullrep'] = False
+    uncon_reps = repeats[(repeats['side'] == 'lr') & (repeats['q_con'] != repeats['t_con']) & np.isin(repeats['q_con'], unconnected['con'].values)].copy()
+    full_reps = np.unique(uncon_reps.loc[np.isin(uncon_reps['t_con'].values, uncon_reps['q_con'].values) == False, 'q_con'].values) # Make sure we do not remove both copies of a repeated contig
+    unconnected.loc[np.isin(unconnected['con'].values, full_reps), 'fullrep'] = True
+    uncon_reps = uncon_reps[(np.isin(uncon_reps['q_con'].values, full_reps) == False) & (np.isin(uncon_reps['t_con'].values, full_reps) == False)].copy()
+    # Handle the repeats, where all versions are fully repeated by taking the one with the longest unique sequence
+    for s in ['q','t']:
+        uncon_reps[f'{s}_uniq'] = (uncon_reps[f'{s}_start'] - uncon_reps[f'{s}_confrom']) + (uncon_reps[f'{s}_conto'] - uncon_reps[f'{s}_end'])
+    full_reps = np.unique(uncon_reps.loc[uncon_reps['q_uniq'] < uncon_reps['t_uniq'], 'q_con'].values)
+    unconnected.loc[np.isin(unconnected['con'].values, full_reps), 'fullrep'] = True
+    uncon_reps = uncon_reps[(np.isin(uncon_reps['q_con'].values, full_reps) == False) & (np.isin(uncon_reps['t_con'].values, full_reps) == False)].copy()
+    # To break ties in case the unique length is identical remove the ones with the higher contig id
+    full_reps = np.unique(uncon_reps.loc[uncon_reps['q_con'] > uncon_reps['t_con'], 'q_con'].values)
+    unconnected.loc[np.isin(unconnected['con'].values, full_reps), 'fullrep'] = True
+#
+    # Update the original scaffolding in case of deleted contigs
+    scaffold_paths['del'] = np.isin(scaffold_paths['scaf'], unconnected.loc[unconnected['lowmap'] | unconnected['fullrep'], 'scaf'].values)
+    scaffold_paths.loc[scaffold_paths['del'].shift(1, fill_value=False), 'sdist_left'] = -1
+    scaffold_paths['conlen'] = 0
+    scaffold_paths.loc[scaffold_paths['con0'] >= 0, 'conlen'] = contig_parts.loc[scaffold_paths.loc[scaffold_paths['con0'] >= 0, 'con0'].values, 'end'].values - contig_parts.loc[scaffold_paths.loc[scaffold_paths['con0'] >= 0, 'con0'].values, 'start'].values
+    scaffold_paths.reset_index(drop=True, inplace=True)
+    cur_entries = scaffold_paths.loc[(scaffold_paths['sdist_right'] >= 0) & scaffold_paths['del'].shift(-1, fill_value=False) & (scaffold_paths['del'] == False), ['sdist_right']].reset_index()
+    cur_entries.index = cur_entries['index'].values
+    s = 1
+    while len(cur_entries):
+        bridged = cur_entries[scaffold_paths.loc[cur_entries['index'].values+s, 'del'].values == False].copy()
+        if len(bridged):
+            scaffold_paths.loc[bridged['index'].values, 'sdist_right'] = bridged['sdist_right'].values
+            scaffold_paths.loc[bridged['index'].values+s, 'sdist_left'] = bridged['sdist_right'].values
+            cur_entries.drop(bridged['index'].values, inplace=True)
+        broken = cur_entries[scaffold_paths.loc[cur_entries['index'].values+s, 'sdist_right'].values < 0].copy()
+        if len(broken):
+            scaffold_paths.loc[broken['index'].values, 'sdist_right'] = -1
+            cur_entries.drop(broken['index'].values, inplace=True)
+        if len(cur_entries):
+            cur_entries['sdist_right'] += scaffold_paths.loc[cur_entries['index'].values+s, 'sdist_right'].values + scaffold_paths.loc[cur_entries['index'].values+s, 'conlen'].values
+            s += 1
+    # Update result_info
+    removed_length = scaffold_paths.loc[scaffold_paths['del'], 'conlen'].values
+    result_info['removed2'] = {}
+    result_info['removed2']['num'] = len(removed_length)
+    result_info['removed2']['total'] = np.sum(removed_length) if len(removed_length) else 0
+    result_info['removed2']['min'] = np.min(removed_length) if len(removed_length) else 0
+    result_info['removed2']['max'] = np.max(removed_length) if len(removed_length) else 0
+    result_info['removed2']['mean'] = np.mean(removed_length) if len(removed_length) else 0
+    # Remove the unconnected contigs scheduled for deletion
+    scaffold_paths = scaffold_paths[scaffold_paths['del'] == False].drop(columns=['del','conlen'])
+#
+    return scaffold_paths, result_info
+
 def PrepareScaffoldPathForMapping(scaffold_paths, bridges, ploidy):
     # Prepare entries in scaffold_paths for mapping
     all_scafs = []
@@ -6735,12 +6834,13 @@ def GetOutputInfo(result_info, scaffold_paths):
     return result_info
 
 def PrintStats(result_info):
-    print("Input assembly:  {:,.0f} contigs   (Total sequence: {:,.0f} Min: {:,.0f} Max: {:,.0f} N50: {:,.0f})".format(result_info['input']['contigs']['num'], result_info['input']['contigs']['total'], result_info['input']['contigs']['min'], result_info['input']['contigs']['max'], result_info['input']['contigs']['N50']))
-    print("                 {:,.0f} scaffolds (Total sequence: {:,.0f} Min: {:,.0f} Max: {:,.0f} N50: {:,.0f})".format(result_info['input']['scaffolds']['num'], result_info['input']['scaffolds']['total'], result_info['input']['scaffolds']['min'], result_info['input']['scaffolds']['max'], result_info['input']['scaffolds']['N50']))
-    print("Removed          {:,.0f} contigs   (Total sequence: {:,.0f} Min: {:,.0f} Max: {:,.0f} Mean: {:,.0f})".format(result_info['removed']['num'], result_info['removed']['total'], result_info['removed']['min'], result_info['removed']['max'], result_info['removed']['mean']))
+    print("Input assembly:     {:8,.0f} contigs   (Total sequence: {:,.0f} Min: {:,.0f} Max: {:,.0f} N50: {:,.0f})".format(result_info['input']['contigs']['num'], result_info['input']['contigs']['total'], result_info['input']['contigs']['min'], result_info['input']['contigs']['max'], result_info['input']['contigs']['N50']))
+    print("                    {:8,.0f} scaffolds (Total sequence: {:,.0f} Min: {:,.0f} Max: {:,.0f} N50: {:,.0f})".format(result_info['input']['scaffolds']['num'], result_info['input']['scaffolds']['total'], result_info['input']['scaffolds']['min'], result_info['input']['scaffolds']['max'], result_info['input']['scaffolds']['N50']))
+    print("Removed from input  {:8,.0f} contigs   (Total sequence: {:,.0f} Min: {:,.0f} Max: {:,.0f} Mean: {:,.0f})".format(result_info['removed']['num'], result_info['removed']['total'], result_info['removed']['min'], result_info['removed']['max'], result_info['removed']['mean']))
     print("Introduced {:,.0f} breaks of which {:,.0f} have been resealed".format(result_info['breaks']['opened'], result_info['breaks']['resealed']))
-    print("Output assembly: {:,.0f} contigs   (Total sequence: {:,.0f} Min: {:,.0f} Max: {:,.0f} N50: {:,.0f})".format(result_info['output']['contigs']['num'], result_info['output']['contigs']['total'], result_info['output']['contigs']['min'], result_info['output']['contigs']['max'], result_info['output']['contigs']['N50']))
-    print("                 {:,.0f} scaffolds (Total sequence: {:,.0f} Min: {:,.0f} Max: {:,.0f} N50: {:,.0f})".format(result_info['output']['scaffolds']['num'], result_info['output']['scaffolds']['total'], result_info['output']['scaffolds']['min'], result_info['output']['scaffolds']['max'], result_info['output']['scaffolds']['N50']))
+    print("Removed from output {:8,.0f} contigs   (Total sequence: {:,.0f} Min: {:,.0f} Max: {:,.0f} Mean: {:,.0f})".format(result_info['removed2']['num'], result_info['removed2']['total'], result_info['removed2']['min'], result_info['removed2']['max'], result_info['removed2']['mean']))
+    print("Output assembly:    {:8,.0f} contigs   (Total sequence: {:,.0f} Min: {:,.0f} Max: {:,.0f} N50: {:,.0f})".format(result_info['output']['contigs']['num'], result_info['output']['contigs']['total'], result_info['output']['contigs']['min'], result_info['output']['contigs']['max'], result_info['output']['contigs']['N50']))
+    print("                    {:8,.0f} scaffolds (Total sequence: {:,.0f} Min: {:,.0f} Max: {:,.0f} N50: {:,.0f})".format(result_info['output']['scaffolds']['num'], result_info['output']['scaffolds']['total'], result_info['output']['scaffolds']['min'], result_info['output']['scaffolds']['max'], result_info['output']['scaffolds']['N50']))
 
 def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapping_length, min_length_contig_break, prefix=False, stats=None):
     # Put in default parameters if nothing was specified
@@ -6753,6 +6853,7 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     keep_all_subreads = False
     alignment_precision = 100
 #
+    proportion_duplicated = 0.95
     max_repeat_extension = 1000 # Expected to be bigger than or equal to min_mapping_length
     min_len_repeat_connection = 5000
     repeat_len_factor_unique = 10
@@ -6775,12 +6876,14 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     prob_factor = 10
     min_distance_tolerance = 20
     rel_distance_tolerance = 0.2
-    ploidy = 2
     org_scaffold_trust = "basic" # blind: If there is a read that supports it use the org scaffold; Do not break contigs
                                  # full: If there is no confirmed other option use the org scaffold
                                  # basic: If there is no alternative bridge use the org scaffold
                                  # no: Do not give preference to org scaffolds
+#
+    ploidy = 2
     max_loop_units = 10
+    lowmap_threshold = 0.05
 
     # Guarantee that outdir exists
     outdir = os.path.dirname(prefix)
@@ -6802,14 +6905,13 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     result_info = {}
     result_info = GetInputInfo(result_info, contigs)
 #
-    print( str(timedelta(seconds=clock())), "Processing repeats")
+    print( str(timedelta(seconds=clock())), "Loading repeats")
+    repeats = LoadRepeats(repeat_file, contig_ids)
 #    contigs, center_repeats = MaskRepeatEnds(contigs, repeat_file, contig_ids, max_repeat_extension, min_len_repeat_connection, repeat_len_factor_unique, remove_duplicated_contigs, pdf)
 #
     print( str(timedelta(seconds=clock())), "Filtering mappings")
-    mappings, cov_counts, cov_probs = ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, alignment_precision, min_num_reads, cov_bin_fraction, num_read_len_groups, pdf)
-    contigs = RemoveUnmappedContigs(contigs, mappings, remove_zero_hit_contigs)
-#    mappings = RemoveUnanchoredMappings(mappings, contigs, center_repeats, min_mapping_length, pdf, max_dist_contig_end)
-#    del center_repeats
+    mappings, cov_counts, cov_probs = ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, alignment_precision, cov_bin_fraction, num_read_len_groups, pdf)
+    contigs, covered_regions = RemoveUnmappedContigs(contigs, mappings, remove_zero_hit_contigs)
 #
     print( str(timedelta(seconds=clock())), "Account for left-over adapters")
     mappings = BreakReadsAtAdapters(mappings, alignment_precision, keep_all_subreads)
@@ -6817,16 +6919,17 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     print( str(timedelta(seconds=clock())), "Search for possible break points")
     if "blind" == org_scaffold_trust:
         # Do not break contigs
-        break_groups, spurious_break_indexes, non_informative_mappings = CallAllBreaksSpurious(mappings, contigs, max_dist_contig_end, min_length_contig_break, min_extension, pdf)
+        break_groups, spurious_break_indexes, non_informative_mappings = CallAllBreaksSpurious(mappings, contigs, covered_regions, max_dist_contig_end, min_length_contig_break, min_extension, pdf)
     else:
-        break_groups, spurious_break_indexes, non_informative_mappings, unconnected_breaks = FindBreakPoints(mappings, contigs, max_dist_contig_end, min_mapping_length, min_length_contig_break, max_break_point_distance, min_num_reads, min_extension, merge_block_length, org_scaffold_trust, cov_probs, prob_factor, allow_same_contig_breaks, prematurity_threshold, pdf)
+        break_groups, spurious_break_indexes, non_informative_mappings, unconnected_breaks = FindBreakPoints(mappings, contigs, covered_regions, max_dist_contig_end, min_mapping_length, min_length_contig_break, max_break_point_distance, min_num_reads, min_extension, merge_block_length, org_scaffold_trust, cov_probs, prob_factor, allow_same_contig_breaks, prematurity_threshold, pdf)
     mappings.drop(np.concatenate([np.unique(spurious_break_indexes['map_index'].values), non_informative_mappings]), inplace=True) # Remove not-accepted breaks from mappings and mappings that do not contain any information (mappings inside of contigs that do not overlap with breaks)
     #SplitReadsAtSpuriousBreakIndexes(mappings, spurious_break_indexes)
     del spurious_break_indexes, non_informative_mappings
 #
-    contig_parts, contigs = GetContigParts(contigs, break_groups, remove_short_contigs, min_mapping_length, alignment_precision, pdf)
+    contig_parts, contigs = GetContigParts(contigs, break_groups, covered_regions, remove_short_contigs, remove_zero_hit_contigs, min_mapping_length, alignment_precision, pdf)
     result_info = GetBreakAndRemovalInfo(result_info, contigs, contig_parts)
     mappings = UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length, max_dist_contig_end, min_extension)
+    repeats = FindDuplicatedContigPartEnds(repeats, contig_parts, max_dist_contig_end, proportion_duplicated)
     del break_groups, contigs, contig_ids
 #
     print( str(timedelta(seconds=clock())), "Search for possible bridges")
@@ -6834,6 +6937,7 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
 #
     print( str(timedelta(seconds=clock())), "Scaffold the contigs")
     scaffold_paths = ScaffoldContigs(contig_parts, bridges, mappings, cov_probs, prob_factor, min_mapping_length, max_dist_contig_end, prematurity_threshold, ploidy, max_loop_units)
+    scaffold_paths, result_info = RemoveUnconnectedLowlyMappedOrDuplicatedContigs(scaffold_paths, result_info, mappings, contig_parts, cov_probs, repeats, ploidy, lowmap_threshold)
 #
     print( str(timedelta(seconds=clock())), "Fill gaps")
     mappings, scaffold_paths = MapReadsToScaffolds(mappings, scaffold_paths, bridges, ploidy) # Might break apart scaffolds again, if we cannot find a mapping read for a connection
@@ -7768,9 +7872,10 @@ def TestFindBreakPoints():
     cov_probs = pd.DataFrame( {'length': {0: 1322, 1: 2310, 2: 3423, 3: 4747, 4: 6352, 5: 8342, 6: 10885, 7: 14391, 8: 19515},
                                'mu': {0: 23.584247754696893, 1: 20.504403471788635, 2: 17.50634409745549, 3: 14.479950280985337, 4: 11.469365157471334, 5: 8.499501941440332, 6: 5.644689191431619, 7: 2.9181378061105048, 8: 0.6972656560039101},
                                'sigma': {0: 10.77667641634545, 1: 9.626709919730942, 2: 8.528159984470921, 3: 7.409683003018617, 4: 6.278824836158851, 5: 5.134680019120394, 6: 3.951599912388506, 7: 2.706556531266621, 8: 1.6980926441778164}} )
+    covered_regions = mappings.groupby(['t_id']).agg({'t_start':'min','t_end':'max'}).reset_index().rename(columns={'t_id':'con_id','t_start':'from','t_end':'to'})
     # Run and validate in steps
     pdf = None
-    pot_breaks = GetBrokenMappings(mappings, max_dist_contig_end, min_length_contig_break, pdf)
+    pot_breaks = GetBrokenMappings(mappings, covered_regions, max_dist_contig_end, min_length_contig_break, pdf)
     pot_breaks = pot_breaks[np.isin(pot_breaks['contig_id'], [62, 118])].copy()
     break_points, bp_map_len = PreparePotBreakPoints(pot_breaks, max_break_point_distance, min_mapping_length, min_num_reads)
     test = []
@@ -7819,7 +7924,7 @@ def TestFindBreakPoints():
         print(test)
         return True
 #
-    break_points, unconnected_break_points = CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_map_len, cov_probs, max_dist_contig_end, max_break_point_distance, min_mapping_length, min_num_reads, min_length_contig_break, prob_factor, merge_block_length, prematurity_threshold)
+    break_points, unconnected_break_points = CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_map_len, cov_probs, covered_regions, max_dist_contig_end, max_break_point_distance, min_mapping_length, min_num_reads, min_length_contig_break, prob_factor, merge_block_length, prematurity_threshold)
     test = []
     test.append( pd.DataFrame( {'contig_id': {0: 118, 1: 118, 2: 118, 3: 118, 4: 118, 5: 118, 6: 118, 7: 118, 8: 118, 9: 118},
                                 'position': {0: 5459, 1: 5502, 2: 5541, 3: 5551, 4: 5557, 5: 5559, 6: 5561, 7: 5562, 8: 5564, 9: 5566},
