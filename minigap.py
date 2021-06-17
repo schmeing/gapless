@@ -2539,9 +2539,9 @@ def GetLoopUnitsInBothDirections(loops):
 #
     return bidi_loops
 
-def FindConnectionsBetweenLoopUnits(loops, scaffold_graph, full_info):
+def FindLoopUnitExtensions(bidi_loops, scaffold_graph):
     # Get the positions where the scaffold_graph from the end of the loop units splits to later check only there to reduce the advantage of long reads just happen to be on one connection
-    first_diff = scaffold_graph.loc[np.isin(scaffold_graph['from'], np.unique(loops['scaf0'].values)), ['from','from_side']].reset_index().rename(columns={'index':'index1'})
+    first_diff = scaffold_graph.loc[np.isin(scaffold_graph['from'], np.unique(bidi_loops['scaf0'].astype(int).values)), ['from','from_side']].reset_index().rename(columns={'index':'index1'})
     first_diff = first_diff.merge(first_diff.rename(columns={'index1':'index2'}), on=['from','from_side'], how='inner').drop(columns=['from','from_side'])
     first_diff = first_diff[first_diff['index1'] != first_diff['index2']].copy()
     first_diff['diff'] = -1
@@ -2557,7 +2557,7 @@ def FindConnectionsBetweenLoopUnits(loops, scaffold_graph, full_info):
     units = diffs[['index1']].drop_duplicates()
     units[['scaf0','strand0']] = scaffold_graph.loc[ units['index1'].values, ['from','from_side']].values
     units['strand0'] = np.where(units['strand0'] == 'l', '+', '-') # For the first_diffs we went into the oppositee direction to get the diffs from which we can extend over the ends
-    bidi_loops = GetLoopUnitsInBothDirections(loops)
+    
     units = units.merge(bidi_loops[['scaf0','strand0']].reset_index().rename(columns={'index':'bindex'}), on=['scaf0','strand0'], how='left').drop(columns=['scaf0','strand0'])
     units['ls'] = bidi_loops.loc[units['bindex'].values, 'length'].values - 2
     units['len'] = np.minimum(scaffold_graph.loc[units['index1'].values, 'length'].values, units['ls']+2)
@@ -2615,6 +2615,12 @@ def FindConnectionsBetweenLoopUnits(loops, scaffold_graph, full_info):
         extensions = extensions[extensions['diff'] == np.repeat(max_diff['max'].values, max_diff['size'].values)].drop(columns=['diff'])
         extensions = RemoveEmptyColumns(extensions)
         extendible = diffs.loc[np.isin(diffs['index1'], max_diff.index.values), ['index1','bindex']].drop_duplicates()
+#
+    return extensions, extendible
+
+def FindConnectionsBetweenLoopUnits(loops, scaffold_graph, full_info):
+    bidi_loops = GetLoopUnitsInBothDirections(loops)
+    extensions, extendible = FindLoopUnitExtensions(bidi_loops, scaffold_graph)
     # Get the loop units matching the extensions
     loop_conns = []
     if len(extensions):
@@ -2964,6 +2970,7 @@ def AddPathThroughLoops(scaffold_paths, scaffold_graph, scaf_bridges, org_scaf_c
     # Get the loop units to fill the connections
     start_units = []
     if len(exit_conns) and len(loops):
+        # Store all loop units consistent with the sequence from the exit in start_units
         for sfrom in range(1,exit_conns['length'].max()):
             pairs = exit_conns.loc[exit_conns['length'] > sfrom, ['loop',f'scaf{sfrom}',f'strand{sfrom}']].reset_index().rename(columns={'index':'eindex',f'scaf{sfrom}':'scaf0',f'strand{sfrom}':'strand0'}).merge(bidi_loops[['loop','scaf0','strand0']].reset_index().rename(columns={'index':'bindex'}), on=['loop','scaf0','strand0'], how='inner').drop(columns=['loop','scaf0','strand0'])
             pairs['length'] = np.minimum(exit_conns.loc[pairs['eindex'].values, 'length'].values - sfrom, bidi_loops.loc[pairs['bindex'].values, 'length'].values)
@@ -2975,9 +2982,40 @@ def AddPathThroughLoops(scaffold_paths, scaffold_graph, scaf_bridges, org_scaf_c
                 if len(pairs):
                     pairs = pairs[(exit_conns.loc[pairs['eindex'].values, [f'scaf{sfrom+s}',f'strand{sfrom+s}',f'dist{sfrom+s}']].values == bidi_loops.loc[pairs['bindex'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values).all(axis=1)].copy()
                     s += 1
+        # Update exit_conns with start_units
+        if len(start_units):
+            # Filter out start_units that are not consistent with the extensions of the loop unit
+            extensions, extendible = FindLoopUnitExtensions(bidi_loops, scaffold_graph)
+            exit_conns['scaf0'] = exit_conns['from']
+            exit_conns['strand0'] = np.where(exit_conns['from_side'] == 'r', '+', '-')
+            start_units = pd.concat(start_units, ignore_index=True)
+            start_units['lindex'] = bidi_loops.loc[start_units['bindex'].values, 'lindex'].values
+            start_units['rstrand'] = np.where( bidi_loops.loc[start_units['bindex'].values, 'strand0'].values == '+', '-', '+' )
+            start_units['rindex'] = start_units[['lindex','rstrand']].rename(columns={'rstrand':'strand0'}).merge(bidi_loops[['lindex','strand0']].reset_index().rename(columns={'index':'rindex'}), on=['lindex','strand0'], how='left')[['rindex']].values
+            start_units.drop(columns=['lindex','rstrand'], inplace=True)
+            start_units = start_units.merge(extendible.rename(columns={'bindex':'rindex'}), on='rindex', how='left')
+            start_units.drop(columns=['rindex'], inplace=True)
+            start_units['index1'] = start_units['index1'].fillna(-1).astype(int)
+            start_units = start_units.merge(extensions[['index1','length']].reset_index().rename(columns={'index':'extindex'}), on='index1', how='left')
+            start_units.drop(columns=['index1'], inplace=True)
+            start_units['extindex'] = start_units['extindex'].fillna(-1).astype(int)
+            start_units['length'] = np.minimum(start_units['sfrom']+1, start_units['length'].fillna(0).astype(int))
+            for s in range(1,start_units['length'].max()):
+                cur = start_units['length'] > s
+                if np.sum(cur):
+                    for f in np.unique(start_units.loc[cur, 'sfrom'].values):
+                        cur2 = cur & (start_units['sfrom'] == f)
+                        start_units.loc[cur2, ['cscaf','cstrand','cdist']] = exit_conns.loc[start_units.loc[cur2, 'eindex'].values, [f'scaf{f-s}',f'strand{f-s}',f'dist{f-s+1}']].values
+                    start_units['cstrand'] = np.where(start_units['cstrand'] == '+', '-', '+')
+                    start_units['keep'] = cur == False
+                    start_units.loc[cur, 'keep'] = (start_units.loc[cur, ['cscaf','cstrand','cdist']].values == extensions.loc[start_units.loc[cur, 'extindex'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values).all(axis=1)
+                    start_units = start_units[ start_units['keep'] ].copy()
+            start_units.drop(columns=['extindex','length','cscaf','cstrand','cdist','keep'], inplace=True)
+            start_units.drop_duplicates(inplace=True)
+            exit_conns.drop(columns=['scaf0','strand0'], inplace=True)
         exit_conns['from_units'] = 0
         if len(start_units):
-            start_units = pd.concat(start_units, ignore_index=True)
+            # Get the earliest valid start points (first_match) in start_units
             start_units.sort_values(['eindex','sfrom','bindex'], inplace=True)
             first_match = start_units.groupby(['eindex'])['sfrom'].agg(['min','size'])
             start_units = start_units[start_units['sfrom'] == np.repeat(first_match['min'].values, first_match['size'].values)].copy()
@@ -5616,6 +5654,7 @@ def TraverseScaffoldingGraph(scaffolds, scaffold_graph, graph_ext, scaf_bridges,
         scaffold_paths[f'dist{h}'] = 0
     CheckScaffoldPathsConsistency(scaffold_paths)
     CheckIfScaffoldPathsFollowsValidBridges(scaffold_paths, scaf_bridges, ploidy)
+    scaffold_path2 = scaffold_paths.copy()
 #
     # Combine paths as much as possible
     print("Start")
@@ -5638,15 +5677,18 @@ def TraverseScaffoldingGraph(scaffolds, scaffold_graph, graph_ext, scaf_bridges,
             CheckIfScaffoldPathsFollowsValidBridges(scaffold_paths, scaf_bridges, ploidy)
         if i==0:
             print("RemoveDuplicates")
+            scaffold_path3 = scaffold_paths.copy()
             scaffold_paths = RemoveDuplicates(scaffold_paths, True, ploidy)
         elif i==1:
             print("PlaceUnambigouslyPlaceables")
+            scaffold_path4 = scaffold_paths.copy()
             scaffold_paths = PlaceUnambigouslyPlaceablePathsAsAlternativeHaplotypes(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges, ploidy)
         if i != 2:
             print(len(np.unique(scaffold_paths['pid'].values)))
             CheckScaffoldPathsConsistency(scaffold_paths)
             CheckIfScaffoldPathsFollowsValidBridges(scaffold_paths, scaf_bridges, ploidy)
     print("TrimAmbiguousOverlap")
+    scaffold_path5 = scaffold_paths.copy()
     scaffold_paths = TrimAmbiguousOverlap(scaffold_paths, scaffold_graph, ploidy)
     print(len(np.unique(scaffold_paths['pid'].values)))
     print("TrimCircularPaths")
@@ -6862,7 +6904,7 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     remove_zero_hit_contigs = True
     remove_short_contigs = True
     min_extension = 500
-    max_dist_contig_end = 2000
+    max_dist_contig_end = 500
     max_break_point_distance = 200
     merge_block_length = 10000
     prematurity_threshold = 0.05
