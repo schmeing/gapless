@@ -37,7 +37,7 @@ def MiniGapSplit(fa_file,o_file=False,min_n=False):
         os.remove(o_file)
 
     with open(o_file, 'w') as fout:
-        with gzip.open(fa_file, 'rb') if 'gz' == fa_file.rsplit('.',1)[-1] else open(fa_file, 'rU') as fin:
+        with gzip.open(fa_file, 'rt') if 'gz' == fa_file.rsplit('.',1)[-1] else open(fa_file, 'rU') as fin:
             for record in SeqIO.parse(fin, "fasta"):
                 # Split scaffolds into contigs
                 contigs=re.split('([nN]+)',str(record.seq))
@@ -96,7 +96,7 @@ def ReadContigs(assembly_file):
     contig_end = -1
     last_scaffold = ""
 
-    with gzip.open(assembly_file, 'rb') if 'gz' == assembly_file.rsplit('.',1)[-1] else open(assembly_file, 'rU') as fin:
+    with gzip.open(assembly_file, 'rt') if 'gz' == assembly_file.rsplit('.',1)[-1] else open(assembly_file, 'rU') as fin:
         for record in SeqIO.parse(fin, "fasta"):
             seqid = record.description.split(' ', 1 ) # Split identifier(name) and further description
             names.append(seqid[0])
@@ -7763,7 +7763,7 @@ def MiniGapFinish(assembly_file, read_file, read_format, scaffold_file, output_f
 #
     print( str(timedelta(seconds=clock())), "Loading assembly from: {}".format(assembly_file))
     contigs = {}
-    with gzip.open(assembly_file, 'rb') if 'gz' == assembly_file.rsplit('.',1)[-1] else open(assembly_file, 'rU') as fin:
+    with gzip.open(assembly_file, 'rt') if 'gz' == assembly_file.rsplit('.',1)[-1] else open(assembly_file, 'rU') as fin:
         for record in SeqIO.parse(fin, "fasta"):
             contigs[ record.description.split(' ', 1)[0] ] = record.seq
 #
@@ -7775,7 +7775,7 @@ def MiniGapFinish(assembly_file, read_file, read_format, scaffold_file, output_f
             read_format = "fasta"
         else:
             read_format = "fastq"
-    with gzip.open(read_file, 'rb') if 'gz' == read_file.rsplit('.',1)[-1] else open(read_file, 'rU') as fin:
+    with gzip.open(read_filt, 'rt') if 'gz' == read_file.rsplit('.',1)[-1] else open(read_file, 'rU') as fin:
         for record in SeqIO.parse(fin, read_format):
             reads[ record.description.split(' ', 1)[0] ] = record.seq
     
