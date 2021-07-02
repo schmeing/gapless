@@ -337,7 +337,7 @@ def NormCDF(x, mu, sigma):
 def CovChi2(par, df): #, expo
     return np.sum((NormCDF(df['x'], par[0], par[1]) - df['y'])**2)
     
-def GetCoverageProbabilities(cov_counts, cov_bin_fraction, pdf):
+def GetCoverageProbabilities(cov_counts, pdf):
     probs = cov_counts.groupby(['bin_size','count']).size().reset_index(name='nbins')
     probs['nbin_cumsum'] = probs.groupby(['bin_size'], sort=False)['nbins'].cumsum()
     cov_bins = probs.groupby(['bin_size'])['nbins'].agg(['sum','size']).reset_index()
@@ -383,12 +383,12 @@ def GetBestSubreads(mappings, alignment_precision):
     
     return mappings
 
-def ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, alignment_precision, cov_bin_fraction, num_read_len_groups, pdf):
+def ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, alignment_precision, num_read_len_groups, pdf):
     mappings = ReadPaf(mapping_file)
 
     length_thresholds = GetThresholdsFromReadLenDist(mappings, num_read_len_groups)
     cov_counts = GetBinnedCoverage(mappings, length_thresholds)
-    cov_probs = GetCoverageProbabilities(cov_counts, cov_bin_fraction, pdf)
+    cov_probs = GetCoverageProbabilities(cov_counts, pdf)
     cov_counts.rename(columns={'count':'count_all'}, inplace=True)
 
     # Filter low mapping qualities
@@ -1093,7 +1093,7 @@ def UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length, max_
     mappings['right_con_side'] = np.where('-' == mappings['strand'], mappings['prev_side'], mappings['next_side'])
     mappings.loc[-1 == mappings['right_con'], 'right_con_side'] = ''
 #
-    # Remove connections that are not starting within max_dist_contig_end or are consistent with a contig part
+    # Remove connections that are consistent with a contig part (not bridging it to itself) or are not starting within max_dist_contig_end
     mappings['left'] = mappings['con_from'] <= mappings['part_start']+max_dist_contig_end
     mappings['right'] = mappings['con_to'] >= mappings['part_end']-max_dist_contig_end
     mappings['remleft'] = (( (mappings['left'] == False) | ((mappings['left_con_side'] == 'r') & (False == np.where(mappings['strand'] == '+', mappings['right'].shift(1), mappings['right'].shift(-1))))
@@ -1365,7 +1365,7 @@ def FilterBridges(bridges, bridge_maplen, borderline_removal, min_factor_alterna
     else:
         bridges['org_scaffold'] = False # Do not use original scaffolds
 
-    # Set lowq flags for all bridges that don't fulfill min_num_reads except for the ones with additional support from original scaffolds
+    # Set lowq flags for all bridges that don't fulfill min_num_reads
     bridges['low_q'] = (bridges['cumcount'] < min_num_reads)
 #
     # Remove lowq for the distance with the highest counts of each original scaffolds
@@ -1402,9 +1402,8 @@ def FilterBridges(bridges, bridge_maplen, borderline_removal, min_factor_alterna
     bridges = bridges[bridges['low_q'] == False].copy()
     bridges.drop(columns=['low_q'], inplace=True)
     
-    # Check for prematurely ending bridges first with mapping length and then with read length after the gap (extension length)
+    # Check for prematurely ending bridges first with mapping length and read length after the gap (extension length)
     for c in ['maplen','extlen']:
-    #for c in ['maplen']:
         # Get longest mapping for every bridge and summarise that for every starting conting end
         maplen_sum = bridge_maplen.groupby(['from','from_side','to','to_side','mean_dist']).agg({f'from_{c}':'max','from_atend':'max',f'to_{c}':'max','to_atend':'max', 'distance':'size'}).reset_index().rename(columns={'distance':'counts'})
         maplen_sum = maplen_sum.merge(bridges[['from','from_side','to','to_side','mean_dist']].drop_duplicates(), on=['from','from_side','to','to_side','mean_dist'], how='inner') # Remove already filtered bridges
@@ -1434,7 +1433,7 @@ def FilterBridges(bridges, bridge_maplen, borderline_removal, min_factor_alterna
             bridges[f'same_from_{c}_premat' if e == 'from' else f'diff_from_{c}_premat'] = bridges[['from','from_side','to','to_side','mean_dist']].merge(cur_maplen, on=['from','from_side','to','to_side','mean_dist'], how='left')['premat_prob'].fillna(1.0).values
             bridges[f'same_to_{c}_premat' if e == 'from' else f'diff_to_{c}_premat'] = bridges[['from','from_side','to','to_side','mean_dist']].merge(cur_maplen.rename(columns={'from':'to','to':'from','from_side':'to_side','to_side':'from_side'}), on=['from','from_side','to','to_side','mean_dist'], how='left')['premat_prob'].fillna(1.0).values
 #
-    # Remove prematurely ending bridges
+    # Remove prematurely ending bridges (if this would remove all bridges from both sides keep the ones with the highest probability)
     bridges['premat_prob'] = bridges[['same_from_extlen_premat','same_to_extlen_premat','diff_from_extlen_premat','diff_to_extlen_premat','same_from_maplen_premat','same_to_maplen_premat','diff_from_maplen_premat','diff_to_maplen_premat']].min(axis=1)
     bridges.drop(columns=['same_from_extlen_premat','same_to_extlen_premat','diff_from_extlen_premat','diff_to_extlen_premat','same_from_maplen_premat','same_to_maplen_premat','diff_from_maplen_premat','diff_to_maplen_premat'], inplace=True)
     bridges['not_premat'] = bridges['premat_prob'] > prematurity_threshold
@@ -2728,6 +2727,37 @@ def AddConnectedScaffolds(loop_scafs, scaffold_graph):
 #
     return loop_scafs
 
+def FindScaffoldsConnectedToLoops(scaffold_graph):
+    # Get the loop units and find scaffolds in them
+    repeated_scaffolds, repeat_graph = FindRepeatedScaffolds(scaffold_graph)
+    if len(repeated_scaffolds):
+        loops = []
+        for s in range(1, repeat_graph['length'].max()):
+            loops.append(repeat_graph.loc[(repeat_graph['from'] == repeat_graph[f'scaf{s}']) & (repeat_graph['from_side'] == 'r') & (repeat_graph[f'strand{s}'] == '+'), ['from','length']+[f'scaf{s1}' for s1 in range(1,s+1) for n in ['scaf']]])
+            loops[-1]['length'] = s+1
+        loops = pd.concat(loops, ignore_index=True, sort=False)
+        loops['scaf0'] = loops['from']
+    loop_scafs = []
+    if len(loops):
+        for s in range(loops['length'].max()-1): # The last base is just the repeated scaffold again
+            loop_scafs.append( loops.loc[loops['length'] > s+1, ['from',f'scaf{s}']].drop_duplicates().astype(int).rename(columns={'from':'loop',f'scaf{s}':'scaf'}) )
+        loop_scafs = pd.concat(loop_scafs)
+        loop_scafs.drop_duplicates(inplace=True)
+        # Find all scaffolds connected to the loop
+        loop_scafs['inside'] = True
+        loop_scafs['exit'] = False
+        loop_scafs = ConnectLoopsThatShareScaffolds(loop_scafs)
+        loop_scafs = AddConnectedScaffolds(loop_scafs, scaffold_graph)
+        while np.sum(loop_scafs['inside'] == loop_scafs['exit']): # New entries, where we do not know yet if they are inside the loop or an exit
+            loop_scafs = FindLoopExits(loop_scafs, scaffold_graph)
+            loop_size = loop_scafs.groupby(['loop']).size().reset_index(name='nbefore')
+            loop_scafs = ConnectLoopsThatShareScaffolds(loop_scafs)
+            loop_size['nafter'] = loop_size[['loop']].merge(loop_scafs.groupby(['loop']).size().reset_index(name='nafter'), on=['loop'], how='left')['nafter'].values
+            loop_scafs.loc[np.isin(loop_scafs['loop'], loop_size.loc[loop_size['nbefore'] < loop_size['nafter'], 'loop'].values), 'exit'] = False # We cannot guarantee that the exits are still exits in merged loops
+            loop_scafs = AddConnectedScaffolds(loop_scafs, scaffold_graph)
+#
+    return loop_scafs
+
 def FindLoopExits(loop_scafs, scaffold_graph):
     loop_scafs.loc[np.isin(loop_scafs['loop'], loop_scafs.loc[loop_scafs['inside'] == loop_scafs['exit'], 'loop'].drop_duplicates().values), 'exit'] = False # If we added new scaffolds to the loop we cannot guarantee anymore that the exits are still exits, so check again
     exit_graph = scaffold_graph[['from','from_side','length']+[f'scaf{s}' for s in range(1,scaffold_graph['length'].max())]].merge(loop_scafs.loc[loop_scafs['inside'] == loop_scafs['exit'], ['scaf','loop']].rename(columns={'scaf':'from'}), on=['from'], how='inner')
@@ -3026,10 +3056,16 @@ def FindConnectionsBetweenLoopUnits(loops, scaffold_graph, full_info):
                 overlapping_units = pd.concat(overlapping_units, ignore_index=True)
             # Filter out the ones that do not match an extension
             if len(overlapping_units):
-                overlapping_units = overlapping_units.merge(extendible.rename(columns={'bindex':'bindex1'}), on=['bindex1'], how='left')
-                overlapping_units['index1'] = overlapping_units['index1'].fillna(-1).astype(int)
-                overlapping_units = overlapping_units.merge(extensions, on=['index1'], how='left')
-                overlapping_units['length'] = overlapping_units['length'].fillna(0).astype(int)
+                if len(extendible):
+                    overlapping_units = overlapping_units.merge(extendible.rename(columns={'bindex':'bindex1'}), on=['bindex1'], how='left')
+                    overlapping_units['index1'] = overlapping_units['index1'].fillna(-1).astype(int)
+                else:
+                    overlapping_units['index1'] = -1
+                if len(extensions):
+                    overlapping_units = overlapping_units.merge(extensions, on=['index1'], how='left')
+                    overlapping_units['length'] = overlapping_units['length'].fillna(0).astype(int)
+                else:
+                    overlapping_units['length'] = 0
                 overlapping_units['s2'] = bidi_loops.loc[overlapping_units['bindex1'].values, 'length'].values - overlapping_units['sfrom']
                 for s in range(1, overlapping_units['length'].max()):
                     overlapping_units['valid'] = overlapping_units['length'] <= s
@@ -3163,7 +3199,10 @@ def GetHandledScaffoldConnectionsFromVerticalPath(vpaths):
     handled_scaf_conns[['scaf0','scaf1','dist1']] = handled_scaf_conns[['scaf0','scaf1','dist1']].astype(int)
     handled_scaf_conns.drop_duplicates(inplace=True)
     # Also get reverse direction
-    handled_scaf_conns = pd.concat([handled_scaf_conns, handled_scaf_conns.rename(columns={'scaf0':'scaf1','scaf1':'scaf0','strand0':'strand1','strand1':'strand0'})], ignore_index=True)
+    reversed_scaf_conns = handled_scaf_conns.rename(columns={'scaf0':'scaf1','scaf1':'scaf0','strand0':'strand1','strand1':'strand0'})
+    for s in [0,1]:
+        reversed_scaf_conns[f'strand{s}'] = np.where(reversed_scaf_conns[f'strand{s}'] == '+', '-', '+')
+    handled_scaf_conns = pd.concat([handled_scaf_conns, reversed_scaf_conns], ignore_index=True)
     handled_scaf_conns.drop_duplicates(inplace=True)
 #
     return handled_scaf_conns
@@ -3186,33 +3225,7 @@ def TurnHorizontalPathIntoVertical(vpaths, min_path_id):
     return hpaths
 
 def AddPathThroughLoops(scaffold_paths, scaffold_graph, scaf_bridges, org_scaf_conns, ploidy, max_loop_units):
-    # Get the loop units and find scaffolds in them
-    repeated_scaffolds, repeat_graph = FindRepeatedScaffolds(scaffold_graph)
-    if len(repeated_scaffolds):
-        loops = []
-        for s in range(1, repeat_graph['length'].max()):
-            loops.append(repeat_graph.loc[(repeat_graph['from'] == repeat_graph[f'scaf{s}']) & (repeat_graph['from_side'] == 'r') & (repeat_graph[f'strand{s}'] == '+'), ['from','length']+[f'scaf{s1}' for s1 in range(1,s+1) for n in ['scaf']]])
-            loops[-1]['length'] = s+1
-        loops = pd.concat(loops, ignore_index=True, sort=False)
-        loops['scaf0'] = loops['from']
-    loop_scafs = []
-    if len(loops):
-        for s in range(loops['length'].max()-1): # The last base is just the repeated scaffold again
-            loop_scafs.append( loops.loc[loops['length'] > s+1, ['from',f'scaf{s}']].drop_duplicates().astype(int).rename(columns={'from':'loop',f'scaf{s}':'scaf'}) )
-        loop_scafs = pd.concat(loop_scafs)
-        loop_scafs.drop_duplicates(inplace=True)
-        # Find all scaffolds connected to the loop
-        loop_scafs['inside'] = True
-        loop_scafs['exit'] = False
-        loop_scafs = ConnectLoopsThatShareScaffolds(loop_scafs)
-        loop_scafs = AddConnectedScaffolds(loop_scafs, scaffold_graph)
-        while np.sum(loop_scafs['inside'] == loop_scafs['exit']): # New entries, where we do not know yet if they are inside the loop or an exit
-            loop_scafs = FindLoopExits(loop_scafs, scaffold_graph)
-            loop_size = loop_scafs.groupby(['loop']).size().reset_index(name='nbefore')
-            loop_scafs = ConnectLoopsThatShareScaffolds(loop_scafs)
-            loop_size['nafter'] = loop_size[['loop']].merge(loop_scafs.groupby(['loop']).size().reset_index(name='nafter'), on=['loop'], how='left')['nafter'].values
-            loop_scafs.loc[np.isin(loop_scafs['loop'], loop_size.loc[loop_size['nbefore'] < loop_size['nafter'], 'loop'].values), 'exit'] = False # We cannot guarantee that the exits are still exits in merged loops
-            loop_scafs = AddConnectedScaffolds(loop_scafs, scaffold_graph)
+    loop_scafs = FindScaffoldsConnectedToLoops(scaffold_graph)
 #
     if len(loop_scafs):
         # Get loop units by exploring possible paths in scaffold_graph
@@ -3465,7 +3478,9 @@ def AddPathThroughLoops(scaffold_paths, scaffold_graph, scaf_bridges, org_scaf_c
     else:
         finished_paths = []
     # Now extend along the valid path
-    if len(finished_paths):
+    if len(finished_paths) == 0:
+        indirect_conns = []
+    else:
         indirect_conns['cindex'] = indirect_conns.index.values
         indirect_conns = indirect_conns.merge(finished_paths, on=['cindex'], how='inner')
         indirect_conns.drop(columns=['cindex'], inplace=True)
@@ -3657,7 +3672,7 @@ def AddPathThroughLoops(scaffold_paths, scaffold_graph, scaf_bridges, org_scaf_c
         loop_count.sort_values(['loop','count'], ascending=[True,False], inplace=True)
         loop_count = loop_count.groupby(['loop'], sort=False).first().reset_index()
         loops = loops.merge(loop_count[['loop','scaf0']], on=['loop','scaf0'], how='inner')
-    # Remove loop units already in bridged or unbridged repeats 
+    # Remove loop units already in bridged or unbridged repeats
     if len(unbridged_repeats):
         if len(bridged_repeats):
             loop_paths = pd.concat([unbridged_repeats, bridged_repeats], ignore_index=True)
@@ -5989,7 +6004,12 @@ def TrimCircularPaths(scaffold_paths, ploidy):
 #
     return scaffold_paths
 
-def TraverseScaffoldingGraph(scaffolds, scaffold_graph, graph_ext, scaf_bridges, org_scaf_conns, ploidy, max_loop_units):
+def TestPrint(scaffold_paths):
+    #print(scaffold_paths)
+    #print( scaffold_paths[np.isin(scaffold_paths['pid'], scaffold_paths.loc[np.isin(scaffold_paths['scaf0'], [9064, 41269, 51925, 67414, 123224, 123225, 123226, 123227, 123228, 123229, 123230, 123231, 123236, 123237, 123238]), 'pid'].values )] )
+    return
+
+def TraverseScaffoldGraph(scaffolds, scaffold_graph, graph_ext, scaf_bridges, org_scaf_conns, ploidy, max_loop_units):
     # Get phased haplotypes
     knots = UnravelKnots(scaffold_graph, scaffolds)
     scaffold_paths = FollowUniquePathsThroughGraph(knots, scaffold_graph)
@@ -6011,20 +6031,23 @@ def TraverseScaffoldingGraph(scaffolds, scaffold_graph, graph_ext, scaf_bridges,
     # Combine paths as much as possible
     print("Start")
     print(len(np.unique(scaffold_paths['pid'].values)))
+    TestPrint(scaffold_paths)
+    old_nscaf = 0
     for i in range(3):
-        old_nscaf = 0
         n = 1
         while old_nscaf != len(np.unique(scaffold_paths['pid'].values)):
             time0 = clock()
             print(f"Iteration {n}")
             n+=1
-            old_nscaf = len(np.unique(scaffold_paths['pid'].values))
              # First Merge then Combine to not accidentially merge a haplotype, where the other haplotype of the paths is not compatible and thus joining wrong paths
             scaffold_paths = MergeHaplotypes(scaffold_paths, scaf_bridges, ploidy)
             time1 = clock()
             print(str(timedelta(seconds=time1-time0)), len(np.unique(scaffold_paths['pid'].values)))
+            TestPrint(scaffold_paths)
+            old_nscaf = len(np.unique(scaffold_paths['pid'].values))
             scaffold_paths = CombinePathOnUniqueOverlap(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges, ploidy)
             print(str(timedelta(seconds=clock()-time1)), len(np.unique(scaffold_paths['pid'].values)))
+            TestPrint(scaffold_paths)
             CheckScaffoldPathsConsistency(scaffold_paths)
             CheckIfScaffoldPathsFollowsValidBridges(scaffold_paths, scaf_bridges, ploidy)
         if i==0:
@@ -6035,14 +6058,17 @@ def TraverseScaffoldingGraph(scaffolds, scaffold_graph, graph_ext, scaf_bridges,
             scaffold_paths = PlaceUnambigouslyPlaceablePathsAsAlternativeHaplotypes(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges, ploidy)
         if i != 2:
             print(len(np.unique(scaffold_paths['pid'].values)))
+            TestPrint(scaffold_paths)
             CheckScaffoldPathsConsistency(scaffold_paths)
             CheckIfScaffoldPathsFollowsValidBridges(scaffold_paths, scaf_bridges, ploidy)
     print("TrimAmbiguousOverlap")
     scaffold_paths = TrimAmbiguousOverlap(scaffold_paths, scaffold_graph, ploidy)
     print(len(np.unique(scaffold_paths['pid'].values)))
+    TestPrint(scaffold_paths)
     print("TrimCircularPaths")
     scaffold_paths = TrimCircularPaths(scaffold_paths, ploidy)
     print(len(np.unique(scaffold_paths['pid'].values)))
+    TestPrint(scaffold_paths)
     CheckScaffoldPathsConsistency(scaffold_paths)
     CheckIfScaffoldPathsFollowsValidBridges(scaffold_paths, scaf_bridges, ploidy)
 
@@ -6476,7 +6502,7 @@ def ScaffoldContigs(contig_parts, bridges, mappings, cov_probs, repeats, prob_fa
     scaffold_graph = DeduplicateScaffoldsInGraph(scaffold_graph, repeats, scaffold_parts, scaf_bridges)
     scaf_bridges = UpdateScafBridgesAccordingToScaffoldGraph(scaf_bridges, scaffold_graph)
     graph_ext = FindValidExtensionsInScaffoldGraph(scaffold_graph)
-    scaffold_paths = TraverseScaffoldingGraph(scaffolds, scaffold_graph, graph_ext, scaf_bridges, org_scaf_conns, ploidy, max_loop_units)
+    scaffold_paths = TraverseScaffoldGraph(scaffolds, scaffold_graph, graph_ext, scaf_bridges, org_scaf_conns, ploidy, max_loop_units)
     scaffold_paths = PhaseScaffolds(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges, ploidy)
     
     # Finish Scaffolding
@@ -7264,7 +7290,6 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     borderline_removal = False
     allow_same_contig_breaks = True
     min_factor_alternatives = 1.1
-    cov_bin_fraction = 0.01
     num_read_len_groups = 10
     prob_factor = 10
     min_distance_tolerance = 20
@@ -7303,7 +7328,7 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
 #    contigs, center_repeats = MaskRepeatEnds(contigs, repeat_file, contig_ids, max_repeat_extension, min_len_repeat_connection, repeat_len_factor_unique, remove_duplicated_contigs, pdf)
 #
     print( str(timedelta(seconds=clock())), "Filtering mappings")
-    mappings, cov_counts, cov_probs = ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, alignment_precision, cov_bin_fraction, num_read_len_groups, pdf)
+    mappings, cov_counts, cov_probs = ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, alignment_precision, num_read_len_groups, pdf)
     contigs, covered_regions = RemoveUnmappedContigs(contigs, mappings, remove_zero_hit_contigs)
 #
     print( str(timedelta(seconds=clock())), "Account for left-over adapters")
@@ -7775,7 +7800,7 @@ def MiniGapFinish(assembly_file, read_file, read_format, scaffold_file, output_f
             read_format = "fasta"
         else:
             read_format = "fastq"
-    with gzip.open(read_filt, 'rt') if 'gz' == read_file.rsplit('.',1)[-1] else open(read_file, 'rU') as fin:
+    with gzip.open(read_file, 'rt') if 'gz' == read_file.rsplit('.',1)[-1] else open(read_file, 'rU') as fin:
         for record in SeqIO.parse(fin, read_format):
             reads[ record.description.split(' ', 1)[0] ] = record.seq
     
@@ -9170,7 +9195,7 @@ def TestFilterInvalidConnections():
         print(splits)
         return True
 
-def TestTraverseScaffoldingGraph():
+def TestTraverseScaffoldGraph():
     # Define test cases
     ploidy = 2
     max_loop_units = 10
@@ -10352,7 +10377,7 @@ def TestTraverseScaffoldingGraph():
 #
     # Run function
     graph_ext = FindValidExtensionsInScaffoldGraph(scaffold_graph)
-    scaffold_paths = TraverseScaffoldingGraph(scaffolds.drop(columns=['case']), scaffold_graph, graph_ext, scaf_bridges, org_scaf_conns, ploidy, max_loop_units)
+    scaffold_paths = TraverseScaffoldGraph(scaffolds.drop(columns=['case']), scaffold_graph, graph_ext, scaf_bridges, org_scaf_conns, ploidy, max_loop_units)
 #
     # Compare and report failed tests
     failed = False
@@ -10389,7 +10414,7 @@ def TestTraverseScaffoldingGraph():
         correct_paths = correct_paths[np.isin(correct_paths['pid'], comp['cpid']) == False].drop(columns=['reverse'])
         obtained_paths = obtained_paths[np.isin(obtained_paths['pid'], comp['opid']) == False].copy()
         if len(correct_paths) | len(obtained_paths):
-            print(f"TestTraverseScaffoldingGraph: Test case {t} failed.")
+            print(f"TestTraverseScaffoldGraph: Test case {t} failed.")
             print("Unmatched correct paths:")
             print(correct_paths)
             print("Unmatched obtained paths:")
@@ -10403,7 +10428,7 @@ def MiniGapTest():
     failed_tests += TestFindBreakPoints()
     failed_tests += TestDuplicationConflictResolution()
     failed_tests += TestFilterInvalidConnections()
-    failed_tests += TestTraverseScaffoldingGraph()
+    failed_tests += TestTraverseScaffoldGraph()
     
     if failed_tests == 0:
         print("All tests succeeded.")
