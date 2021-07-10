@@ -5847,6 +5847,7 @@ def PlacePathAInPathB(duplications, scaffold_paths, graph_ext, scaf_bridges, plo
     if len(ends) == 0:
         includes['success'] = False
     else:
+        SetDistanceAtFirstPositionToZero(test_paths, ploidy)
         test_paths, group_info = MergeHaplotypes(test_paths, scaf_bridges, ploidy, ends)
         pids = np.unique(test_paths['pid'])
         includes['success'] = (np.isin(includes['tpid1'], pids) == False) & (np.isin(includes['tpid2'], pids) == False) # If we still have the original pids they could not be merged
