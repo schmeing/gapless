@@ -2400,7 +2400,7 @@ def FindValidExtensionsInScaffoldGraph(scaffold_graph):
     while len(branches):
         # Remove pairs where branch 2 stops matching branch 1 at scaffold s 
         branches = branches[(origins.loc[branches['oindex1'].values, [f'oscaf{s}',f'ostrand{s}',f'odist{s-1}']].values == origins.loc[branches['oindex2'].values, [f'oscaf{s}',f'ostrand{s}',f'odist{s-1}']].values).all(axis=1)].copy()
-        # Add a branch point for the branches 1 that no have less pairs
+        # Add a branch point for the branches 1 that now have less pairs
         nbranches['nbranches_new'] = nbranches[['oindex1']].merge(branches.groupby(['oindex1'], sort=False).size().reset_index(name='nbranches'), on=['oindex1'], how='left')['nbranches'].fillna(0).astype(int).values
         branch_points.append( nbranches.loc[nbranches['nbranches_new'] < nbranches['nbranches'], ['oindex1']].rename(columns={'oindex1':'oindex'}) )
         branch_points[-1]['pos'] = s
@@ -2446,7 +2446,7 @@ def FindValidExtensionsInScaffoldGraph(scaffold_graph):
                     comp = (cur_pairs['matches'] == s-1) & (cur_pairs['length'] > s)
                     cur_pairs.loc[comp,'matches'] += (cur.loc[cur_pairs.loc[comp, 'cindex'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values == extensions.loc[cur_pairs.loc[comp, 'eindex'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values).all(axis=1).astype(int)
                 cur_pairs['end'] = cur_pairs['matches']+1 == cur_pairs['length']
-                # Check if the extension matches at least one oft he possible extensions of origin (An origin can have multiple scaffold_graph entries that extend it and extensions are compared to each of them)
+                # Check if the extension matches at least one of the possible extensions of origin (An origin can have multiple scaffold_graph entries that extend it and extensions are compared to each of them)
                 cur_pairs = cur_pairs.groupby(['oindex','eindex'])[['end']].max().reset_index()
                 # Add a end=False for every extension/origin pair that should have been checked, but was not, because already scaf1 did not match and they never went into cur_pairs
                 cur_pairs = pairs[['oindex','eindex']].merge(cur[['oindex']].drop_duplicates(), on=['oindex'], how='inner').merge(cur_pairs, on=['oindex','eindex'], how='left')
@@ -2458,40 +2458,19 @@ def FindValidExtensionsInScaffoldGraph(scaffold_graph):
     # Add everything also in the other direction
     pairs = pairs.merge(pairs.rename(columns={'oindex':'eindex','eindex':'oindex'}), on=['oindex','eindex'], how='outer')
     pairs.sort_values(['oindex','eindex'], inplace=True)
-    # Get continuations of origins and extensions to reduce computations later
+    # Get continuations of origins and extensions to make neighbours consistent
     ocont = []
-    missing_cont = pairs[['oindex']].rename(columns={'oindex':'oindex1'}) # All origins that have an extension must have a following origin in the direction of extension
-    missing_cont[['nscaf','nstrand','ndist']] = extensions.loc[pairs['eindex'].values, ['scaf1','strand1','dist1']].values
-    missing_cont.drop_duplicates(inplace=True)
-    if len(missing_cont):
-        for cut in range(origins['olength'].max()-1): # If we do not find a following origin for a given origin look for the longest match by cutting away scaffolds
-            for l in np.unique(origins.loc[origins['olength'] > cut+1, 'olength'].values):
-                cur = origins[origins['olength'] == l].reset_index()
-                cur.rename(columns={**{'index':'oindex2','scaf0':'nscaf','strand0':'nstrand','odist0':'ndist'}, **{f'{n}{s}':f'{n}{s-1}' for s in range(1,l-cut) for n in ['oscaf','ostrand','odist']}}, inplace=True)
+    for l in np.unique(origins.loc[origins['olength'] > 1, 'olength'].values):
+            cur = origins[origins['olength'] == l].reset_index()
+            if len(cur):
+                cur.rename(columns={**{'index':'oindex2','scaf0':'nscaf','strand0':'nstrand','odist0':'ndist'}, **{f'{n}{s}':f'{n}{s-1}' for s in range(1,l) for n in ['oscaf','ostrand','odist']}}, inplace=True)
                 cur.rename(columns={'oscaf0':'scaf0','ostrand0':'strand0'}, inplace=True)
-                cur.drop(columns=['olength'] + [f'{n}{s}' for s in range(l-cut,l) for n in ['oscaf','ostrand']] + [f'odist{s}' for s in range(l-cut,l-1)], inplace=True)
+                cur.drop(columns=['olength'] + [f'{n}{s}' for s in range(l,l) for n in ['oscaf','ostrand']] + [f'odist{s}' for s in range(l,l-1)], inplace=True)
                 cur = RemoveEmptyColumns(cur)
-                mcols = ['scaf0','strand0'] + [f'{n}{s}' for s in range(1,l-cut-1) for n in ['oscaf','ostrand']] + [f'odist{s}' for s in range(l-cut-2)]
-                cur = cur.merge(origins.loc[np.isin(origins.index.values, np.unique(missing_cont['oindex1'])), mcols].reset_index().rename(columns={'index':'oindex1'}), on=mcols, how='inner').drop(columns=mcols)
-                if cut > 0:
-                    cur = cur.merge(missing_cont, on=['oindex1','nscaf','nstrand','ndist'], how='inner') # Do not use this for perfect matches, because sometimes an extension gets lost due to the simplification from all reads to the scaffold_graph
-                cur['matches'] = l-cut
+                mcols = ['scaf0','strand0'] + [f'{n}{s}' for s in range(1,l-1) for n in ['oscaf','ostrand']] + [f'odist{s}' for s in range(l-2)]
+                cur = cur.merge(origins[mcols].reset_index().rename(columns={'index':'oindex1'}), on=mcols, how='inner').drop(columns=mcols)
                 ocont.append(cur)
-            if cut == 0:
-                # no cut means we have perfect matches, so we cannot improve on them anymore, so remove them from missing cont (For other cut values, we might cut away more from a longer origin and still achieve more matches, thus we cannnot only use it for perfect matches)
-                ocont = pd.concat(ocont, ignore_index=True)
-                mcols = ['oindex1','nscaf','nstrand','ndist']
-                missing_cont = missing_cont[ missing_cont.merge(ocont[mcols].drop_duplicates(), on=mcols, how='left', indicator=True)['_merge'].values == "left_only" ].copy()
-                perfect_ocont = ocont.drop(columns=['matches','nscaf','nstrand','ndist'])
-                ocont = [ ocont ]
-    if len(ocont):
-        ocont = pd.concat(ocont, ignore_index=True)[['oindex1','oindex2','nscaf','nstrand','ndist','matches']]
-        mcols = ['oindex1','nscaf','nstrand','ndist']
-        ocont = ocont[ocont['matches'] == ocont[mcols].merge(ocont.groupby(mcols)['matches'].max().reset_index(), on=mcols, how='left')['matches'].values].copy()
-        ocont.drop(columns=['matches'], inplace=True)
-        ocont.sort_values(['oindex1','oindex2'], inplace=True)
-    else:
-        ocont = pd.DataFrame({'oindex1':[],'oindex2':[],'nscaf':[],'nstrand':[],'ndist':[]})
+    perfect_ocont = pd.concat(ocont, ignore_index=True).drop(columns=['nscaf','nstrand','ndist'])
     econt = []
     for l in np.unique(extensions['length'].values):
         cur = extensions[extensions['length'] == l].reset_index()
@@ -2525,7 +2504,41 @@ def FindValidExtensionsInScaffoldGraph(scaffold_graph):
         pairs.sort_values(['oindex','eindex'], inplace=True)
         if old_len == len(pairs):
             break
-    # Combine it into one dictionary for easier passing
+    # Get continuations of origins to reduce computations later
+    ocont = []
+    missing_cont = pairs[['oindex']].rename(columns={'oindex':'oindex1'}) # All origins that have an extension must have a following origin in the direction of extension
+    missing_cont[['nscaf','nstrand','ndist']] = extensions.loc[pairs['eindex'].values, ['scaf1','strand1','dist1']].values
+    missing_cont.drop_duplicates(inplace=True)
+    if len(missing_cont):
+        for cut in range(origins['olength'].max()-1): # If we do not find a following origin for a given origin look for the longest match by cutting away scaffolds
+            for l in np.unique(origins.loc[origins['olength'] > cut+1, 'olength'].values):
+                cur = origins[origins['olength'] == l].reset_index()
+                cur.rename(columns={**{'index':'oindex2','scaf0':'nscaf','strand0':'nstrand','odist0':'ndist'}, **{f'{n}{s}':f'{n}{s-1}' for s in range(1,l-cut) for n in ['oscaf','ostrand','odist']}}, inplace=True)
+                cur.rename(columns={'oscaf0':'scaf0','ostrand0':'strand0'}, inplace=True)
+                cur.drop(columns=['olength'] + [f'{n}{s}' for s in range(l-cut,l) for n in ['oscaf','ostrand']] + [f'odist{s}' for s in range(l-cut,l-1)], inplace=True)
+                cur = RemoveEmptyColumns(cur)
+                mcols = ['scaf0','strand0'] + [f'{n}{s}' for s in range(1,l-cut-1) for n in ['oscaf','ostrand']] + [f'odist{s}' for s in range(l-cut-2)]
+                cur = cur.merge(origins.loc[np.isin(origins.index.values, np.unique(missing_cont['oindex1'])), mcols].reset_index().rename(columns={'index':'oindex1'}), on=mcols, how='inner').drop(columns=mcols)
+                if cut > 0:
+                    cur = cur.merge(missing_cont, on=['oindex1','nscaf','nstrand','ndist'], how='inner') # Do not use this for perfect matches, because sometimes an extension gets lost due to the simplification from all reads to the scaffold_graph
+                cur['matches'] = l-cut
+                ocont.append(cur)
+            if cut == 0:
+                # no cut means we have perfect matches, so we cannot improve on them anymore, so remove them from missing cont (For other cut values, we might cut away more from a longer origin and still achieve more matches, thus we cannnot only use it for perfect matches)
+                ocont = pd.concat(ocont, ignore_index=True)
+                mcols = ['oindex1','nscaf','nstrand','ndist']
+                missing_cont = missing_cont[ missing_cont.merge(ocont[mcols].drop_duplicates(), on=mcols, how='left', indicator=True)['_merge'].values == "left_only" ].copy()
+                perfect_ocont = ocont.drop(columns=['matches','nscaf','nstrand','ndist'])
+                ocont = [ ocont ]
+    if len(ocont):
+        ocont = pd.concat(ocont, ignore_index=True)[['oindex1','oindex2','nscaf','nstrand','ndist','matches']]
+        mcols = ['oindex1','nscaf','nstrand','ndist']
+        ocont = ocont[ocont['matches'] == ocont[mcols].merge(ocont.groupby(mcols)['matches'].max().reset_index(), on=mcols, how='left')['matches'].values].copy()
+        ocont.drop(columns=['matches'], inplace=True)
+        ocont.sort_values(['oindex1','oindex2'], inplace=True)
+    else:
+        ocont = pd.DataFrame({'oindex1':[],'oindex2':[],'nscaf':[],'nstrand':[],'ndist':[]})
+    # Combine it into one dictionary for easier passing as parameter
     graph_ext = {}
     graph_ext['org'] = origins
     graph_ext['ext'] = extensions
@@ -2534,7 +2547,7 @@ def FindValidExtensionsInScaffoldGraph(scaffold_graph):
 #
     return graph_ext
 
-def UnravelKnots(scaffold_graph, scaffolds):
+def UnravelKnots(scaffold_graph):
     knots = []
     for oside in ['l','r']:
         # First take one side in scaffold_graph as origin
@@ -2615,9 +2628,9 @@ def UnravelKnots(scaffold_graph, scaffolds):
     
     return knots
 
-def FollowUniquePathsThroughGraph(scaffold_graph, scaffolds):
+def FollowUniquePathsThroughGraphOld(scaffold_graph):
     # Get connected knots, which have to be handled in sequence instead of parallel
-    knots = UnravelKnots(scaffold_graph, scaffolds)
+    knots = UnravelKnots(scaffold_graph)
     ravels = []
     for s in range(0,knots['olen'].max()+1):
         ravels.append(knots.loc[knots['olen'] >= s, ['knot',f'oscaf{s}']].rename(columns={f'oscaf{s}':'scaf'}))
@@ -2690,8 +2703,80 @@ def FollowUniquePathsThroughGraph(scaffold_graph, scaffolds):
     # Finalize paths
     scaffold_paths['pos'] = scaffold_paths.groupby(['pid'], sort=False).cumcount()
     scaffold_paths.rename(columns={'scaf':'scaf0','strand':'strand0','dist':'dist0'}, inplace=True)
+    handled_graph_entries = knots['oindex'].values
 #
-    return scaffold_paths, knots
+    return scaffold_paths, handled_graph_entries
+
+def FollowUniquePathsThroughGraph(graph_ext):
+    # Prepare origin-extension pairs
+    origins = graph_ext['org']
+    extensions = graph_ext['ext']
+    pairs = graph_ext['pairs'].copy()
+    pairs[['oscaf1','ostrand1','scaf0','strand0','odist0']] = origins.loc[pairs['oindex'], ['oscaf1','ostrand1','scaf0','strand0','odist0']].values
+    pairs[['scaf1','strand1','dist1']] = extensions.loc[pairs['eindex'], ['scaf1','strand1','dist1']].values
+    # Group pairs that share origins/extensions
+    pairs['group'] = np.minimum(pairs['oindex'],pairs['eindex'])
+    while True:
+        pairs['min_group'] = np.minimum( pairs[['oindex']].merge(pairs.groupby(['oindex'])['group'].min().reset_index(), on=['oindex'], how='left')['group'].values,
+                                         pairs[['eindex']].merge(pairs.groupby(['eindex'])['group'].min().reset_index(), on=['eindex'], how='left')['group'].values )
+        pairs['new_group'] = pairs[['group']].merge(pairs.groupby(['group'])['min_group'].min().reset_index(), on=['group'], how='left')['min_group'].values
+        if np.sum(pairs['group'] != pairs['new_group']) == 0:
+            break
+        else:
+            pairs['group'] = pairs['new_group']
+    pairs.drop(columns=['min_group','new_group'], inplace=True)
+    # For path extension we can only use the "unique" origin-extension pairs in that sense that all grouped pairs connect the same first scaffold in the origin with the same first scaffold in the extension
+    alternatives = pairs[['group','strand0','oscaf1','ostrand1','odist0','scaf1','strand1','dist1']].drop_duplicates().groupby(['group','strand0']).size().reset_index(name='alternatives')
+    alternatives = alternatives.groupby(['group'])['alternatives'].max().reset_index()
+    path_ext = pairs[['oindex','scaf1','strand1','dist1','group','strand0']].drop_duplicates().merge(alternatives.loc[alternatives['alternatives'] == 1, ['group']], on=['group'], how='inner')
+    # Check if a group can be extended even further
+    ocont = graph_ext['ocont']
+    path_ext.rename(columns={'strand0':'strand','scaf1':'nscaf','strand1':'nstrand','dist1':'ndist'}, inplace=True)
+    path_ext = path_ext.merge(ocont[np.isin(ocont['oindex2'], path_ext['oindex'].values)].rename(columns={'oindex1':'oindex'}), on=['oindex','nscaf','nstrand','ndist'], how='left')
+    # Make sure extensions in groups are consistent (if one cannot extend, all others are also not allowed to extend)
+    inconsistency = path_ext.groupby(['group','strand'])['oindex2'].agg(['size','count'])
+    inconsistency = inconsistency[(inconsistency['count'] != 0) & (inconsistency['count'] != inconsistency['size'])].reset_index()[['group','strand']]
+    other_side = path_ext[['group','strand','oindex2']].merge(inconsistency, on=['group','strand'], how='inner')[['oindex2']].rename(columns={'oindex2':'oindex'}).merge(path_ext[['group','strand','oindex']])[['group','strand']].drop_duplicates()
+    other_side['strand'] = np.where(other_side['strand'] == '+', '-', '+')
+    path_ext = path_ext[ np.isin(path_ext['group'], inconsistency['group'].values) == False ].copy() # We need to remove the inconsistent group completely to not have a two scaffold overlap afterwards that is preferred in CombinePathOnUniqueOverlap
+    path_ext.loc[ path_ext[['group','strand']].merge(other_side, on=['group','strand'], how='left', indicator=True)['_merge'].values == "both" , 'oindex2'] = np.nan
+    # Find the path ends to start from there (starting on both sides will duplicate all paths, but is less effort then linearly going through all the paths to prevent this)
+    path_ends = path_ext.groupby(['group','strand'])['oindex2'].agg(['count']).reset_index()
+    path_ends = path_ends[path_ends['count'] == 0].drop(columns=['count'])
+    path_ends['strand'] = np.where(path_ends['strand'] == '+', '-', '+') # Reverse the direction of the ends to point in the direction that is not ending
+    path_ends = pairs.drop(columns=['oindex','eindex']).drop_duplicates().merge(path_ends.rename(columns={'strand':'strand0'}), on=['group','strand0'], how='inner')
+    # Start all possible paths
+    path_ends['pid'] = np.arange(len(path_ends))
+    scaffold_paths = []
+    scaffold_paths.append( path_ends[['pid','oscaf1','ostrand1']].rename(columns={'oscaf1':'scaf','ostrand1':'strand'}) )
+    scaffold_paths[-1].insert(1, 'pos', 0)
+    scaffold_paths[-1]['dist'] = 0
+    scaffold_paths.append( path_ends[['pid','scaf0','strand0','odist0']].rename(columns={'scaf0':'scaf','strand0':'strand','odist0':'dist'}) )
+    scaffold_paths[-1].insert(1, 'pos', 1)
+    scaffold_paths.append( path_ends[['pid','scaf1','strand1','dist1']].rename(columns={'scaf1':'scaf','strand1':'strand','dist1':'dist'}) )
+    scaffold_paths[-1].insert(1, 'pos', 2)
+    next_org = path_ext.merge( path_ends[['group','strand0','pid']].drop_duplicates().rename(columns={'strand0':'strand'}), on=['group','strand'], how='inner' )[['pid','oindex2']].drop_duplicates()
+    # Continue along all paths as long as supported
+    p = 3
+    while len(next_org):
+        # Remove the groups that do not have enough support to continue
+        test = next_org.groupby(['pid'])['oindex2'].agg(['size','count']).reset_index()
+        next_org = next_org[np.isin(next_org['pid'], test.loc[test['size'] == test['count'], 'pid'].values)].copy()
+        if len(next_org):
+            # Add the next scaffold to scaffold_paths
+            cur_ext = path_ext.merge(next_org.rename(columns={'oindex2':'oindex'}), on='oindex', how='inner')
+            scaffold_paths.append( cur_ext[['pid','nscaf','nstrand','ndist']].drop_duplicates().rename(columns={'nscaf':'scaf','nstrand':'strand','ndist':'dist'}) )
+            scaffold_paths[-1].insert(1, 'pos', p)
+            p += 1
+            # Find next origins to continue
+            next_org = path_ext[['group','strand','oindex2']].merge( cur_ext[['group','strand','pid']].drop_duplicates(), on=['group','strand'], how='inner' )[['pid','oindex2']].drop_duplicates()
+    # Finalize paths
+    scaffold_paths = pd.concat(scaffold_paths, ignore_index=True)
+    scaffold_paths.rename(columns={'scaf':'scaf0','strand':'strand0','dist':'dist0'}, inplace=True)
+    scaffold_paths.sort_values(['pid','pos'], inplace=True)
+    handled_origins = np.sort(path_ext['oindex'].values)
+#
+    return scaffold_paths, handled_origins
 
 def FindRepeatedScaffolds(scaffold_graph):
     repeated_scaffolds = []
@@ -3972,17 +4057,18 @@ def AddPathThroughInvertedRepeats(scaffold_paths, handled_scaf_conns, scaffold_g
 #
     return scaffold_paths, handled_scaf_conns
 
-def AddUntraversedConnectedPaths(scaffold_paths, knots, scaffold_graph, handled_scaf_conns):
+def AddUntraversedConnectedPaths(scaffold_paths, graph_ext, handled_origins, handled_scaf_conns):
     # Get untraversed connections to neighbouring scaffolds in graph
-    conn_path = scaffold_graph.loc[np.isin(scaffold_graph.index.values, knots['oindex'].values) == False, ['from','from_side','scaf1','strand1','dist1']].drop_duplicates()
+    conn_path = graph_ext['org'][['oscaf1','ostrand1','scaf0','strand0','odist0']].drop(handled_origins)
+    conn_path.drop_duplicates(inplace=True)
+    conn_path.rename(columns={'oscaf1':'scaf0','ostrand1':'strand0','scaf0':'scaf1','strand0':'strand1','odist0':'dist1'}, inplace=True)
     # Require that it is untraversed in both directions, otherwise we would duplicate the end of a phased path
-    conn_path['to_side'] = np.where(conn_path['strand1'] == '+', 'l', 'r')
-    conn_path = conn_path.merge(conn_path[['from','from_side','scaf1','to_side','dist1']].rename(columns={'from':'scaf1','from_side':'to_side','scaf1':'from','to_side':'from_side'}), on=['from','from_side','scaf1','to_side','dist1'], how='inner')
+    conn_path['side0'] = np.where(conn_path['strand0'] == '+', 'r', 'l')
+    conn_path['side1'] = np.where(conn_path['strand1'] == '+', 'l', 'r')
+    conn_path = conn_path.merge(conn_path[['scaf0','side0','scaf1','side1','dist1']].rename(columns={'scaf0':'scaf1','side0':'side1','scaf1':'scaf0','side1':'side0'}), on=['scaf0','side0','scaf1','side1','dist1'], how='inner')
     # Only use one of the two directions for the path
-    conn_path = conn_path[(conn_path['from'] < conn_path['scaf1']) | ((conn_path['from'] == conn_path['scaf1']) & ((conn_path['from_side'] == conn_path['to_side']) | (conn_path['from_side'] == 'r')))].drop(columns=['to_side'])
+    conn_path = conn_path[(conn_path['scaf0'] < conn_path['scaf1']) | ((conn_path['scaf0'] == conn_path['scaf1']) & ((conn_path['side0'] == conn_path['side1']) | (conn_path['side0'] == 'r')))].drop(columns=['side0','side1'])
     # Require that is has not been handled before
-    conn_path.rename(columns={'from':'scaf0','from_side':'strand0'}, inplace=True)
-    conn_path['strand0'] = np.where(conn_path['strand0'] == 'r', '+', '-')
     if len(handled_scaf_conns):
         conn_path = conn_path[ conn_path.merge(handled_scaf_conns, on=['scaf0','strand0','scaf1','strand1','dist1'], how='left', indicator=True)['_merge'].values == "left_only" ].copy()
     # Turn into proper format for scaffold_paths
@@ -3991,10 +4077,7 @@ def AddUntraversedConnectedPaths(scaffold_paths, knots, scaffold_graph, handled_
         conn_path['dist0'] = 0
         conn_path['pos'] = 0
         conn_path['pos1'] = 1
-        if len(scaffold_paths):
-            scaffold_paths = pd.concat([scaffold_paths, conn_path[['pid','pos','scaf0','strand0','dist0']], conn_path[['pid','pos1','scaf1','strand1','dist1']].rename(columns={'pos1':'pos','scaf1':'scaf0','strand1':'strand0','dist1':'dist0'})], ignore_index=True)
-        else:
-            scaffold_paths = conn_path
+        scaffold_paths = pd.concat( ([scaffold_paths] if len(scaffold_paths) else []) + [conn_path[['pid','pos','scaf0','strand0','dist0']], conn_path[['pid','pos1','scaf1','strand1','dist1']].rename(columns={'pos1':'pos','scaf1':'scaf0','strand1':'strand0','dist1':'dist0'})], ignore_index=True)
     if len(scaffold_paths):
         scaffold_paths.sort_values(['pid','pos'], inplace=True)
 
@@ -4242,7 +4325,7 @@ def RequireContinuousDirectionForDuplications(duplications):
             s += 1
         alternatives = pd.concat(alternatives, ignore_index=True)
     if len(alternatives):
-        # Get shortest merged path length
+        # Get shortest merged path length (from first duplication to last duplication)
         alternatives['mlen'] = np.maximum( np.maximum(0, duplications.loc[alternatives['i0'].values, 'apos'].values - duplications.loc[alternatives['i0'].values, 'amin'].values),
                                            np.maximum(0, np.where(duplications.loc[alternatives['i0'].values, 'samedir'].values, duplications.loc[alternatives['i0'].values, 'bpos'].values - duplications.loc[alternatives['i0'].values, 'bmin'].values, duplications.loc[alternatives['i0'].values, 'bmax'].values - duplications.loc[alternatives['i0'].values, 'bpos'].values) ) )
         alternatives['li'] = alternatives['i0'].values
@@ -4255,7 +4338,7 @@ def RequireContinuousDirectionForDuplications(duplications):
                                             np.maximum(0, np.where(duplications.loc[alternatives['li'].values, 'samedir'].values, duplications.loc[alternatives['li'].values, 'bmax'].values - duplications.loc[alternatives['li'].values, 'bpos'].values, duplications.loc[alternatives['li'].values, 'bpos'].values - duplications.loc[alternatives['li'].values, 'bmin'].values) ) )
         alternatives = alternatives[alternatives['mlen'].values == alternatives[['cid']].merge(alternatives.groupby(['cid'])['mlen'].min().reset_index(name='minlen'), on=['cid'], how='left')['minlen'].values].drop(columns=['mlen'])
         duplications.drop(columns=['amin','amax','bmin','bmax'], inplace=True)
-        # Take the alternatives that cut the least amount from the ends
+        # Take the alternatives that cut the least amount from the ends (truly shortest path, because we reduce the overhang at the ends to a minimum)
         alternatives[['amin','bmin']] = duplications.loc[alternatives['i0'].values, ['apos','bpos']].values
         alternatives[['amax','bmax']] = duplications.loc[alternatives['li'].values, ['apos','bpos']].values
         alternatives['samedir'] = duplications.loc[alternatives['i0'].values, 'samedir'].values
@@ -4940,7 +5023,7 @@ def GetPathBFromEnds(ends, scaffold_paths, ploidy):
 #
     return ends, pathb
 
-def FilterInvalidConnections(ends, scaffold_paths, scaffold_graph, graph_ext, ploidy):
+def FilterInvalidConnections(ends, scaffold_paths, graph_ext, ploidy):
     if len(ends):
         # Find origins with full length matches. If we do not find one at the end go back along patha until we find a full length match.
         ends, patha = GetPathAFromEnds(ends, scaffold_paths, ploidy)
@@ -5293,7 +5376,7 @@ def GetHaplotypesThatDifferOnlyByDistance(scaffold_paths, check_pids, ploidy):
 #
     return dist_diff_only
 
-def CombinePathAccordingToMetaParts(scaffold_paths, meta_parts_in, conns, scaffold_graph, graph_ext, scaf_bridges, scaf_len, ploidy):
+def CombinePathAccordingToMetaParts(scaffold_paths, meta_parts_in, conns, graph_ext, scaf_bridges, scaf_len, ploidy):
     # Combine scaffold_paths from lowest to highest position in meta scaffolds
     meta_scaffolds = meta_parts_in.loc[meta_parts_in['pos'] == 0].drop(columns=['pos'])
     scaffold_paths['reverse'] = scaffold_paths[['pid']].merge(meta_scaffolds[['pid','reverse']], on=['pid'], how='left')['reverse'].fillna(False).values.astype(bool)
@@ -5339,7 +5422,7 @@ def CombinePathAccordingToMetaParts(scaffold_paths, meta_parts_in, conns, scaffo
             ends.drop(columns=['anhaps','bnhaps','aoverlap','boverlap','start_pos'], inplace=True)
             cols = ['pid','hap','side','min','max','len']
             ends = pd.concat([ends, ends.rename(columns={**{f'a{n}':f'b{n}' for n in cols},**{f'b{n}':f'a{n}' for n in cols}})], ignore_index=True)
-            ends = FilterInvalidConnections(ends, scaffold_paths, scaffold_graph, graph_ext, ploidy)
+            ends = FilterInvalidConnections(ends, scaffold_paths, graph_ext, ploidy)
             if len(ends) == 0:
                 break
             else:
@@ -5550,7 +5633,7 @@ def CombinePathOnUniqueOverlap(scaffold_paths, scaffold_graph, graph_ext, scaf_b
     ends = ends[ends['samedir'] == (ends['aside'] != ends['bside'])].copy()
 #
     # Check that combining the paths does not violate scaffold_graph
-    ends = FilterInvalidConnections(ends, scaffold_paths, scaffold_graph, graph_ext, ploidy)
+    ends = FilterInvalidConnections(ends, scaffold_paths, graph_ext, ploidy)
     ends = ends[ends['valid_path'] == 'ab'].drop(columns=['valid_path'])
 #
     if len(ends):
@@ -5613,7 +5696,7 @@ def CombinePathOnUniqueOverlap(scaffold_paths, scaffold_graph, graph_ext, scaf_b
         meta_parts.sort_values(['meta','pos'], inplace=True)
 #
         scaf_len = scaffold_paths.groupby(['pid'])['pos'].max().reset_index()
-        scaffold_paths = CombinePathAccordingToMetaParts(scaffold_paths, meta_parts, conns, scaffold_graph, graph_ext, scaf_bridges, scaf_len, ploidy)
+        scaffold_paths = CombinePathAccordingToMetaParts(scaffold_paths, meta_parts, conns, graph_ext, scaf_bridges, scaf_len, ploidy)
 
     return scaffold_paths
 
@@ -5737,7 +5820,7 @@ def RemoveDuplicates(scaffold_paths, remove_all, ploidy):
 #
     return scaffold_paths
 
-def PlacePathAInPathB(duplications, scaffold_paths, scaffold_graph, graph_ext, scaf_bridges, ploidy):
+def PlacePathAInPathB(duplications, scaffold_paths, graph_ext, scaf_bridges, ploidy):
     includes = duplications.groupby(['ldid','rdid','apid','ahap','bpid','bhap'])['bpos'].agg(['min','max']).reset_index()
     scaf_len = scaffold_paths.groupby(['pid'])['pos'].max().reset_index()
     includes['blen'] = includes[['bpid']].rename(columns={'bpid':'pid'}).merge(scaf_len, on=['pid'], how='left')['pos'].values
@@ -5813,7 +5896,7 @@ def PlacePathAInPathB(duplications, scaffold_paths, scaffold_graph, graph_ext, s
         conns['aoverlap'] = 1
         conns['boverlap'] = 1
         scaf_len = test_paths.groupby(['pid'])['pos'].max().reset_index()
-        test_paths = CombinePathAccordingToMetaParts(test_paths, meta_parts, conns, scaffold_graph, graph_ext, scaf_bridges, scaf_len, ploidy)
+        test_paths = CombinePathAccordingToMetaParts(test_paths, meta_parts, conns, graph_ext, scaf_bridges, scaf_len, ploidy)
         pids = np.unique(test_paths['pid'])
         includes['success'] = (np.isin(includes[['tpid1','tpid2','tpid3']], pids).sum(axis=1) == 1)
         test_paths = test_paths.merge(pd.concat([ includes.loc[includes['success'], [f'tpid{i}','tpid3']].rename(columns={f'tpid{i}':'pid'}) for i in [1,2] ], ignore_index=True), on=['pid'], how='inner')
@@ -5824,7 +5907,7 @@ def PlacePathAInPathB(duplications, scaffold_paths, scaffold_graph, graph_ext, s
 #
     return test_paths, includes
 
-def PlaceUnambigouslyPlaceablePathsAsAlternativeHaplotypes(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges, ploidy):
+def PlaceUnambigouslyPlaceablePathsAsAlternativeHaplotypes(scaffold_paths, graph_ext, scaf_bridges, ploidy):
     duplications = GetDuplications(scaffold_paths, ploidy)
     # Only insert a maximum of one path a per path b per round to avoid conflicts between inserted path
     while len(duplications):
@@ -5877,7 +5960,7 @@ def PlaceUnambigouslyPlaceablePathsAsAlternativeHaplotypes(scaffold_paths, scaff
         duplications['valid'] = duplications[['ldid','rdid']].merge(duplications.groupby(['ldid','rdid'])['valid'].min().reset_index(), on=['ldid','rdid'], how='left')['valid'].values
         duplications = duplications[duplications['valid']].copy()
         # Check that including path a as haplotype of path b does not violate scaffold_graph
-        test_paths, includes = PlacePathAInPathB(duplications, scaffold_paths, scaffold_graph, graph_ext, scaf_bridges, ploidy)
+        test_paths, includes = PlacePathAInPathB(duplications, scaffold_paths, graph_ext, scaf_bridges, ploidy)
         # Require that path a has a unique placement
         includes.sort_values(['apid'], inplace=True)
         includes = includes[(includes['apid'] != includes['apid'].shift(1)) & (includes['apid'] != includes['apid'].shift(-1))].copy()
@@ -6030,10 +6113,10 @@ def TestPrint(scaffold_paths):
 
 def TraverseScaffoldGraph(scaffolds, scaffold_graph, graph_ext, scaf_bridges, org_scaf_conns, ploidy, max_loop_units):
     # Get phased haplotypes
-    scaffold_paths, knots = FollowUniquePathsThroughGraph(scaffold_graph, scaffolds)
+    scaffold_paths, handled_origins = FollowUniquePathsThroughGraph(graph_ext)
     scaffold_paths, handled_scaf_conns = AddPathThroughLoops(scaffold_paths, scaffold_graph, scaf_bridges, org_scaf_conns, ploidy, max_loop_units)
     scaffold_paths, handled_scaf_conns = AddPathThroughInvertedRepeats(scaffold_paths, handled_scaf_conns, scaffold_graph, scaf_bridges, ploidy)
-    scaffold_paths = AddUntraversedConnectedPaths(scaffold_paths, knots, scaffold_graph, handled_scaf_conns)
+    scaffold_paths = AddUntraversedConnectedPaths(scaffold_paths, graph_ext, handled_origins, handled_scaf_conns)
     scaffold_paths = AddUnconnectedPaths(scaffold_paths, scaffolds, scaffold_graph)
 #
     # Turn them into full path with ploidy
@@ -6073,7 +6156,7 @@ def TraverseScaffoldGraph(scaffolds, scaffold_graph, graph_ext, scaf_bridges, or
             scaffold_paths = RemoveDuplicates(scaffold_paths, True, ploidy)
         elif i==1:
             print("PlaceUnambigouslyPlaceables")
-            scaffold_paths = PlaceUnambigouslyPlaceablePathsAsAlternativeHaplotypes(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges, ploidy)
+            scaffold_paths = PlaceUnambigouslyPlaceablePathsAsAlternativeHaplotypes(scaffold_paths, graph_ext, scaf_bridges, ploidy)
         if i != 2:
             print(len(np.unique(scaffold_paths['pid'].values)))
             TestPrint(scaffold_paths)
@@ -6241,7 +6324,7 @@ def FindNextValidPositionOnBothSidesOfTestConnection(test_conns, scaffold_paths,
 #
     return test_conns
 
-def PhaseScaffoldsWithScaffoldGraph(scaffold_paths, scaffold_graph, graph_ext, ploidy):
+def PhaseScaffoldsWithScaffoldGraph(scaffold_paths, graph_ext, ploidy):
     ## Combine phases where scaffold_graph leaves only one option
     # Get all remaining phase_breaks
     phase_breaks = []
@@ -6285,7 +6368,11 @@ def PhaseScaffoldsWithScaffoldGraph(scaffold_paths, scaffold_graph, graph_ext, p
                 # Replace deletion with scaffold next to deletion (we need to take it from scaffold_paths, because it might be on the other side of the split)
                 cur = (test_paths['hap'] == h) & (test_paths['pos'] == test_paths['split_pos'])
                 cols = [f'scaf{h}',f'strand{h}',f'dist{h}']
-                test_paths.loc[cur, cols] = test_paths.loc[cur, ['opid','switch_pos']].rename(columns={'opid':'pid','switch_pos':'pos'}).merge(scaffold_paths[['pid','pos']+cols], on=['pid','pos'], how='left')[cols].values
+                if h == 0:
+                    test_paths.loc[cur, cols] = test_paths.loc[cur, ['opid','switch_pos']].rename(columns={'opid':'pid','switch_pos':'pos'}).merge(scaffold_paths[['pid','pos']+cols], on=['pid','pos'], how='left')[cols].values
+                else:
+                    tmp = test_paths.loc[cur, ['opid','switch_pos']].rename(columns={'opid':'pid','switch_pos':'pos'}).merge(scaffold_paths[['pid','pos',f'phase{h}','scaf0','strand0','dist0']+cols], on=['pid','pos'], how='left')
+                    test_paths.loc[cur, cols] = np.where(tmp[[f'phase{h}',f'phase{h}',f'phase{h}']].values > 0, tmp[cols].values, tmp[['scaf0','strand0','dist0']].values)
                 # Make sure we do not affect the other haplotypes by changing the main path
                 cur = (test_paths['hap'] == h) & (test_paths['pos'] == test_paths['switch_pos'])
                 if h == 0:
@@ -6293,6 +6380,7 @@ def PhaseScaffoldsWithScaffoldGraph(scaffold_paths, scaffold_graph, graph_ext, p
                         test_paths.loc[cur & (test_paths[f'phase{h1}'] < 0), [f'scaf{h1}',f'strand{h1}',f'dist{h1}']] = test_paths.loc[cur & (test_paths[f'phase{h1}'] < 0), ['scaf0','strand0','dist0']].values
                 # Delete the scaffold we shifted
                 test_paths.loc[cur, cols] = [-1,'',0]
+                test_paths.loc[cur, f'phase{h}'] = np.abs(test_paths.loc[cur, f'phase{h}'])
         test_paths.drop(columns=['switch_pos','opid','hap'], inplace=True)
     test_paths.drop(columns=['split_pos'], inplace=True)  
     test_paths['pos'] = test_paths.groupby(['pid'], sort=False).cumcount()
@@ -6310,7 +6398,7 @@ def PhaseScaffoldsWithScaffoldGraph(scaffold_paths, scaffold_graph, graph_ext, p
     ends = test_conns.drop(columns=['pid','lpos','rpos','pos','lspos','rspos']).drop_duplicates()
     cols = ['pid','hap','side','min','max','len']
     ends = pd.concat([ends, ends.rename(columns={**{f'a{n}':f'b{n}' for n in cols},**{f'b{n}':f'a{n}' for n in cols}})], ignore_index=True)
-    ends = FilterInvalidConnections(ends, test_paths, scaffold_graph, graph_ext, ploidy)
+    ends = FilterInvalidConnections(ends, test_paths, graph_ext, ploidy)
     ends = ends[ends['valid_path'] == 'ab'].drop(columns=['valid_path'])
     if len(ends) == 0:
         path_errors = phase_breaks
@@ -6341,7 +6429,7 @@ def PhaseScaffoldsWithScaffoldGraph(scaffold_paths, scaffold_graph, graph_ext, p
 #
     return scaffold_paths
 
-def PhaseScaffolds(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges, ploidy):
+def PhaseScaffolds(scaffold_paths, graph_ext, scaf_bridges, ploidy):
     ## Set initial phasing by giving every polyploid positions its own phase
     scaffold_paths['polyploid'] = (scaffold_paths[[f'phase{h}' for h in range(ploidy)]].values > 0).sum(axis=1) > 1
     scaffold_paths['polyploid'] = scaffold_paths['polyploid'] | (scaffold_paths['polyploid'].shift(1) & (scaffold_paths['pid'] == scaffold_paths['pid'].shift(1)))
@@ -6352,7 +6440,7 @@ def PhaseScaffolds(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges, ploi
     scaffold_paths.drop(columns=['polyploid','new_phase'], inplace=True)
 #
     scaffold_paths = PhaseScaffoldsWithScafBridges(scaffold_paths, scaf_bridges, ploidy)
-    scaffold_paths = PhaseScaffoldsWithScaffoldGraph(scaffold_paths, scaffold_graph, graph_ext, ploidy)
+    scaffold_paths = PhaseScaffoldsWithScaffoldGraph(scaffold_paths, graph_ext, ploidy)
 #
     # Merge phases, where no other phase has a break
     while True:
@@ -6521,7 +6609,7 @@ def ScaffoldContigs(contig_parts, bridges, mappings, cov_probs, repeats, prob_fa
     scaf_bridges = UpdateScafBridgesAccordingToScaffoldGraph(scaf_bridges, scaffold_graph)
     graph_ext = FindValidExtensionsInScaffoldGraph(scaffold_graph)
     scaffold_paths = TraverseScaffoldGraph(scaffolds, scaffold_graph, graph_ext, scaf_bridges, org_scaf_conns, ploidy, max_loop_units)
-    scaffold_paths = PhaseScaffolds(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges, ploidy)
+    scaffold_paths = PhaseScaffolds(scaffold_paths, graph_ext, scaf_bridges, ploidy)
     
     # Finish Scaffolding
     scaffold_paths = ExpandScaffoldsWithContigs(scaffold_paths, scaffolds, scaffold_parts, ploidy)
@@ -9180,17 +9268,7 @@ def TestFilterInvalidConnections():
 #
     # Run function
     graph_ext = FindValidExtensionsInScaffoldGraph(scaffold_graph)
-    #print(graph_ext['org'][np.isin(graph_ext['org']['scaf0'], [1802])])
-    #print(graph_ext['ext'][np.isin(graph_ext['ext']['scaf0'], [1802])])
-    #print(graph_ext['pairs'][np.isin(graph_ext['pairs'][['oindex','eindex']], list(range(348,351))).any(axis=1)])
-    #print(ends[np.isin(ends[['apid','bpid']].values, [118,119]).all(axis=1)].copy())
-    #print(ends[np.isin(ends[['apid','bpid']], [118,119]).any(axis=1)])
-    #print(scaffold_graph[(scaffold_graph['from'] == 1801)])
-    #print(scaffold_graph[(scaffold_graph['from'] == 1802)])
-    #print(scaffold_graph[(scaffold_graph['from'] == 1803)])
-    #print(scaffold_graph[(scaffold_graph['from'] == 1804)])
-    #print(scaffold_graph[(scaffold_graph['from'] == 1805)])
-    ends = FilterInvalidConnections(ends, scaffold_paths, scaffold_graph, graph_ext, ploidy)
+    ends = FilterInvalidConnections(ends, scaffold_paths, graph_ext, ploidy)
 #
     # Compare and report failed tests
     splits['correct'] = True
@@ -9317,6 +9395,7 @@ def TestTraverseScaffoldGraph():
         {'from':  40554, 'from_side':    'r', 'length':      3, 'scaf1':  53480, 'strand1':    '-', 'dist1':      0, 'scaf2':   2722, 'strand2':    '+', 'dist2':      0},
         {'from':  41636, 'from_side':    'l', 'length':      2, 'scaf1':    115, 'strand1':    '+', 'dist1':   1932},
         {'from':  41636, 'from_side':    'r', 'length':      4, 'scaf1': 112333, 'strand1':    '-', 'dist1':   -710, 'scaf2':  13455, 'strand2':    '+', 'dist2':    -43, 'scaf3':     69, 'strand3':    '-', 'dist3':    -43},        {'from':  47404, 'from_side':    'l', 'length':      3, 'scaf1':  30179, 'strand1':    '-', 'dist1':    -32, 'scaf2': 109207, 'strand2':    '-', 'dist2':    -40},
+        {'from':  47404, 'from_side':    'l', 'length':      3, 'scaf1':  30179, 'strand1':    '-', 'dist1':    -32, 'scaf2': 109207, 'strand2':    '-', 'dist2':    -40},
         {'from':  47404, 'from_side':    'l', 'length':      3, 'scaf1':  33144, 'strand1':    '+', 'dist1':  -4062, 'scaf2':  26855, 'strand2':    '+', 'dist2':    -40},
         {'from':  47404, 'from_side':    'r', 'length':      2, 'scaf1':     69, 'strand1':    '+', 'dist1':    -43},
         {'from':  49093, 'from_side':    'l', 'length':      3, 'scaf1':  51660, 'strand1':    '+', 'dist1':    -14, 'scaf2': 101215, 'strand2':    '+', 'dist2':      5},
@@ -9732,6 +9811,139 @@ def TestTraverseScaffoldGraph():
         'strand1':  [     '',     '',     ''],
         'dist1':    [      0,      0,      0]
         }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    100,    100,    100],
+        'pos':      [      0,      1,      2],
+        'scaf0':    [   2885,  15812,  10723],
+        'strand0':  [    '+',    '+',    '-'],
+        'dist0':    [      0,    -44,    -43]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    101,    101,    101],
+        'pos':      [      0,      1,      2],
+        'scaf0':    [   2885,  13452,  10723],
+        'strand0':  [    '+',    '-',    '-'],
+        'dist0':    [      0,    -45,    -41]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    102,    102,    102],
+        'pos':      [      0,      1,      2],
+        'scaf0':    [  10723,  12896,  76860],
+        'strand0':  [    '-',    '-',    '-'],
+        'dist0':    [      0,    -43,    -46]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    103,    103,    103],
+        'pos':      [      0,      1,      2],
+        'scaf0':    [  10723,  12910,  76860],
+        'strand0':  [    '-',    '-',    '-'],
+        'dist0':    [      0,    -43,    -42]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    104,    104,    104],
+        'pos':      [      0,      1,      2],
+        'scaf0':    [  76860,  32229,  71091],
+        'strand0':  [    '-',    '+',    '-'],
+        'dist0':    [      0,   -456,      3]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    105,    105,    105],
+        'pos':      [      0,      1,      2],
+        'scaf0':    [  71091,   1306,     44],
+        'strand0':  [    '-',    '+',    '-'],
+        'dist0':    [      0,    -45,    -43]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    106,    106,    106,    106,    106,    106,    106,    106,    106,    106,    106],
+        'pos':      [      0,      1,      2,      3,      4,      5,      6,      7,      8,      9,      9],
+        'scaf0':    [     44,  99342,  99341,   9344, 118890,  96716,  56740, 101215,  56987,  49093, 109207],
+        'strand0':  [    '-',    '-',    '-',    '+',    '-',    '+',    '-',    '-',    '-',    '+',    '+'],
+        'dist0':    [      0,    -44,      0,      0,    -13,     -3,    -45,    469,    -10,      4,    780]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    107,    107,    107],
+        'pos':      [      0,      1,      2],
+        'scaf0':    [  109207,  30179, 47404],
+        'strand0':  [    '+',    '+',    '+'],
+        'dist0':    [      0,    -40,    -32]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    108,    108,    108,    108],
+        'pos':      [      0,      1,      2,      3],
+        'scaf0':    [ 109207,  26855,  33144,  47404],
+        'strand0':  [    '+',    '-',    '-',    '+'],
+        'dist0':    [      0,    -43,    -40,  -4062]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    109,    109,    109,    109,    109,    109,    109,    109,    109,    109,    109,    109,    109,    109],
+        'pos':      [      0,      1,      2,      3,      4,      5,      6,      7,      8,      9,     10,     11,     12,     13],
+        'scaf0':    [ 109207,  30214,  49093,  51660, 101215,  47516,  96716, 118892,   9344,  99342, 107483, 107484, 107485, 107486],
+        'strand0':  [    '-',    '+',    '-',    '+',    '+',    '+',    '-',    '+',    '-',    '+',    '+',    '+',    '+',    '+'],
+        'dist0':    [      0,     -6,     17,    -14,      5,    453,    -45,    -38,      8,     73,    -44,      0,      0,      0]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    110,    110,    110],
+        'pos':      [      0,      1,      2],
+        'scaf0':    [  13591,  11659,   2725],
+        'strand0':  [    '+',    '+',    '-'],
+        'dist0':    [      0,    -43,    136]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    111,    111,    111],
+        'pos':      [      0,      1,      2],
+        'scaf0':    [  13591,  13029,   2725],
+        'strand0':  [    '+',    '-',    '-'],
+        'dist0':    [      0,    -43,    143]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    112,    112,    112],
+        'pos':      [      0,      1,      2],
+        'scaf0':    [   2725,  14096,    929],
+        'strand0':  [    '-',    '-',    '-'],
+        'dist0':    [      0,    642,    -44]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    113,    113,    113,    113,    113,    113],
+        'pos':      [      0,      1,      2,      3,      4,      5],
+        'scaf0':    [    929, 117303, 107484, 107485, 107486,  33994],
+        'strand0':  [    '-',    '-',    '+',    '+',    '+',    '+'],
+        'dist0':    [      0,   2544,   -888,      0,      0,    -44]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    114,    114,    114,    114,    114,    114,    114],
+        'pos':      [      0,      1,      2,      3,      4,      5,      6],
+        'scaf0':    [     69,  13434, 112333,    114,    115,     -1, 115803],
+        'strand0':  [    '+',    '-',    '+',    '+',    '+',    '+',    '+'],
+        'dist0':    [      0,    -41,     38,   -819,   1131,      0,    885]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    115,    115,    115,    115,    115,    115,    115],
+        'pos':      [      0,      1,      2,      3,      4,      5,      6],
+        'scaf0':    [     69,  13455, 112333,  41636,    115,  15177, 115803],
+        'strand0':  [    '+',    '-',    '+',    '-',    '+',    '+',    '+'],
+        'dist0':    [      0,    -43,    -43,   -710,   1932,    -42,      5]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    116,    116,    116,    116,    116],
+        'pos':      [      0,      1,      2,      3,      4],
+        'scaf0':    [    372, 107485, 107486, 101373,  70951],
+        'strand0':  [    '+',    '+',    '+',    '-',    '+'],
+        'dist0':    [      0,  -1436,      0,  -1922,      0]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    117,    117,    117],
+        'pos':      [      0,      1,      2],
+        'scaf0':    [  31749,  53480, 101373],
+        'strand0':  [    '-',    '-',    '-'],
+        'dist0':    [   -350,   -646,  -1383]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    118,    118,    118],
+        'pos':      [      0,      1,      2],
+        'scaf0':    [  40554,  53480,   2722],
+        'strand0':  [    '+',    '-',    '+'],
+        'dist0':    [      0,      0,      0]
+        }) )
     result_loops.append( pd.DataFrame({
         'pid':      [    100,    100,    100],
         'pos':      [      0,      1,      2],
@@ -9752,6 +9964,104 @@ def TestTraverseScaffoldGraph():
         'scaf0':    [  40554,  53480,   2722],
         'strand0':  [    '+',    '-',    '+'],
         'dist0':    [      0,      0,      0]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    100,    100],
+        'pos':      [      0,      1],
+        'scaf0':    [   2799,    674],
+        'strand0':  [    '-',    '+'],
+        'dist0':    [      0,     60]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    101,    101],
+        'pos':      [      0,      1],
+        'scaf0':    [    674,  20727],
+        'strand0':  [    '+',    '-'],
+        'dist0':    [      0,    -68]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    102,    102],
+        'pos':      [      0,      1],
+        'scaf0':    [    674,  20727],
+        'strand0':  [    '+',    '-'],
+        'dist0':    [      0,    -18]
+        }) )        
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    103,    103],
+        'pos':      [      0,      1],
+        'scaf0':    [  20727,   2885],
+        'strand0':  [    '-',    '+'],
+        'dist0':    [      0,    -44]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    104,    104],
+        'pos':      [      0,      1],
+        'scaf0':    [  20727,   2885],
+        'strand0':  [    '-',    '+'],
+        'dist0':    [      0,    245]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    105,    105],
+        'pos':      [      0,      1],
+        'scaf0':    [  76860,  71091],
+        'strand0':  [    '-',    '-'],
+        'dist0':    [      0,   2134]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    106,    106],
+        'pos':      [      0,      1],
+        'scaf0':    [  71091,     44],
+        'strand0':  [    '-',    '-'],
+        'dist0':    [      0,      1]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    107,    107],
+        'pos':      [      0,      1],
+        'scaf0':    [  13591,   2725],
+        'strand0':  [    '+',    '-'],
+        'dist0':    [      0,    734]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    108,    108],
+        'pos':      [      0,      1],
+        'scaf0':    [   2725,    929],
+        'strand0':  [    '-',    '-'],
+        'dist0':    [      0,   1205]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    109,    109],
+        'pos':      [      0,      1],
+        'scaf0':    [    929, 117304],
+        'strand0':  [    '-',    '-'],
+        'dist0':    [      0,   2489]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    110,    110],
+        'pos':      [      0,      1],
+        'scaf0':    [     69,  47404],
+        'strand0':  [    '-',    '-'],
+        'dist0':    [      0,    -43]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    111,    111],
+        'pos':      [      0,      1],
+        'scaf0':    [     69, 110827],
+        'strand0':  [    '-',    '-'],
+        'dist0':    [      0,    -43]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    112,    112],
+        'pos':      [      0,      1],
+        'scaf0':    [  58443, 107486],
+        'strand0':  [    '+',    '+'],
+        'dist0':    [      0,    -83]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    113,    113],
+        'pos':      [      0,      1],
+        'scaf0':    [  99004, 107486],
+        'strand0':  [    '+',    '-'],
+        'dist0':    [      0,    838]
         }) )
 #
     # Test 2
@@ -9812,6 +10122,13 @@ def TestTraverseScaffoldGraph():
         'strand1':  [     '',     '',     '',     '',     '',     '',     '',     '',     '',     '',     ''],
         'dist1':    [      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0]
         }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    200,    200,    200,    200,    200,    200,    200,    200,    200,    200,    200],
+        'pos':      [      0,      1,      2,      3,      4,      5,      6,      7,      8,      9,     10],
+        'scaf0':    [  66038, 115947, 115948, 115949, 115950, 115951, 115952, 115951, 115949, 115947,  19382],
+        'strand0':  [    '+',    '+',    '+',    '+',    '+',    '+',    '+',    '-',    '-',    '-',    '+'],
+        'dist0':    [      0,    381,      0,      0,      0,      0,    -42,    -43,   9325,    515,    -41]
+        }) )
 #
     # Test 3
     scaffolds.append( pd.DataFrame({'case':3, 'scaffold':[30387,  95786, 108403, 110072]}) )
@@ -9848,6 +10165,13 @@ def TestTraverseScaffoldGraph():
         'scaf1':    [     -1,     -1,     -1,     -1,     -1,     -1,     -1],
         'strand1':  [     '',     '',     '',     '',     '',     '',     ''],
         'dist1':    [      0,      0,      0,      0,      0,      0,      0]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    300,    300,    300],
+        'pos':      [      0,      1,      2],
+        'scaf0':    [ 110072, 108403, 110072],
+        'strand0':  [    '+',    '+',    '+'],
+        'dist0':    [      0,    -30,    813]
         }) )
     result_loops.append( pd.DataFrame({
         'pid':      [    300,    300,    300,    300,    300,    300,    300],
@@ -9913,6 +10237,20 @@ def TestTraverseScaffoldGraph():
         'strand1':  [     '',    '+',     '',    '-',     '',    '+',    '+'],
         'dist1':    [      0,    -44,      0,   2982,      0,    -44,    -46]
         }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    400,    400,    400],
+        'pos':      [      0,      1,      2],
+        'scaf0':    [  80469,  13100,  20542],
+        'strand0':  [    '-',    '-',    '+'],
+        'dist0':    [      0,    -42,    -43]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    401,    401,    401],
+        'pos':      [      0,      1,      2],
+        'scaf0':    [  80469,  12976,  20542],
+        'strand0':  [    '-',    '+',    '+'],
+        'dist0':    [      0,    -44,    -46]
+        }) )
     result_loops.append( pd.DataFrame({
         'pid':      [    400,    400,    400],
         'pos':      [      0,      1,      2],
@@ -9926,6 +10264,20 @@ def TestTraverseScaffoldGraph():
         'scaf0':    [  45222,   9067,   9067,  80469],
         'strand0':  [    '+',    '-',    '-',    '-'],
         'dist0':    [      0,    397,   2982,      4]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    400,    400],
+        'pos':      [      0,      1],
+        'scaf0':    [    928,  45222],
+        'strand0':  [    '+',    '+'],
+        'dist0':    [      0,     20]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    401,    401],
+        'pos':      [      0,      1],
+        'scaf0':    [    928,  45222],
+        'strand0':  [    '+',    '+'],
+        'dist0':    [      0,    -44]
         }) )
 #
     # Test 5
@@ -10128,16 +10480,16 @@ def TestTraverseScaffoldGraph():
         'dist1':    [      0,      0,   -558,    739,   -502,      0,      0,      0]
         }) )
     result_paths.append( pd.DataFrame({
-        'pid':      [    502,    502,    502,    502,    502],
-        'pos':      [      0,      1,      2,      3,      4],
-        'phase0':   [    505,    505,    505,    505,    505],
-        'scaf0':    [  54753,  95291,  10945, 105853,  32135],
-        'strand0':  [    '+',    '+',    '+',    '-',    '-'],
-        'dist0':    [      0,    -18,    -45,    -43,    -45],
-        'phase1':   [   -506,   -506,   -506,   -506,   -506],
-        'scaf1':    [     -1,     -1,     -1,     -1,     -1],
-        'strand1':  [     '',     '',     '',     '',     ''],
-        'dist1':    [      0,      0,      0,      0,      0]
+        'pid':      [    502,    502,    502,    502,    502,    502],
+        'pos':      [      0,      1,      2,      3,      4,      5],
+        'phase0':   [    505,    505,    505,    505,    505,    505],
+        'scaf0':    [  54753,  95291,  10945, 105853,  32135,  45782],
+        'strand0':  [    '+',    '+',    '+',    '-',    '-',    '+'],
+        'dist0':    [      0,    -18,    -45,    -43,    -45,   -502],
+        'phase1':   [   -506,   -506,   -506,   -506,   -506,   -506],
+        'scaf1':    [     -1,     -1,     -1,     -1,     -1,     -1],
+        'strand1':  [     '',     '',     '',     '',     '',     ''],
+        'dist1':    [      0,      0,      0,      0,      0,      0]
         }) )
     result_paths.append( pd.DataFrame({
         'pid':      [    503,    503,    503,    503,    503],
@@ -10222,6 +10574,160 @@ def TestTraverseScaffoldGraph():
         'scaf1':    [     -1,     -1],
         'strand1':  [     '',     ''],
         'dist1':    [      0,      0]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    500,    500,    500,    500],
+        'pos':      [      0,      1,      2,      3],
+        'scaf0':    [  11769,      7,  74998,  32135],
+        'strand0':  [    '-',    '+',    '+',    '-'],
+        'dist0':    [      0,     76,   -558,    739]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    501,    501,    501],
+        'pos':      [      0,      1,      2],
+        'scaf0':    [  32135,  45782,  49372],
+        'strand0':  [    '-',    '+',    '-'],
+        'dist0':    [      0,   -502,    334]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    502,    502,    502],
+        'pos':      [      0,      1,      2],
+        'scaf0':    [  49372,  86633,  30446],
+        'strand0':  [    '-',    '-',    '+'],
+        'dist0':    [      0,    432,    -43]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    503,    503,    503],
+        'pos':      [      0,      1,      2],
+        'scaf0':    [  31108,  93920,      7],
+        'strand0':  [    '-',    '-',    '+'],
+        'dist0':    [      0,  -4681,    383]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    504,    504,    504,    504],
+        'pos':      [      0,      1,      2,      3],
+        'scaf0':    [      7,  74998,  32135,  45782],
+        'strand0':  [    '+',    '+',    '-',    '+'],
+        'dist0':    [      0,   -558,    739,   -502],
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    505,    505,    505],
+        'pos':      [      0,      1,      2],
+        'scaf0':    [  45782,  45783,  31737],
+        'strand0':  [    '+',    '+',    '+'],
+        'dist0':    [      0,      0,   1044],
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    506,    506,    506],
+        'pos':      [      0,      1,      2],
+        'scaf0':    [ 110006,   1440,  11769],
+        'strand0':  [    '+',    '-',    '-'],
+        'dist0':    [      0,    406,    -45]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    507,    507,    507],
+        'pos':      [      0,      1,      2],
+        'scaf0':    [ 110006,   7349,  11769],
+        'strand0':  [    '+',    '+',    '-'],
+        'dist0':    [      0,    387,    -45]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    508,    508,    508,    508,    508,    508],
+        'pos':      [      0,      1,      2,      3,      4,      5],
+        'scaf0':    [  31108,  54753,  95291,  10945, 105853,  32135],
+        'strand0':  [    '-',    '+',    '+',    '+',    '-',    '-'],
+        'dist0':    [      0,      0,    -18,    -45,    -43,    -45]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    509,    509,    509],
+        'pos':      [      0,      1,      2],
+        'scaf0':    [  31758,  47750, 113898],
+        'strand0':  [    '+',    '+',    '+'],
+        'dist0':    [      0,    -42,    -10]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    510,    510,    510,    510,    510],
+        'pos':      [      0,      1,      2,      3,      4],
+        'scaf0':    [  23515,  95291,  29100, 105853,  32420],
+        'strand0':  [    '+',    '+',    '-',    '-',    '-'],
+        'dist0':    [      0,      3,    -43,    -44,    -44]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    500,    500],
+        'pos':      [      0,      1],
+        'scaf0':    [      7,  45782],
+        'strand0':  [    '+',    '+'],
+        'dist0':    [      0,   -230]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    501,    501],
+        'pos':      [      0,      1],
+        'scaf0':    [  32135,  45782],
+        'strand0':  [    '-',    '+'],
+        'dist0':    [      0,   -502]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    502,    502],
+        'pos':      [      0,      1],
+        'scaf0':    [  31737,  31758],
+        'strand0':  [    '+',    '+'],
+        'dist0':    [      0,     86]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    503,    503],
+        'pos':      [      0,      1],
+        'scaf0':    [  49372,  30446],
+        'strand0':  [    '-',    '+'],
+        'dist0':    [      0,   9158]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    504,    504],
+        'pos':      [      0,      1],
+        'scaf0':    [  31758, 113898],
+        'strand0':  [    '+',    '+'],
+        'dist0':    [      0,    686]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    505,    505],
+        'pos':      [      0,      1],
+        'scaf0':    [  76037,  31729],
+        'strand0':  [    '-',    '+'],
+        'dist0':    [      0,   -162]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    506,    506],
+        'pos':      [      0,      1],
+        'scaf0':    [  76037,  31737],
+        'strand0':  [    '-',    '+'],
+        'dist0':    [      0,   -168]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    507,    507],
+        'pos':      [      0,      1],
+        'scaf0':    [  30446,  31729],
+        'strand0':  [    '+',    '+'],
+        'dist0':    [      0,    630]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    508,    508],
+        'pos':      [      0,      1],
+        'scaf0':    [  30446,  76037],
+        'strand0':  [    '+',    '-'],
+        'dist0':    [      0,      0]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    509,    509],
+        'pos':      [      0,      1],
+        'scaf0':    [  31729,  31758],
+        'strand0':  [    '+',    '+'],
+        'dist0':    [      0,   -399]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    510,    510],
+        'pos':      [      0,      1],
+        'scaf0':    [  31737,  31758],
+        'strand0':  [    '+',    '+'],
+        'dist0':    [      0,     86]
         }) )
 #
     # Test 6
@@ -10340,12 +10846,61 @@ def TestTraverseScaffoldGraph():
         'strand1':  [     '',     '',    '+',     '',    '+',     '',     '',     '',     '',     '',     '',     '',    '+',     '',     '',     '',     '',     '',     '',     ''],
         'dist1':    [      0,      0,      3,      0,    564,      0,      0,      0,      0,      0,      0,      0,    590,      0,      0,      0,      0,      0,      0,      0]
         }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    600,    600,    600],
+        'pos':      [      0,      1,      2],
+        'scaf0':    [ 123238, 123225, 123231],
+        'strand0':  [    '+',    '+',    '+'],
+        'dist0':    [      0,    -42,    -42]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    601,    601,    601,    601,    601,    601,    601],
+        'pos':      [      0,      1,      2,      3,      4,      5,      6],
+        'scaf0':    [ 123231, 123227, 123236, 123226, 123237, 123227, 123230],
+        'strand0':  [    '+',    '+',    '+',    '+',    '+',    '+',    '+'],
+        'dist0':    [      0,    549,    224,      2,      0,    542,    196]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    602,    602,    602],
+        'pos':      [      0,      1,      2],
+        'scaf0':    [ 123230, 123225, 123229],
+        'strand0':  [    '+',    '+',    '+'],
+        'dist0':    [      0,    -40,    -42]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    603,    603,    603,    603,    603,    603,    603,    603],
+        'pos':      [      0,      1,      2,      3,      4,      5,      6,      7],
+        'scaf0':    [ 123229, 123224,  51925,  41269, 123224, 123228,  51925,  67414],
+        'strand0':  [    '+',    '+',    '+',    '-',    '+',    '+',    '+',    '+'],
+        'dist0':    [      0,    179,    965,      4,   -519,     43,     55,     87]
+        }) )
     result_loops.append( pd.DataFrame({
         'pid':      [    600,    600,    600,    600,    600,    600,    600,    600,    600,    600,    600,    600,    600],
         'pos':      [      0,      1,      2,      3,      4,      5,      6,      7,      8,      9,     10,     11,     12],
         'scaf0':    [   9064, 123226, 123238, 123225, 123231, 123227, 123236, 123226, 123237, 123227, 123230, 123225, 123229],
         'strand0':  [    '-',    '+',    '+',    '+',    '+',    '+',    '+',    '+',    '+',    '+',    '+',    '+',    '+'],
         'dist0':    [      0,     -5,      3,    -42,    -42,    549,    224,      2,      0,    542,    196,    -40,    -42]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    600,    600],
+        'pos':      [      0,      1],
+        'scaf0':    [ 123226, 123238],
+        'strand0':  [    '+',    '+'],
+        'dist0':    [      0,    400]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    601,    601],
+        'pos':      [      0,      1],
+        'scaf0':    [ 123238, 123231],
+        'strand0':  [    '+',    '+'],
+        'dist0':    [      0,    564]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    602,    602],
+        'pos':      [      0,      1],
+        'scaf0':    [ 123230, 123229],
+        'strand0':  [    '+',    '+'],
+        'dist0':    [      0,    590]
         }) )
 #
     # Test 7
@@ -10392,6 +10947,27 @@ def TestTraverseScaffoldGraph():
         'strand1':  [     '',     ''],
         'dist1':    [      0,      0]
         }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    700,    700,    700],
+        'pos':      [      0,      1,      2],
+        'scaf0':    [  48692, 123617,  17428],
+        'strand0':  [    '+',    '+',    '-'],
+        'dist0':    [      0,    -38,    -44]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    700,    700],
+        'pos':      [      0,      1],
+        'scaf0':    [  48692,  17428],
+        'strand0':  [    '+',    '-'],
+        'dist0':    [      0,   1916]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    701,    701],
+        'pos':      [      0,      1],
+        'scaf0':    [  17428,  17428],
+        'strand0':  [    '-',    '+'],
+        'dist0':    [      0,  28194]
+        }) )
 #
     # Test 8
     scaffolds.append( pd.DataFrame({'case':8, 'scaffold':[197, 198, 199, 39830]}) )
@@ -10426,6 +11002,13 @@ def TestTraverseScaffoldGraph():
         'scaf1':    [     -1,     -1,     -1,     -1,     -1],
         'strand1':  [     '',     '',     '',     '',     ''],
         'dist1':    [      0,      0,      0,      0,      0]
+        }) )
+    result_unique_paths.append( pd.DataFrame({
+        'pid':      [    800,    800,    800,    800,    800],
+        'pos':      [      0,      1,      2,      3,      4],
+        'scaf0':    [    197,    198,    199,    198,  39830],
+        'strand0':  [    '+',    '+',    '+',    '+',    '-'],
+        'dist0':    [      0,      0,   -616,      3,      0]
         }) )
     result_loops.append( pd.DataFrame({
         'pid':      [    800,    800,    800,    800,    800],
@@ -10463,17 +11046,17 @@ def TestTraverseScaffoldGraph():
 #
     # Run function
     graph_ext = FindValidExtensionsInScaffoldGraph(scaffold_graph)
-    unique_paths, knots = FollowUniquePathsThroughGraph(scaffold_graph, scaffolds)
+    unique_paths, handled_origins = FollowUniquePathsThroughGraph(graph_ext)
     loop_paths, handled_scaf_conns = AddPathThroughLoops([], scaffold_graph, scaf_bridges, org_scaf_conns, ploidy, max_loop_units)
     inversion_paths, handled_scaf_conns = AddPathThroughInvertedRepeats([], handled_scaf_conns, scaffold_graph, scaf_bridges, ploidy)
-    untraversed_paths = AddUntraversedConnectedPaths([], knots, scaffold_graph, handled_scaf_conns)
+    untraversed_paths = AddUntraversedConnectedPaths([], graph_ext, handled_origins, handled_scaf_conns)
     scaffold_paths = TraverseScaffoldGraph(scaffolds.drop(columns=['case']), scaffold_graph, graph_ext, scaf_bridges, org_scaf_conns, ploidy, max_loop_units)
 #
     # Compare and report failed tests
     failed = False
     org_ploidy = ploidy
     for t in np.unique(scaffolds['case']):
-        for test_func in ["AddPathThroughLoops","AddPathThroughInvertedRepeats","TraverseScaffoldGraph"]:
+        for test_func in ["FollowUniquePathsThroughGraph","AddPathThroughLoops","AddPathThroughInvertedRepeats","AddUntraversedConnectedPaths","TraverseScaffoldGraph"]:
             if test_func == "FollowUniquePathsThroughGraph":
                 res_paths = result_unique_paths
                 scaf_paths = unique_paths
@@ -10527,7 +11110,10 @@ def TestTraverseScaffoldGraph():
                 comp = comp.groupby(['cpid','opid','hap','reverse']).size().reset_index(name='bcount').groupby(['cpid','opid','hap'])[['bcount']].max().reset_index()
                 comp = correct_haps[correct_haps['reverse']].groupby(['cpid','hap']).size().reset_index(name='ccount').merge(comp, on=['cpid','hap'], how='inner')
                 comp = comp[comp['ccount'] == comp['bcount']].merge( obtained_haps.groupby(['opid','hap']).size().reset_index(name='ocount'), on=['opid','hap'], how='left')
-                comp = comp[comp['ccount'] == comp['ocount']].groupby(['cpid','hap']).first().reset_index()
+                if test_func == "FollowUniquePathsThroughGraph":
+                    comp = comp[comp['ccount'] == comp['ocount']].copy() # In FollowUniquePathsThroughGraph we do produce every path in both directions, so do accept both here
+                else:
+                    comp = comp[comp['ccount'] == comp['ocount']].groupby(['cpid','hap']).first().reset_index()
                 comp = comp.groupby(['cpid','opid']).size().reset_index(name='nhaps')
                 comp = comp[comp['nhaps'] == ploidy].copy()
                 correct_paths = correct_paths[np.isin(correct_paths['pid'], comp['cpid']) == False].drop(columns=['reverse'])
