@@ -5656,21 +5656,24 @@ def CombinePathOnUniqueOverlap(scaffold_paths, scaffold_graph, graph_ext, scaf_b
         conns = conns.groupby(['apid','aside','bpid','bside']).first().reset_index()
         conns.drop(columns=['minhaps','maxhaps','maxoverlap','minoverlap','tiebreakhaps','tiebreakoverlap'], inplace=True)
         # Get number of different haplotypes that are actually compared (because they differ close enough to the checked end) to not give an advantage to paths with more haplotypes in the upcoming filtering
-        dedup_haps = GetDeduplicatedHaplotypesAtPathEnds(ends[['apid','aside','matches']].drop_duplicates().rename(columns={'apid':'pid','aside':'side'}), scaffold_paths, scaffold_graph, ploidy)
-        dedup_haps = ends[['apid','aside','ahap','bpid','bside','bhap','matches']].merge(dedup_haps.rename(columns={col:f'a{col}' for col in dedup_haps.columns if col != 'matches'}), on=['apid','aside','matches','ahap'], how='inner')\
-                                                                                  .merge(dedup_haps.rename(columns={col:f'b{col}' for col in dedup_haps.columns if col != 'matches'}), on=['bpid','bside','matches','bhap'], how='inner')
-        dedup_haps.drop(columns=['matches'], inplace=True)
-        for p in ['a','b']:
-            conns[f'{p}nhaps'] = conns[['apid','aside','bpid','bside']].merge(dedup_haps[['apid','aside','bpid','bside',f'{p}hap']].drop_duplicates().groupby(['apid','aside','bpid','bside']).size().reset_index(name='nhaps'), on=['apid','aside','bpid','bside'], how='left')['nhaps'].astype(int).values
-        conns['minhaps'] = np.minimum(conns['anhaps'], conns['bnhaps'])
-        conns['maxhaps'] = np.maximum(conns['anhaps'], conns['bnhaps'])
+        #dedup_haps = GetDeduplicatedHaplotypesAtPathEnds(ends[['apid','aside','matches']].drop_duplicates().rename(columns={'apid':'pid','aside':'side'}), scaffold_paths, scaffold_graph, ploidy)
+        #dedup_haps = ends[['apid','aside','ahap','bpid','bside','bhap','matches']].merge(dedup_haps.rename(columns={col:f'a{col}' for col in dedup_haps.columns if col != 'matches'}), on=['apid','aside','matches','ahap'], how='inner')\
+        #                                                                          .merge(dedup_haps.rename(columns={col:f'b{col}' for col in dedup_haps.columns if col != 'matches'}), on=['bpid','bside','matches','bhap'], how='inner')
+        #dedup_haps.drop(columns=['matches'], inplace=True)
+        #for p in ['a','b']:
+        #    conns[f'{p}nhaps'] = conns[['apid','aside','bpid','bside']].merge(dedup_haps[['apid','aside','bpid','bside',f'{p}hap']].drop_duplicates().groupby(['apid','aside','bpid','bside']).size().reset_index(name='nhaps'), on=['apid','aside','bpid','bside'], how='left')['nhaps'].astype(int).values
+        #conns['minhaps'] = np.minimum(conns['anhaps'], conns['bnhaps'])
+        #conns['maxhaps'] = np.maximum(conns['anhaps'], conns['bnhaps'])
         # Count alternatives and take only unique connections with preferences giving to more haplotypes and matches
         for p in ['a','b']:
-            sort_cols = [f'{p}pid',f'{p}side','minhaps','maxhaps',f'{p}nhaps','max_matches']
-            conns.sort_values(sort_cols, ascending=[True,True,False,False,False,False], inplace=True) # Do not use minhaps/maxhaps here, because they are between different scaffolds and this would give an advantage to scaffolds with more haplotypes
-            conns[f'{p}alts'] = conns.groupby([f'{p}pid',f'{p}side'], sort=False).cumcount()+1
-            equivalent = conns.groupby(sort_cols, sort=False)[f'{p}alts'].agg(['max','size'])
-            conns[f'{p}alts'] = np.repeat(equivalent['max'].values, equivalent['size'].values)
+            conns.sort_values([f'{p}pid',f'{p}side'], inplace=True)
+            alts = conns.groupby([f'{p}pid',f'{p}side'], sort=False).size().values
+            conns[f'{p}alts'] = np.repeat(alts, alts)
+        #    sort_cols = [f'{p}pid',f'{p}side','minhaps','maxhaps',f'{p}nhaps','max_matches']
+        #    conns.sort_values(sort_cols, ascending=[True,True,False,False,False,False], inplace=True) # Do not use minhaps/maxhaps here, because they are between different scaffolds and this would give an advantage to scaffolds with more haplotypes
+        #    conns[f'{p}alts'] = conns.groupby([f'{p}pid',f'{p}side'], sort=False).cumcount()+1
+        #    equivalent = conns.groupby(sort_cols, sort=False)[f'{p}alts'].agg(['max','size'])
+        #    conns[f'{p}alts'] = np.repeat(equivalent['max'].values, equivalent['size'].values)
         conns = conns.loc[(conns['aalts'] == 1) & (conns['balts'] == 1), ['apid','aside','bpid','bside','aoverlap','boverlap']].copy()
 #
         # Assign all connected paths to a meta scaffold to define connection order
