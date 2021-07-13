@@ -5111,6 +5111,116 @@ def FilterInvalidConnections(ends, scaffold_paths, graph_ext, ploidy):
 #
     return ends
 
+def SelectBestConnections(ends, scaffold_paths, scaffold_graph, ploidy):
+    if len(ends):
+        ends = ends[ends['valid_path'] == 'ab'].drop(columns=['valid_path'])
+        # Find branching points in alternative patha
+        branch_points = []
+        extending = []
+        ends, patha = GetPathAFromEnds(ends, scaffold_paths, ploidy)
+        pairwise = ends[['opid','bpid','bside','bhap','matches']].copy()
+        pairwise = pairwise.groupby(['opid','bpid','bside','bhap'])['matches'].max().reset_index()
+        pairwise = pairwise.rename(columns={'opid':'opid1','matches':'matches1'}).merge(pairwise.rename(columns={'opid':'opid2','matches':'matches2'}), on=['bpid','bside','bhap'], how='inner').drop(columns=['bpid','bside','bhap'])
+        pairwise = pairwise[pairwise['opid1'] != pairwise['opid2']].drop_duplicates()
+        pairwise.rename(columns={'matches1':'pos1','matches2':'pos2'}, inplace=True)
+        pairwise['min_pos'] = np.minimum(pairwise['pos1'], pairwise['pos2'])
+        for p in [1,2]:
+            pairwise[f'pos{p}'] -= pairwise['min_pos']
+        pairwise.drop(columns=['min_pos'], inplace=True)
+        patha_len = patha.groupby(['pid'])['pos'].max().reset_index(name='len')
+        patha_len['len'] += 1
+        for p in [1,2]:
+            pairwise[f'len{p}'] = pairwise[[f'opid{p}']].rename(columns={f'opid{p}':'pid'}).merge(patha_len, on=['pid'], how='left')['len'].values
+        while len(pairwise):
+            pairwise['pos1'] += 1
+            pairwise['pos2'] += 1
+            extending.append( pairwise.loc[(pairwise['pos1'] >= pairwise['len1']) & (pairwise['pos2'] < pairwise['len2']), ['opid1','opid2']].drop_duplicates() )
+            pairwise = pairwise[(pairwise['pos1'] < pairwise['len1']) & (pairwise['pos2'] < pairwise['len2'])].copy()
+            if len(pairwise):
+                pairwise['match'] = ( pairwise[['opid1','pos1']].rename(columns={'opid1':'pid','pos1':'pos'}).merge(patha, on=['pid','pos'], how='left')[['scaf','strand','dist']].values == pairwise[['opid2','pos2']].rename(columns={'opid2':'pid','pos2':'pos'}).merge(patha, on=['pid','pos'], how='left')[['scaf','strand','dist']].values ).all(axis=1)
+                branch_points.append( pairwise.loc[pairwise['match'] == False, ['opid1','pos1']].drop_duplicates() )
+                pairwise = pairwise[pairwise['match']].copy()
+        if len(branch_points):
+            branch_points = pd.concat(branch_points, ignore_index=True)
+            branch_points = branch_points[branch_points['pos1'] < scaffold_graph['length'].max()-1].copy() # Branch points that cannot have a connection out of the path are irrelevant
+        if len(extending):
+            extending = pd.concat(extending, ignore_index=True)
+        # Check from the branch_points beginning with the furthest if some ends are not directly supported by the scaffold_graph
+        if len(branch_points):
+            # Build vertical paths up to furthest branch_point
+            branch_points.rename(columns={'opid1':'opid','pos1':'pos'}, inplace=True)
+            branch_points.sort_values(['opid','pos'], ascending=[True,False], inplace=True)
+            branch_points.drop_duplicates(inplace=True)
+            vpatha = branch_points.groupby(['opid'], sort=False)['pos'].max().reset_index()
+            vpatha['length'] = vpatha['pos'] + 1
+            patha['strand'] = np.where(patha['strand'] == '+', '-', '+') # We need patha in the opposite direction
+            patha['dist'] = patha['dist'].shift(-1, fill_value=0) # Shift the distances additionally to the previous strand flip to get the reverse direction
+            vpatha[['scaf0','strand0']] = vpatha[['opid','pos']].rename(columns={'opid':'pid'}).merge(patha, on=['pid','pos'], how='left')[['scaf','strand']].values
+            vpatha['pos'] -= 1
+            s = 1
+            while np.sum(vpatha['pos'] >= 0):
+                vpatha[[f'scaf{s}',f'strand{s}',f'dist{s}']] = vpatha[['opid','pos']].rename(columns={'opid':'pid'}).merge(patha, on=['pid','pos'], how='left')[['scaf','strand','dist']].values
+                vpatha['pos'] -= 1
+                s += 1
+            vpatha.drop(columns=['pos'], inplace=True)
+            vpatha.rename(columns={'scaf0':'from','strand0':'from_side','length':'olen'}, inplace=True)
+            vpatha['from_side'] = np.where(vpatha['from_side'] == '+', 'r', 'l')
+            # Check from the branch_points beginning with the furthest if some ends are not directly supported by the scaffold_graph
+            ends, pathb = GetPathBFromEnds(ends, scaffold_paths, ploidy)
+            pathb_len = pathb.groupby(['pid'])['pos'].max().reset_index(name='len')
+            pathb_len['len'] += 1
+            while len(branch_points):
+                # Get the extensions for each patha from scaffold_graph
+                patha_ext = []
+                for l in np.unique(vpatha['olen'].values):
+                    mcols = ['from','from_side'] + [f'{n}{s}' for s in range(1,l) for n in ['scaf','strand','dist']]
+                    cur_ext = vpatha.loc[vpatha['olen'] == l, ['opid']+mcols].merge(scaffold_graph.loc[scaffold_graph['length'] > l], on=mcols, how='inner').drop(columns=mcols)
+                    if len(cur_ext):
+                        cur_ext = RemoveEmptyColumns(cur_ext)
+                        cur_ext.rename(columns={f'{n}{s}':f'{n}{s-l}' for s in range(l,cur_ext['length'].max()) for n in ['scaf','strand','dist']}, inplace=True)
+                        cur_ext['length'] -= l
+                        patha_ext.append( cur_ext )
+                if len(patha_ext):
+                    patha_ext = pd.concat(patha_ext, ignore_index=True)
+                # Check if pathb matches at least one of the extensions
+                if len(patha_ext):
+                    # Compare pathb with extensions
+                    pairs = ends[['opid','epid']].reset_index().rename(columns={'index':'endindex'}).merge(patha_ext[['opid','length']].reset_index().rename(columns={'index':'eindex'}), on='opid', how='inner')
+                    if len(pairs):
+                        pairs['length'] = np.minimum(pairs['length'], pairs[['epid']].merge(pathb_len, left_on='epid', right_on='pid', how='left')['len'].values)
+                        pairs['match'] = True
+                        for s in range(pairs['length'].max()):
+                            cur = (pairs['length'] > s) & pairs['match']
+                            pairs.loc[cur, 'match'] = ( pairs.loc[cur, ['epid']].rename(columns={'epid':'pid'}).merge(pathb[pathb['pos'] == s], on=['pid'], how='left')[['scaf','strand','dist']].values == patha_ext.loc[pairs.loc[cur, 'eindex'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values ).all(axis=1)
+                    # Remove ends without a matching pairing
+                    pairs = pairs.groupby(['endindex'])['match'].max().reset_index()
+                    pairs = pairs[pairs['match'] == False].drop(columns=['match'])
+                    ends.drop(pairs['endindex'].values, inplace=True)
+                # Remove handled branch_points and go to next ones
+                branch_points['trim'] = np.where(branch_points['opid'] == branch_points['opid'].shift(1), branch_points['pos'].shift(1, fill_value=0) - branch_points['pos'], -1)
+                branch_points = branch_points[branch_points['trim'] > 0].copy()
+                vpatha = vpatha.merge(branch_points.groupby(['opid'], sort=False).first().reset_index()[['opid','trim']], on='opid', how='inner')
+                if len(vpatha):
+                    vpatha.drop(columns=['from','from_side'], inplace=True)
+                    vpatha = pd.concat([ vpatha[vpatha['trim'] == t].drop(columns=[f'{n}{s}' for s in range(1,t) for n in ['scaf','strand','dist']]).rename(columns={f'{n}{s}':f'{n}{s-t}' for s in range(t,vpatha['olen'].max()) for n in ['scaf','strand','dist']}) for t in np.unique(vpatha['trim'].values)], ignore_index=True)
+                    vpatha['olen'] -= vpatha['trim']
+                    vpatha.drop(columns=['trim','dist0'], inplace=True)
+                    vpatha = RemoveEmptyColumns(vpatha)
+                    vpatha.rename(columns={'scaf0':'from','strand0':'from_side'}, inplace=True)
+                    vpatha['from_side'] = np.where(vpatha['from_side'] == '+', 'r', 'l')
+            ends.drop(columns=['epid'], inplace=True)
+        ends.drop(columns=['opid'], inplace=True)
+        # Require ends to be valid from both sides
+        ends = ends.merge(ends[['apid','ahap','aside','bpid','bhap','bside']].rename(columns={'apid':'bpid','ahap':'bhap','aside':'bside','bpid':'apid','bhap':'ahap','bside':'aside'}), on=['apid','ahap','aside','bpid','bhap','bside'], how='inner')
+        # Take the ones that support more haplotypes
+        support = ends[['apid','aside','bpid','bside','bhap']].drop_duplicates().groupby(['bpid','bside','apid','aside']).size().reset_index(name='bhaps')
+        support['max_supp'] = support[['bpid','bside']].merge(support.groupby(['bpid','bside'], sort=False)['bhaps'].max().reset_index(), on=['bpid','bside'], how='left')['bhaps'].values
+        support = support[support['bhaps'] == support['max_supp']].drop(columns=['bhaps','max_supp'])
+        ends = ends.merge(support, on=['apid','aside','bpid','bside'], how='inner')
+        ends = ends.merge(ends[['apid','ahap','aside','bpid','bhap','bside']].rename(columns={'apid':'bpid','ahap':'bhap','aside':'bside','bpid':'apid','bhap':'ahap','bside':'aside'}), on=['apid','ahap','aside','bpid','bhap','bside'], how='inner')
+#
+    return ends
+
 def GetDeduplicatedHaplotypesAtPathEnds(path_sides, scaffold_paths, scaffold_graph, ploidy):
     # Reverse the scaffolds, where we are interested on the right side, so that the position 0 is always the first on the interesting side
     cur_paths = scaffold_paths.merge(path_sides, on=['pid'], how='inner')
@@ -5634,7 +5744,7 @@ def CombinePathOnUniqueOverlap(scaffold_paths, scaffold_graph, graph_ext, scaf_b
 #
     # Check that combining the paths does not violate scaffold_graph
     ends = FilterInvalidConnections(ends, scaffold_paths, graph_ext, ploidy)
-    ends = ends[ends['valid_path'] == 'ab'].drop(columns=['valid_path'])
+    ends = SelectBestConnections(ends, scaffold_paths, scaffold_graph, ploidy)
 #
     if len(ends):
         # Combine all ends that describe the same connection (multiple haplotypes of same path and multiple mapping options): Take the lowest overlap (to not compress repeats) supported by most haplotypes (requiring all haplotypes to be present would remove connections, where one haplotype reaches further into the other scaffold than other haplotypes)
@@ -5653,28 +5763,12 @@ def CombinePathOnUniqueOverlap(scaffold_paths, scaffold_graph, graph_ext, scaf_b
         conns['tiebreakhaps'] = np.where(conns['apid'] < conns['bpid'], conns['anhaps'], conns['bnhaps'])
         conns['tiebreakoverlap'] = np.where(conns['apid'] < conns['bpid'], conns['aoverlap'], conns['boverlap'])
         conns.sort_values(['apid','aside','bpid','bside','minhaps','maxhaps','maxoverlap','minoverlap','tiebreakhaps','tiebreakoverlap'], ascending=[True,True,True,True,False,False,True,True,False,True], inplace=True)
-        conns = conns.groupby(['apid','aside','bpid','bside']).first().reset_index()
-        conns.drop(columns=['minhaps','maxhaps','maxoverlap','minoverlap','tiebreakhaps','tiebreakoverlap'], inplace=True)
-        # Get number of different haplotypes that are actually compared (because they differ close enough to the checked end) to not give an advantage to paths with more haplotypes in the upcoming filtering
-        #dedup_haps = GetDeduplicatedHaplotypesAtPathEnds(ends[['apid','aside','matches']].drop_duplicates().rename(columns={'apid':'pid','aside':'side'}), scaffold_paths, scaffold_graph, ploidy)
-        #dedup_haps = ends[['apid','aside','ahap','bpid','bside','bhap','matches']].merge(dedup_haps.rename(columns={col:f'a{col}' for col in dedup_haps.columns if col != 'matches'}), on=['apid','aside','matches','ahap'], how='inner')\
-        #                                                                          .merge(dedup_haps.rename(columns={col:f'b{col}' for col in dedup_haps.columns if col != 'matches'}), on=['bpid','bside','matches','bhap'], how='inner')
-        #dedup_haps.drop(columns=['matches'], inplace=True)
-        #for p in ['a','b']:
-        #    conns[f'{p}nhaps'] = conns[['apid','aside','bpid','bside']].merge(dedup_haps[['apid','aside','bpid','bside',f'{p}hap']].drop_duplicates().groupby(['apid','aside','bpid','bside']).size().reset_index(name='nhaps'), on=['apid','aside','bpid','bside'], how='left')['nhaps'].astype(int).values
-        #conns['minhaps'] = np.minimum(conns['anhaps'], conns['bnhaps'])
-        #conns['maxhaps'] = np.maximum(conns['anhaps'], conns['bnhaps'])
-        # Count alternatives and take only unique connections with preferences giving to more haplotypes and matches
+        conns = conns.groupby(['apid','aside','bpid','bside'])[['aoverlap','boverlap']].first().reset_index()
         for p in ['a','b']:
             conns.sort_values([f'{p}pid',f'{p}side'], inplace=True)
             alts = conns.groupby([f'{p}pid',f'{p}side'], sort=False).size().values
             conns[f'{p}alts'] = np.repeat(alts, alts)
-        #    sort_cols = [f'{p}pid',f'{p}side','minhaps','maxhaps',f'{p}nhaps','max_matches']
-        #    conns.sort_values(sort_cols, ascending=[True,True,False,False,False,False], inplace=True) # Do not use minhaps/maxhaps here, because they are between different scaffolds and this would give an advantage to scaffolds with more haplotypes
-        #    conns[f'{p}alts'] = conns.groupby([f'{p}pid',f'{p}side'], sort=False).cumcount()+1
-        #    equivalent = conns.groupby(sort_cols, sort=False)[f'{p}alts'].agg(['max','size'])
-        #    conns[f'{p}alts'] = np.repeat(equivalent['max'].values, equivalent['size'].values)
-        conns = conns.loc[(conns['aalts'] == 1) & (conns['balts'] == 1), ['apid','aside','bpid','bside','aoverlap','boverlap']].copy()
+        conns = conns[(conns['aalts'] == 1) & (conns['balts'] == 1)].drop(columns=['aalts','balts'])
 #
         # Assign all connected paths to a meta scaffold to define connection order
         conns.sort_values(['apid','aside','bpid','bside'], inplace=True)
@@ -6113,6 +6207,7 @@ def TrimCircularPaths(scaffold_paths, ploidy):
 def TestPrint(scaffold_paths):
     #print(scaffold_paths)
     #print( scaffold_paths[np.isin(scaffold_paths['pid'], scaffold_paths.loc[np.isin(scaffold_paths['scaf0'], [9064, 41269, 51925, 67414, 123224, 123225, 123226, 123227, 123228, 123229, 123230, 123231, 123236, 123237, 123238]), 'pid'].values )] )
+    #print( scaffold_paths[np.isin(scaffold_paths['pid'], scaffold_paths.loc[np.isin(scaffold_paths['scaf0'], [99342,99341,9344,118890,118892]), 'pid'].values )] )
     return
 
 def TraverseScaffoldGraph(scaffolds, scaffold_graph, graph_ext, scaf_bridges, org_scaf_conns, ploidy, max_loop_units):
@@ -10472,28 +10567,28 @@ def TestTraverseScaffoldGraph():
         'dist1':    [      0,    387,      0,      0,      0,      0,      0,      0,      0,   9158]
         }) )
     result_paths.append( pd.DataFrame({
-        'pid':      [    501,    501,    501,    501,    501,    501,    501,    501],
-        'pos':      [      0,      1,      2,      3,      4,      5,      6,      7],
-        'phase0':   [    503,    503,    503,    503,    503,    503,    503,    503],
-        'scaf0':    [  93920,      7,     -1,     -1,  45782,  45783,  31737,  31758],
-        'strand0':  [    '-',    '+',     '',     '',    '+',    '+',    '+',    '+'],
-        'dist0':    [      0,    383,      0,      0,   -230,      0,   1044,     86],
-        'phase1':   [   -504,   -504,    504,    504,    504,   -504,   -504,   -504],
-        'scaf1':    [     -1,     -1,  74998,  32135,  45782,     -1,     -1,     -1],
-        'strand1':  [     '',     '',    '+',    '-',    '+',     '',     '',     ''],
-        'dist1':    [      0,      0,   -558,    739,   -502,      0,      0,      0]
+        'pid':      [    501,    501,    501,    501,    501,    501,    501],
+        'pos':      [      0,      1,      2,      3,      4,      5,      6],
+        'phase0':   [    503,    503,    503,    503,    503,    503,    503],
+        'scaf0':    [  93920,      7,     -1,     -1,  45782,  45783,  31737],
+        'strand0':  [    '-',    '+',     '',     '',    '+',    '+',    '+'],
+        'dist0':    [      0,    383,      0,      0,   -230,      0,   1044],
+        'phase1':   [   -504,   -504,    504,    504,    504,   -504,   -504],
+        'scaf1':    [     -1,     -1,  74998,  32135,  45782,     -1,     -1],
+        'strand1':  [     '',     '',    '+',    '-',    '+',     '',     ''],
+        'dist1':    [      0,      0,   -558,    739,   -502,      0,      0]
         }) )
     result_paths.append( pd.DataFrame({
-        'pid':      [    502,    502,    502,    502,    502,    502],
-        'pos':      [      0,      1,      2,      3,      4,      5],
-        'phase0':   [    505,    505,    505,    505,    505,    505],
-        'scaf0':    [  54753,  95291,  10945, 105853,  32135,  45782],
-        'strand0':  [    '+',    '+',    '+',    '-',    '-',    '+'],
-        'dist0':    [      0,    -18,    -45,    -43,    -45,   -502],
-        'phase1':   [   -506,   -506,   -506,   -506,   -506,   -506],
-        'scaf1':    [     -1,     -1,     -1,     -1,     -1,     -1],
-        'strand1':  [     '',     '',     '',     '',     '',     ''],
-        'dist1':    [      0,      0,      0,      0,      0,      0]
+        'pid':      [    502,    502,    502,    502,    502],
+        'pos':      [      0,      1,      2,      3,      4],
+        'phase0':   [    505,    505,    505,    505,    505],
+        'scaf0':    [  54753,  95291,  10945, 105853,  32135],
+        'strand0':  [    '+',    '+',    '+',    '-',    '-'],
+        'dist0':    [      0,    -18,    -45,    -43,    -45],
+        'phase1':   [   -506,   -506,   -506,   -506,   -506],
+        'scaf1':    [     -1,     -1,     -1,     -1,     -1],
+        'strand1':  [     '',     '',     '',     '',     ''],
+        'dist1':    [      0,      0,      0,      0,      0]
         }) )
     result_paths.append( pd.DataFrame({
         'pid':      [    503,    503,    503,    503,    503],
@@ -10518,6 +10613,18 @@ def TestTraverseScaffoldGraph():
         'scaf1':    [     -1,     -1,     -1, 113898],
         'strand1':  [     '',     '',     '',    '+'],
         'dist1':    [      0,      0,      0,    686]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    505,    505],
+        'pos':      [      0,      1],
+        'phase0':   [    511,    511],
+        'scaf0':    [  31737,  31758],
+        'strand0':  [    '+',    '+'],
+        'dist0':    [      0,     86],
+        'phase1':   [   -512,   -512],
+        'scaf1':    [     -1,     -1],
+        'strand1':  [     '',     ''],
+        'dist1':    [      0,      0]
         }) )
     result_paths.append( pd.DataFrame({
         'pid':      [    506,    506],
