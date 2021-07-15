@@ -1519,6 +1519,52 @@ def GetBridges(mappings, borderline_removal, min_factor_alternatives, min_num_re
 
     return bridges
 
+def InsertBridgesOnUniqueContigOverlapsWithoutConnections(bridges, repeats, min_len_contig_overlap, min_num_reads):
+    if len(repeats):
+        # Find overlapping ends
+        overlaps = repeats.rename(columns={'side':'q_side'})
+        overlaps = overlaps.merge(overlaps.rename(columns={**{col:f't{col[1:]}' for col in overlaps.columns if col[0] == 'q'}, **{col:f'q{col[1:]}' for col in overlaps.columns if col[0] == 't'}}), on=[col for col in overlaps.columns if col != 'q_side'], how='inner')
+        # Filter fully duplicated contigs
+        overlaps = overlaps[(overlaps['q_side'] != 'lr') & (overlaps['t_side'] != 'lr')].copy()
+        # Only the duplicated part should overlap, not the rest of the contig
+        overlaps = overlaps[(overlaps['q_side'] != overlaps['t_side']) == (overlaps['strand'] == '+')].drop(columns=['strand'])
+    else:
+        overlaps = []
+    if len(overlaps):
+        # Overlap needs to be unique or at least min_len_contig_overlap longer than all other options (if there is no other option it has to be at least min_len_contig_overlap long)
+        for s in ['q','t']:
+            overlaps[f'{s}_overlap'] = np.where(overlaps[f'{s}_side'] == 'l', overlaps[f'{s}_end'] - overlaps[f'{s}_confrom'], overlaps[f'{s}_conto'] - overlaps[f'{s}_start'])
+        overlaps.drop(columns=['q_confrom','q_conto','t_confrom','t_conto'], inplace=True)
+        overlaps.sort_values(['q_con','q_side','q_overlap'], ascending=[True,True,False], inplace=True)
+        overlaps['q_alt_overlap'] = np.where( (overlaps['q_con'] == overlaps['q_con'].shift(-1)) & (overlaps['q_side'] == overlaps['q_side'].shift(-1)), overlaps['q_overlap'].shift(-1, fill_value=0), 0)
+        overlaps = overlaps[(overlaps['q_con'] != overlaps['q_con'].shift(1)) & (overlaps['q_side'] != overlaps['q_side'].shift(1))].copy()
+        overlaps = overlaps[overlaps['q_overlap'] >= overlaps['q_alt_overlap'] + min_len_contig_overlap].copy()
+        overlaps.drop(columns=['q_alt_overlap'], inplace=True)
+    if len(overlaps):
+        overlaps = overlaps.merge(overlaps.rename(columns={**{col:f't{col[1:]}' for col in overlaps.columns if col[0] == 'q'}, **{col:f'q{col[1:]}' for col in overlaps.columns if col[0] == 't'}}), on=list(overlaps.columns), how='inner')
+        # We do not handle overlaps with itself (could later implement trimming of large overlap for circular contigs)
+        overlaps = overlaps[overlaps['q_con'] != overlaps['t_con']].copy()
+        # Only handle overlaps if they do not have bridges/connections on that side
+        for s in ['q','t']:
+            if len(overlaps):
+                overlaps = overlaps[ overlaps[[f'{s}_con',f'{s}_side']].rename(columns={f'{s}_con':'from',f'{s}_side':'from_side'}).merge(bridges[['from','from_side']].drop_duplicates(), on=['from','from_side'], how='left', indicator=True)['_merge'].values == "left_only" ].copy()
+    # Add the valid overlaps to bridges
+    overlap_bridges = overlaps.copy()
+    if len(overlaps):
+        overlaps.rename(columns={'q_con':'from','q_side':'from_side','t_con':'to','t_side':'to_side'}, inplace=True)
+        overlaps['mapq'] = bridges['mapq'].max()
+        overlaps['bcount'] = min_num_reads
+        overlaps['min_dist'] = -np.maximum(overlaps['q_overlap'], overlaps['t_overlap'])
+        overlaps['max_dist'] = -np.minimum(overlaps['q_overlap'], overlaps['t_overlap'])
+        overlaps['mean_dist'] = (overlaps['min_dist']+overlaps['max_dist'])//2
+        overlaps['probability'] = 0.5
+        overlaps[['to_alt','from_alt']] = 1
+        overlaps = overlaps[['from','from_side','to','to_side','mapq','bcount','mean_dist','min_dist','max_dist','probability','to_alt','from_alt']].copy()
+        bridges = pd.concat([bridges, overlaps], ignore_index=True)
+        bridges.sort_values(['from','from_side','to','to_side','mean_dist'], inplace=True)
+    
+    return bridges, overlap_bridges
+
 def ScaffoldAlongGivenConnections(scaffolds, scaffold_parts):
     # Handle right-right scaffold connections (keep scaffold with lower id and reverse+add the other one): We can only create new r-r or r-l connections
     keep = scaffolds.loc[(scaffolds['rscaf_side'] == 'r') & (scaffolds['scaffold'] < scaffolds['rscaf']), 'scaffold'].values
@@ -7111,7 +7157,7 @@ def BasicMappingToScaffolds(mappings, all_scafs):
 #
     return mappings
 
-def MapReadsToScaffolds(mappings, scaffold_paths, bridges, ploidy):
+def MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploidy):
     # Preserve some information on the neighbouring mappings that we need later
     mappings['read_pos'] = mappings.groupby(['read_name','read_start'], sort=False).cumcount()
     mappings[['lmapq','lmatches']] = mappings[['mapq','matches']].shift(1, fill_value=-1).values
@@ -7147,6 +7193,25 @@ def MapReadsToScaffolds(mappings, scaffold_paths, bridges, ploidy):
         mappings.rename(columns={'group':'mapid'}, inplace=True)
         conn_cov = conn_cov.merge(mappings.loc[(mappings['lcon'] >= 0) & (mappings['lpos'] >= 0), ['scaf','pos','lpos','lhap']].rename(columns={'pos':'rpos','lhap':'hap'}).groupby(['scaf','lpos','rpos','hap']).size().reset_index(name='ucov'), on=['scaf','lpos','rpos','hap'], how='left')
         conn_cov['ucov'] = conn_cov['ucov'].fillna(0).astype(int)
+        conn_cov.loc[ conn_cov[['scaf','lpos','rpos','hap']].merge(zero_cov[['scaf','lpos','rpos','hap']], on=['scaf','lpos','rpos','hap'], how='left', indicator=True)['_merge'].values == "both", ['cov','ucov']] = 1
+#
+        # Set coverage to 1 for  overlap_bridges, so that they are not removed
+        if len(overlap_bridges):
+            zero_cov = conn_cov.loc[conn_cov['cov'] == 0, ['scaf','lpos','rpos','hap']].copy()
+            cols = [f'{n}{h}' for h in range(ploidy) for n in ['phase','con','strand']]
+            for s in ['l','r']:
+                zero_cov[cols] = zero_cov[['scaf',f'{s}pos']].rename(columns={f'{s}pos':'pos'}).merge(scaffold_paths[['scaf','pos']+cols], on=['scaf','pos'], how='left')[cols].values
+                zero_cov[[f'{s}con',f'{s}strand']] = zero_cov[['con0','strand0']].values
+                for h in range(1,ploidy):
+                    cur = (zero_cov['hap'] == h) & (zero_cov[f'phase{h}'] > 0)
+                    if np.sum(cur):
+                        zero_cov.loc[cur, [f'{s}con',f'{s}strand']] = zero_cov.loc[cur, [f'con{h}',f'strand{h}']].values
+                    zero_cov.drop(columns=cols, inplace=True)
+            zero_cov.rename(columns={'lcon':'q_con','lstrand':'q_side','rcon':'t_con','rstrand':'t_side'}, inplace=True)
+            zero_cov['q_side'] = np.where(zero_cov['q_side'] == '+', 'r', 'l')
+            zero_cov['t_side'] = np.where(zero_cov['t_side'] == '+', 'l', 'r')
+            zero_cov = zero_cov.merge(overlap_bridges[['q_con','q_side','t_con','t_side']], on=['q_con','q_side','t_con','t_side'], how='inner')
+            conn_cov.loc[ conn_cov[['scaf','lpos','rpos','hap']].merge(zero_cov[['scaf','lpos','rpos','hap']], on=['scaf','lpos','rpos','hap'], how='left', indicator=True)['_merge'].values == "both", ['cov','ucov']] = 1
 #
         # Try to fix scaffold_paths, where no reads support the connection
         # Start by getting mappings that have both sides in them
@@ -7283,6 +7348,8 @@ def MapReadsToScaffolds(mappings, scaffold_paths, bridges, ploidy):
             scaffold_paths['pos'] = scaffold_paths.groupby(['scaf'], sort=False).cumcount()
             scaffold_paths.loc[scaffold_paths['pos'] == 0, 'dist0'] = 0
             mappings = org_mappings.copy()
+    # Store the position of overlap_bridges
+    overlap_bridges = zero_cov.merge(overlap_bridges, on=['q_con','q_side','t_con','t_side'], how='inner')
 #
     ## Handle circular scaffolds
     mcols = [f'con{h}' for h in range(ploidy)]+[f'strand{h}' for h in range(ploidy)]
@@ -7337,7 +7404,7 @@ def MapReadsToScaffolds(mappings, scaffold_paths, bridges, ploidy):
     mappings.loc[np.isnan(mappings['circular']) == False, 'lpos'] = mappings.loc[np.isnan(mappings['circular']) == False, 'circular'].astype(int)
     mappings.drop(columns=['check_pos','circular'], inplace=True)
 #
-    return mappings, scaffold_paths
+    return mappings, scaffold_paths, overlap_bridges
 
 def CountResealedBreaks(result_info, scaffold_paths, contig_parts, ploidy):
     ## Get resealed breaks (Number of total contig_parts - minimum number of scaffold chunks needed to have them all included in the proper order)
@@ -7384,7 +7451,7 @@ def CountResealedBreaks(result_info, scaffold_paths, contig_parts, ploidy):
 
     return result_info
 
-def FillGapsWithReads(scaffold_paths, mappings, contig_parts, ploidy, max_dist_contig_end, min_extension, min_num_reads, pdf):
+def FillGapsWithReads(scaffold_paths, mappings, contig_parts, overlap_bridges, ploidy, max_dist_contig_end, min_extension, min_num_reads, pdf):
     ## Find best reads to fill into gaps
     possible_reads = mappings.loc[(mappings['rcon'] >= 0) & (mappings['rpos'] >= 0), ['scaf','pos','rhap','rpos','read_pos','read_name','read_start','read_from','read_to','strand','rdist','mapq','rmapq','matches','rmatches','con_from','con_to','rmapid']].sort_values(['scaf','pos','rhap'])
 #
@@ -7424,6 +7491,17 @@ def FillGapsWithReads(scaffold_paths, mappings, contig_parts, ploidy, max_dist_c
     # Get the mapping information for the other side of the gap (chap is the haplotype that it connects to on the other side, for circular scaffolds it is not guaranteed to be identical with rhap)
     possible_reads['read_pos'] += np.where(possible_reads['strand'] == '+', 1, -1)
     possible_reads[['rcon_from','rcon_to','chap']] = possible_reads[['read_name','read_start','read_pos','scaf','pos','rpos','rmapid']].merge(mappings[['read_name','read_start','read_pos','scaf','pos','lpos','con_from','con_to','lhap','mapid']].rename(columns={'pos':'rpos','lpos':'pos','con_from':'rcon_from','con_to':'rcon_to','lhap':'chap','mapid':'rmapid'}), on=['read_name','read_start','read_pos','scaf','pos','rpos','rmapid'], how='left')[['rcon_from','rcon_to','chap']].astype(int).values
+    possible_reads.drop(columns=['read_pos','read_start','rmapid'], inplace=True)
+#
+    # Add overlap_bridges as pseudo reads
+    if len(overlap_bridges):
+        pseudo_reads = overlap_bridges[['scaf','lpos','hap','rpos','q_start','q_end','t_start','t_end']].rename(columns={'lpos':'pos','hap':'rhap','q_start':'con_from','q_end':'con_to','t_start':'rcon_from','t_end':'rcon_to'})
+        pseudo_reads['read_name'] = np.repeat("__overlap_bridge__", len(pseudo_reads)).astype(np.object) + (np.arange(len(pseudo_reads))+1).astype(str)
+        pseudo_reads['read_from'] = 0
+        pseudo_reads['read_to'] = 0
+        pseudo_reads['strand'] = '+'
+        pseudo_reads['chap'] = pseudo_reads['rhap']
+        possible_reads = pd.concat([possible_reads, pseudo_reads], ignore_index=True)
 #
     ## Fill scaffold_paths with read and contig information
     for h in range(ploidy):
@@ -7618,9 +7696,7 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     alignment_precision = 100
 #
     proportion_duplicated = 0.95
-    max_repeat_extension = 1000 # Expected to be bigger than or equal to min_mapping_length
-    min_len_repeat_connection = 5000
-    repeat_len_factor_unique = 10
+    min_len_contig_overlap = 10000
     remove_duplicated_contigs = True
 #
     remove_zero_hit_contigs = True
@@ -7697,15 +7773,16 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
 #
     print( str(timedelta(seconds=clock())), "Search for possible bridges")
     bridges = GetBridges(mappings, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, cov_probs, prob_factor, min_mapping_length, min_distance_tolerance, rel_distance_tolerance, prematurity_threshold, max_dist_contig_end, pdf)
+    bridges, overlap_bridges = InsertBridgesOnUniqueContigOverlapsWithoutConnections(bridges, repeats, min_len_contig_overlap, min_num_reads)
 #
     print( str(timedelta(seconds=clock())), "Scaffold the contigs")
     scaffold_paths = ScaffoldContigs(contig_parts, bridges, mappings, cov_probs, repeats, prob_factor, min_mapping_length, max_dist_contig_end, prematurity_threshold, ploidy, max_loop_units)
     scaffold_paths, result_info = RemoveUnconnectedLowlyMappedOrDuplicatedContigs(scaffold_paths, result_info, mappings, contig_parts, cov_probs, repeats, ploidy, lowmap_threshold)
 #
     print( str(timedelta(seconds=clock())), "Fill gaps")
-    mappings, scaffold_paths = MapReadsToScaffolds(mappings, scaffold_paths, bridges, ploidy) # Might break apart scaffolds again, if we cannot find a mapping read for a connection
+    mappings, scaffold_paths, overlap_bridges = MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploidy) # Might break apart scaffolds again, if we cannot find a mapping read for a connection
     result_info = CountResealedBreaks(result_info, scaffold_paths, contig_parts, ploidy)
-    scaffold_paths, mappings = FillGapsWithReads(scaffold_paths, mappings, contig_parts, ploidy, max_dist_contig_end, min_extension, min_num_reads, pdf) # Mappings are prepared for scaffold extensions
+    scaffold_paths, mappings = FillGapsWithReads(scaffold_paths, mappings, contig_parts, overlap_bridges, ploidy, max_dist_contig_end, min_extension, min_num_reads, pdf) # Mappings are prepared for scaffold extensions
     result_info = GetOutputInfo(result_info, scaffold_paths)
 #
     if pdf:
