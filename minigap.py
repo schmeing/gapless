@@ -3744,28 +3744,28 @@ def AddPathThroughLoops(scaffold_paths, scaffold_graph, scaf_bridges, org_scaf_c
     if len(unbridged_repeats):
         unbridged_repeats = RemoveEmptyColumns(unbridged_repeats)
 #
-    # Only keep loop units, where we have unconnected exits or never had exits at all
-    if len(all_loops_with_exits) and len(loops):
-        if len(exits):
-            unconnected_exits = exits[['loop','from','from_side']].drop_duplicates()
-            if len(unbridged_repeats):
-                unconnected_exits = unconnected_exits[unconnected_exits.merge(unbridged_repeats[['loop','from','from_side']].drop_duplicates(), on=['loop','from','from_side'], how='left', indicator=True)['_merge'].values == "left_only"].copy()
-                unconnected_exits = unconnected_exits[unconnected_exits.merge(unbridged_repeats[['loop','to','to_side']].drop_duplicates().rename(columns={'to':'from','to_side':'from_side'}), on=['loop','from','from_side'], how='left', indicator=True)['_merge'].values == "left_only"].copy()
-            loops = loops[np.isin(loops['loop'], np.setdiff1d(all_loops_with_exits, np.unique(unconnected_exits['loop'].values))) == False].copy()
-        else:
-            loops = loops[np.isin(loops['loop'], all_loops_with_exits) == False].copy()
+    # # Only keep loop units, where we have unconnected exits or never had exits at all
+    # if len(all_loops_with_exits) and len(loops):
+        # if len(exits):
+            # unconnected_exits = exits[['loop','from','from_side']].drop_duplicates()
+            # if len(unbridged_repeats):
+                # unconnected_exits = unconnected_exits[unconnected_exits.merge(unbridged_repeats[['loop','from','from_side']].drop_duplicates(), on=['loop','from','from_side'], how='left', indicator=True)['_merge'].values == "left_only"].copy()
+                # unconnected_exits = unconnected_exits[unconnected_exits.merge(unbridged_repeats[['loop','to','to_side']].drop_duplicates().rename(columns={'to':'from','to_side':'from_side'}), on=['loop','from','from_side'], how='left', indicator=True)['_merge'].values == "left_only"].copy()
+            # loops = loops[np.isin(loops['loop'], np.setdiff1d(all_loops_with_exits, np.unique(unconnected_exits['loop'].values))) == False].copy()
+        # else:
+            # loops = loops[np.isin(loops['loop'], all_loops_with_exits) == False].copy()
     if len(unbridged_repeats):
         unbridged_repeats.drop(columns=['to','to_side'], inplace=True)
         unbridged_repeats.rename(columns={'from':'scaf0','from_side':'strand0'}, inplace=True)
         unbridged_repeats['strand0'] = np.where(unbridged_repeats['strand0'] == 'r', '+', '-')
-    if len(loops):
-        # Only keep the start position with the most loop units per loop
-        loops.sort_values(['loop','scaf0'], inplace=True)
-        loop_count = loops.groupby(['loop','scaf0'], sort=False).size().reset_index(name='count')
-        loop_count.sort_values(['loop','count'], ascending=[True,False], inplace=True)
-        loop_count = loop_count.groupby(['loop'], sort=False).first().reset_index()
-        loops = loops.merge(loop_count[['loop','scaf0']], on=['loop','scaf0'], how='inner')
-    # Remove loop units already in bridged or unbridged repeats
+    # if len(loops):
+        # # Only keep the start position with the most loop units per loop
+        # loops.sort_values(['loop','scaf0'], inplace=True)
+        # loop_count = loops.groupby(['loop','scaf0'], sort=False).size().reset_index(name='count')
+        # loop_count.sort_values(['loop','count'], ascending=[True,False], inplace=True)
+        # loop_count = loop_count.groupby(['loop'], sort=False).first().reset_index()
+        # loops = loops.merge(loop_count[['loop','scaf0']], on=['loop','scaf0'], how='inner')
+    # # Remove loop units already in bridged or unbridged repeats
     if len(unbridged_repeats):
         if len(bridged_repeats):
             loop_paths = pd.concat([unbridged_repeats, bridged_repeats], ignore_index=True)
@@ -3776,32 +3776,33 @@ def AddPathThroughLoops(scaffold_paths, scaffold_graph, scaf_bridges, org_scaf_c
             loop_paths = bridged_repeats
         else:
             loop_paths = []
-    if len(loop_paths) and len(loops):
-        max_len = loop_paths['length'].max()
-        search_space = np.unique(loops['scaf0'].values)
-        inner_repeats = []
-        for s1 in range(1, max_len-1):
-            for s2 in range(s1+1, max_len-1):
-                found_repeats = loop_paths.loc[np.isin(loop_paths[f'scaf{s1}'], search_space) & (loop_paths[f'scaf{s1}'] == loop_paths[f'scaf{s2}']) & (loop_paths[f'strand{s1}'] == loop_paths[f'strand{s2}']), ['length']+[f'scaf{s1}',f'strand{s1}']+[f'{n}{s}' for s in range(s1+1, s2+1) for n in ['scaf','strand','dist']]].rename(columns={f'{n}{s}':f'{n}{s-s1}' for s in range(s1, s2+1) for n in ['scaf','strand','dist']})
-                if len(found_repeats):
-                    found_repeats['length'] = s2-s1+1
-                    inner_repeats.append(found_repeats[found_repeats['strand0'] == '+'].copy())
-                    found_repeats = found_repeats[found_repeats['strand0'] == '-'].copy()
-                    if len(found_repeats):
-                        found_repeats = ReverseVerticalPaths(found_repeats)
-                        inner_repeats.append(found_repeats.drop(columns=['lindex']))
-        if len(inner_repeats):
-            inner_repeats = pd.concat(inner_repeats, ignore_index=True, sort=False)
-        if len(inner_repeats):
-            inner_repeats.drop_duplicates(inplace=True)
-            loops = loops[ loops.merge(inner_repeats, on=list(inner_repeats.columns.values), how='left', indicator=True)['_merge'].values == "left_only" ].copy()
+    # if len(loop_paths) and len(loops):
+        # max_len = loop_paths['length'].max()
+        # search_space = np.unique(loops['scaf0'].values)
+        # inner_repeats = []
+        # for s1 in range(1, max_len-1):
+            # for s2 in range(s1+1, max_len-1):
+                # found_repeats = loop_paths.loc[np.isin(loop_paths[f'scaf{s1}'], search_space) & (loop_paths[f'scaf{s1}'] == loop_paths[f'scaf{s2}']) & (loop_paths[f'strand{s1}'] == loop_paths[f'strand{s2}']), ['length']+[f'scaf{s1}',f'strand{s1}']+[f'{n}{s}' for s in range(s1+1, s2+1) for n in ['scaf','strand','dist']]].rename(columns={f'{n}{s}':f'{n}{s-s1}' for s in range(s1, s2+1) for n in ['scaf','strand','dist']})
+                # if len(found_repeats):
+                    # found_repeats['length'] = s2-s1+1
+                    # inner_repeats.append(found_repeats[found_repeats['strand0'] == '+'].copy())
+                    # found_repeats = found_repeats[found_repeats['strand0'] == '-'].copy()
+                    # if len(found_repeats):
+                        # found_repeats = ReverseVerticalPaths(found_repeats)
+                        # inner_repeats.append(found_repeats.drop(columns=['lindex']))
+        # if len(inner_repeats):
+            # inner_repeats = pd.concat(inner_repeats, ignore_index=True, sort=False)
+        # if len(inner_repeats):
+            # inner_repeats.drop_duplicates(inplace=True)
+            # loops = loops[ loops.merge(inner_repeats, on=list(inner_repeats.columns.values), how='left', indicator=True)['_merge'].values == "left_only" ].copy()
 #
-    # Add remaining loop units to loop_paths, get all scaffold connections in the path and make it a vertical path
-    if len(loops):
-        if len(loop_paths):
-            loop_paths = pd.concat([loop_paths, loops], ignore_index=True).drop(columns=['loop'])
-        else:
-            loop_paths = loops.drop(columns=['loop'])
+    # # Add remaining loop units to loop_paths
+    # if len(loops):
+        # if len(loop_paths):
+            # loop_paths = pd.concat([loop_paths, loops], ignore_index=True).drop(columns=['loop'])
+        # else:
+            # loop_paths = loops.drop(columns=['loop'])
+    # Get all scaffold connections in the path and make it a vertical path
     if len(loop_paths):
         handled_scaf_conns = GetHandledScaffoldConnectionsFromVerticalPath(loop_paths)
         if len(scaffold_paths):
