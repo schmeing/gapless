@@ -6144,7 +6144,9 @@ def PlaceUnambigouslyPlaceablePathsAsAlternativeHaplotypes(scaffold_paths, graph
 #
     return scaffold_paths
 
-def CombineAndExtendOnUniquelyMatchingExtensions(scaffold_paths, graph_ext, scaffold_graph, scaf_bridges, ploidy):
+def CombineOnMatchingExtensions(scaffold_paths, graph_ext, scaffold_graph, scaf_bridges, ploidy):
+    # Extend scaffold_paths, but keep the old version and only take the new paths if it connects two uniquely placeable old paths
+    old_paths = scaffold_paths.copy()
     extendable_pids = np.unique(scaffold_paths['pid'].values)
     extendable_sides = pd.DataFrame( {'apid':np.repeat(extendable_pids, 2), 'aside':np.tile(['l','r'], len(extendable_pids)), 'max_len':scaffold_graph['length'].max()} ) # Only allow to extend as long as a single read spans it (The length of the single read will be put in later, but it cannot be longer than max span of a single read) 
     ext_phase = extendable_sides[['apid','aside']].copy()
@@ -6241,6 +6243,59 @@ def CombineAndExtendOnUniquelyMatchingExtensions(scaffold_paths, graph_ext, scaf
     # Remove duplicates and try to combine paths
     scaffold_paths = RemoveDuplicates(scaffold_paths, True, ploidy)
     scaffold_paths = CombinePathOnUniqueOverlap(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges, ploidy)
+    # Only keep extended paths and assign new pids
+    scaf_len = old_paths.groupby(['pid'])['pos'].max().reset_index(name='old_len')
+    scaf_len['new_len'] = scaf_len[['pid']].merge(scaffold_paths.groupby(['pid'])['pos'].max().reset_index(), on='pid', how='left')['pos'].fillna(0).astype(int)
+    scaf_len = scaf_len[scaf_len['old_len'] != scaf_len['new_len']].copy()
+    max_pid = old_paths['pid'].max()
+    scaf_len['new_pid'] = np.where(scaf_len['new_len'] > 0, (scaf_len['new_len'] > 0).cumsum() + max_pid, -1)
+    scaffold_paths = scaffold_paths.merge(scaf_len[['pid','new_pid']], on=['pid'], how='inner')
+    scaffold_paths['pid'] = scaffold_paths['new_pid']
+    scaffold_paths.drop(columns=['new_pid'], inplace=True)
+    # Merge old and new paths and find duplications to identify where the old paths is now included in the new paths
+    scaffold_paths = pd.concat([old_paths, scaffold_paths], ignore_index=True)
+    duplications = GetDuplications(scaffold_paths, ploidy)
+    duplications = duplications[np.isin(duplications['apid'], scaf_len['pid'].values) & (duplications['bpid'] > max_pid)].copy()
+    tmp_len = scaffold_paths.groupby(['pid'])['pos'].max().reset_index()
+    duplications = RequireDuplicationAtPathEnd(duplications, tmp_len, ['apid','bpid'], patha_only=True)
+    # Check if they are on the same or opposite strand (alone it is useless, but it sets the requirements for the direction of change for the positions)
+    duplications = AddStrandToDuplications(duplications, scaffold_paths, ploidy)
+    duplications['samedir'] = duplications['astrand'] == duplications['bstrand']
+    duplications.drop(columns=['astrand','bstrand'], inplace=True)
+    # Extend the duplications with valid distances from each end
+    duplications = SeparateDuplicationsByHaplotype(duplications, scaffold_paths, ploidy)
+    ldups = ExtendDuplicationsFromEnd(duplications, scaffold_paths, 'l', tmp_len, ploidy)
+    rdups = ExtendDuplicationsFromEnd(duplications, scaffold_paths, 'r', tmp_len, ploidy)
+    rdups['did'] += 1 + ldups['did'].max()
+    duplications = pd.concat([ldups,rdups], ignore_index=True)
+    # Require that both ends of patha are included
+    ends = GetEndDuplicationsBelongTo(duplications, tmp_len)
+    ends = ends[(ends['aleft'] & ends['aright'])].drop(columns=['did','amin','amax','alen','aleft','aright','bleft','bright','bhap','matches','blen'])
+    ends.drop_duplicates(inplace=True)
+    # Require that all haplotypes are found at that position
+    ends['ahap'] = (np.repeat("hap", len(ends)).astype(np.object) + ends['ahap'].astype(str)).astype(str)
+    ends['present'] = True
+    ends = ends.pivot(index=['apid','bpid','bmin','bmax'], columns='ahap', values='present').reset_index().rename_axis(None, axis=1)
+    for h in range(ploidy):
+        if f'hap{h}' in ends.columns:
+            ends[f'hap{h}'] = ends[f'hap{h}'].fillna(False)
+        else:
+            ends[f'hap{h}'] = False
+    ends = ends.merge(scaffold_paths[np.isin(scaffold_paths['pid'], scaf_len['pid'].values)].groupby(['pid'])[[f'phase{h}' for h in range(ploidy)]].max().reset_index().rename(columns={'pid':'apid'}), on='apid', how='left')
+    ends = ends[ (ends[[f'hap{h}' for h in range(ploidy)]].values == (ends[[f'phase{h}' for h in range(ploidy)]] > 0).values).all(axis=1) ].drop(columns=[f'{n}{h}' for h in range(ploidy) for n in ['hap','phase']])
+    # Require unique placement
+    ends = ends[ ends[['apid']].merge(ends.groupby(['apid']).size().reset_index(name='nalt'), on='apid', how='left')['nalt'].values == 1 ].copy()
+    # Require multiple original paths on one new paths
+    ends = ends[ ends[['bpid']].merge(ends.groupby(['bpid']).size().reset_index(name='count'), on='bpid', how='left')['count'].values > 1 ].copy()
+    # Insert the new combined paths (without the non-combining extensions) and remove duplicates
+    ends = ends.groupby(['bpid']).agg({'bmin':'min','bmax':'max'}).reset_index()
+    ends.rename(columns={'bpid':'pid','bmin':'minpos','bmax':'maxpos'}, inplace=True)
+    scaffold_paths = scaffold_paths.merge(ends, on='pid', how='inner')
+    scaffold_paths = scaffold_paths[(scaffold_paths['pos'] >= scaffold_paths['minpos']) & (scaffold_paths['pos'] <= scaffold_paths['maxpos'])].drop(columns=['minpos','maxpos'])
+    scaffold_paths['pos'] = scaffold_paths.groupby(['pid']).cumcount()
+    scaffold_paths = SetDistanceAtFirstPositionToZero(scaffold_paths, ploidy)
+    scaffold_paths = pd.concat([old_paths, scaffold_paths], ignore_index=True)
+    scaffold_paths = RemoveDuplicates(scaffold_paths, True, ploidy)
 #
     return scaffold_paths
 
@@ -6443,8 +6498,8 @@ def TraverseScaffoldGraph(scaffolds, scaffold_graph, graph_ext, scaf_bridges, or
             TestPrint(scaffold_paths)
             CheckScaffoldPathsConsistency(scaffold_paths)
             CheckIfScaffoldPathsFollowsValidBridges(scaffold_paths, scaf_bridges, ploidy)
-    print("CombineAndExtendOnUniquelyMatchingExtensions")
-    scaffold_paths = CombineAndExtendOnUniquelyMatchingExtensions(scaffold_paths, graph_ext, scaffold_graph, scaf_bridges, ploidy)
+    print("CombineOnMatchingExtensions")
+    scaffold_paths = CombineOnMatchingExtensions(scaffold_paths, graph_ext, scaffold_graph, scaf_bridges, ploidy)
     print(len(np.unique(scaffold_paths['pid'].values)))
     TestPrint(scaffold_paths)
     print("TrimAmbiguousOverlap")
@@ -7193,7 +7248,6 @@ def MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploi
         mappings.rename(columns={'group':'mapid'}, inplace=True)
         conn_cov = conn_cov.merge(mappings.loc[(mappings['lcon'] >= 0) & (mappings['lpos'] >= 0), ['scaf','pos','lpos','lhap']].rename(columns={'pos':'rpos','lhap':'hap'}).groupby(['scaf','lpos','rpos','hap']).size().reset_index(name='ucov'), on=['scaf','lpos','rpos','hap'], how='left')
         conn_cov['ucov'] = conn_cov['ucov'].fillna(0).astype(int)
-        conn_cov.loc[ conn_cov[['scaf','lpos','rpos','hap']].merge(zero_cov[['scaf','lpos','rpos','hap']], on=['scaf','lpos','rpos','hap'], how='left', indicator=True)['_merge'].values == "both", ['cov','ucov']] = 1
 #
         # Set coverage to 1 for  overlap_bridges, so that they are not removed
         if len(overlap_bridges):
@@ -7349,7 +7403,8 @@ def MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploi
             scaffold_paths.loc[scaffold_paths['pos'] == 0, 'dist0'] = 0
             mappings = org_mappings.copy()
     # Store the position of overlap_bridges
-    overlap_bridges = zero_cov.merge(overlap_bridges, on=['q_con','q_side','t_con','t_side'], how='inner')
+    if len(overlap_bridges):
+        overlap_bridges = zero_cov.merge(overlap_bridges, on=['q_con','q_side','t_con','t_side'], how='inner')
 #
     ## Handle circular scaffolds
     mcols = [f'con{h}' for h in range(ploidy)]+[f'strand{h}' for h in range(ploidy)]
