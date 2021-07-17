@@ -2066,66 +2066,7 @@ def BuildScaffoldGraph(long_range_connections, scaf_bridges):
 
     return scaffold_graph
 
-def RemoveEmptyColumns(df):
-    # Clean up columns with all NaN
-    cols = df.count()
-    df.drop(columns=cols[cols == 0].index.values,inplace=True)
-    return df
-
-def DeleteIndexInScaffoldGraph(scaffold_graph, remindex, fullrem):
-    trim_graph = scaffold_graph.loc[remindex].copy()
-    scaffold_graph.drop(remindex, inplace=True)
-    trim_graph.rename(columns={'from':'scaf0','from_side':'strand0'}, inplace=True)
-    trim_graph['strand0'] = np.where(trim_graph['strand0'] == 'r', '+', '-')
-    if fullrem:
-        trim_graph = pd.concat([trim_graph, ReverseVerticalPaths(trim_graph).drop(columns=['lindex'])], ignore_index=True)
-    for s in range(trim_graph['length'].max()-1, 1, -1):
-        shorten = trim_graph[trim_graph['length'] == s+1].copy()
-        shorten[[f'scaf{s}',f'strand{s}',f'dist{s}']] = np.nan
-        shorten['length'] -= 1
-        trim_graph = pd.concat([trim_graph, shorten], ignore_index=True)
-        trim_graph.drop_duplicates(inplace=True)
-    trim_graph = ReverseVerticalPaths(trim_graph)
-    trim_graph.drop(columns=['lindex'], inplace=True)
-    trim_graph.rename(columns={'scaf0':'from','strand0':'from_side'}, inplace=True)
-    trim_graph['from_side'] = np.where(trim_graph['from_side'] == '+', 'r', 'l')
-    scaffold_graph['trim'] = scaffold_graph[trim_graph.columns].merge(trim_graph, on=list(trim_graph.columns), how='left', indicator=True)['_merge'].values == "both"
-    if fullrem:
-        scaffold_graph = scaffold_graph[scaffold_graph['trim'] == False].drop(columns=['trim'])
-    else:
-        scaffold_graph = scaffold_graph[(scaffold_graph['trim'] == False) | (scaffold_graph['length'] > 2)].copy()
-        for l in np.unique(scaffold_graph.loc[scaffold_graph['trim'], 'length'].values): # The increasing order provided by np.unique is important here
-            scaffold_graph.loc[scaffold_graph['trim'] & (scaffold_graph['length'] == l), [f'scaf{l-1}',f'strand{l-1}',f'dist{l-1}']] = np.nan
-            scaffold_graph.loc[scaffold_graph['trim'] & (scaffold_graph['length'] == l), 'length'] -= 1
-        scaffold_graph.drop(columns=['trim'], inplace=True)
-        scaffold_graph = RemoveRedundantEntriesInScaffoldGraph(scaffold_graph)
-#
-    return scaffold_graph
-
-def ApplyDistancesToDuplicationAlternative(cur, lpot, alt_graph, scaf_bridges, s):
-    cur[f'side{s}'] = np.where(cur[f'strand{s}'] == '+', 'r', 'l')
-    cur[f'side{s+1}'] = np.where(cur[f'strand{s+1}'] == '+', 'l', 'r')
-    cur = cur.merge(scaf_bridges[['from','from_side','to','to_side','mean_dist']].rename(columns={'from':f'scaf{s}','from_side':f'side{s}','to':f'scaf{s+1}','to_side':f'side{s+1}'}), on=[f'scaf{s}',f'side{s}',f'scaf{s+1}',f'side{s+1}'], how='inner')
-    cur[f'dist{s+1}'] = cur['mean_dist']
-    cur.drop(columns=[f'side{s}',f'side{s+1}','mean_dist'], inplace=True)
-    lpot.append( cur.copy() ) # Store the change to apply potential extensions of the replaced scaffold to the left later
-    cur[f'side{s-1}'] = np.where(cur[f'strand{s-1}'] == '+', 'r', 'l')
-    cur[f'side{s}'] = np.where(cur[f'strand{s}'] == '+', 'l', 'r')
-    cur = cur.merge(scaf_bridges[['from','from_side','to','to_side','mean_dist']].rename(columns={'from':f'scaf{s-1}','from_side':f'side{s-1}','to':f'scaf{s}','to_side':f'side{s}'}), on=[f'scaf{s-1}',f'side{s-1}',f'scaf{s}',f'side{s}'], how='inner')
-    cur[f'dist{s}'] = cur['mean_dist']
-    alt_graph.append( cur.drop(columns=['dscaf','t_con','t_start','t_end',f'side{s-1}',f'side{s}','mean_dist']) )
-#
-    return cur, lpot, alt_graph
-
-def AddConnectedIndexes(remindex, dup_combs):
-    old_len = 0
-    while old_len != len(remindex):
-        old_len = len(remindex)
-        remindex = np.unique(np.concatenate([remindex, dup_combs.loc[np.isin(dup_combs['sindex1'], remindex), 'sindex2'].values]))
-#
-    return remindex
-
-def DeduplicateScaffoldsInGraph(scaffold_graph, repeats, scaffold_parts, scaf_bridges):
+def FindFullyDuplicatedScaffolds(scaffold_parts, repeats):
     # Find fully repeated contigs on scaffolds
     scaf_reps = scaffold_parts.merge(repeats.loc[repeats['side'] == 'lr', ['q_con','strand','t_con','t_start','t_end']].rename(columns={'q_con':'conpart'}), on='conpart', how='inner')
     # Filter scaffolds where not all positions are repeated by the same contig (if we have a full duplication of a multi-contig scaffolds inside another multi-contig scaffold those two scaffolds must be distinct enough and we can ignore it, or they would not have been scaffolded along unique bridges)
@@ -2164,51 +2105,176 @@ def DeduplicateScaffoldsInGraph(scaffold_graph, repeats, scaffold_parts, scaf_br
     scaf_reps = scaf_reps[np.isin(scaf_reps['group'], inconsistent) == False].drop(columns=['conpart','pos','reverse','next_dist','prev_dist','ncons'])
     scaf_reps = scaf_reps.groupby(['group','scaffold','strand','t_con']).agg({'t_start':'min','t_end':'max'}).reset_index().drop(columns=['group']).drop_duplicates()
 #
+    return scaf_reps
+
+def FindSingleContigScaffoldsWithOneDuplicatedUnconnectedEnd(scaffold_parts, repeats, scaffold_graph):
+    # Find unscaffolded one sides duplications (full duplicates are two separate one sided duplicates)
+    end_reps = scaffold_parts.groupby(['scaffold']).size().reset_index(name='len')
+    end_reps = end_reps[end_reps['len'] == 1].drop(columns='len').merge(repeats[['q_con','side','q_start','q_end','strand','t_con']].rename(columns={'q_con':'scaffold'}), on='scaffold', how='inner')
+    end_reps = end_reps.loc[np.repeat(end_reps.index.values, np.where(end_reps['side'] == 'lr', 2, 1))].reset_index()
+    end_reps.loc[end_reps['index'] == end_reps['index'].shift(1), 'side'] = 'r'
+    end_reps.loc[end_reps['index'] == end_reps['index'].shift(-1), 'side'] = 'l'
+    end_reps.drop(columns='index', inplace=True)
+    # Require that they do not have a bridge on that side
+    bridges = scaffold_graph[['from','from_side']].drop_duplicates().rename(columns={'from':'scaffold','from_side':'side'})
+    end_reps = end_reps[ end_reps.merge(bridges, on=['scaffold','side'], how='left', indicator=True)['_merge'].values == "left_only" ].copy()
+    # Remove contigs that do not have a connection on the other side (where we cannot check that they are continuing on the same path)
+    bridges['side'] = np.where(bridges['side'] == 'r', 'l', 'r') # Invert the bridge side here, so that we check if there is a connection of the opposite side (of the duplication)
+    end_reps = end_reps.merge(bridges, on=['scaffold','side'], how='inner')
+    # Require that t_con is at an scaffold end
+    scaffold_ends = scaffold_parts.loc[scaffold_parts['scaffold'] != scaffold_parts['scaffold'].shift(1), ['conpart','scaffold','reverse']].copy()
+    scaffold_ends['end'] = 'l'
+    scaffold_ends = pd.concat([scaffold_ends, scaffold_parts.loc[scaffold_parts['scaffold'] != scaffold_parts['scaffold'].shift(-1), ['conpart','scaffold','reverse']].copy()], ignore_index=True)
+    scaffold_ends['end'] = scaffold_ends['end'].fillna('r')
+    end_reps = end_reps.merge(scaffold_ends.rename(columns={'conpart':'t_con','scaffold':'t_scaf'}), on='t_con', how='inner')
+    # The scaffold is only allowed to continue on the duplicated side
+    end_reps['t_side'] = np.where((end_reps['strand'] == '+') != end_reps['reverse'], end_reps['side'], np.where(end_reps['side'] == 'r', 'l', 'r'))
+    end_reps = end_reps[end_reps['t_side'] != end_reps['end']].drop(columns=['reverse','end'])
+    # Require that t_scaf also has connections on the non-duplicated side
+    end_reps = end_reps.merge(bridges.rename(columns={'scaffold':'t_scaf','side':'t_side'}), on=['t_scaf','t_side'], how='inner')
+    # Make output consistent with FindFullyDuplicatedScaffolds (where only single contig scaffolds can be target (t_con))
+    end_reps['strand'] = np.where(end_reps['side'] == end_reps['t_side'], '+', '-')
+    end_reps.drop(columns=['t_con','t_side'], inplace=True)
+    end_reps.rename(columns={'t_scaf':'t_con'}, inplace=True)
+#
+    return end_reps
+
+def DropRemovedScaffoldsFromRepeats(onesided_reps, remindex):
+    if len(remindex):
+        tmpindex = np.unique(remindex['sindex'].values)
+        onesided_reps = onesided_reps[np.isin(onesided_reps['sindex'], tmpindex) == False].copy()
+        onesided_reps = onesided_reps[np.isin(onesided_reps['tindex'], tmpindex) == False].copy()
+#
+    return onesided_reps
+
+def DeleteIndexInScaffoldGraph(scaffold_graph, remindex, fullrem):
+    trim_graph = scaffold_graph.loc[remindex].copy()
+    scaffold_graph.drop(remindex, inplace=True)
+    trim_graph.rename(columns={'from':'scaf0','from_side':'strand0'}, inplace=True)
+    trim_graph['strand0'] = np.where(trim_graph['strand0'] == 'r', '+', '-')
+    if fullrem:
+        trim_graph = pd.concat([trim_graph, ReverseVerticalPaths(trim_graph).drop(columns=['lindex'])], ignore_index=True)
+    for s in range(trim_graph['length'].max()-1, 1, -1):
+        shorten = trim_graph[trim_graph['length'] == s+1].copy()
+        shorten[[f'scaf{s}',f'strand{s}',f'dist{s}']] = np.nan
+        shorten['length'] -= 1
+        trim_graph = pd.concat([trim_graph, shorten], ignore_index=True)
+        trim_graph.drop_duplicates(inplace=True)
+    trim_graph = ReverseVerticalPaths(trim_graph)
+    trim_graph.drop(columns=['lindex'], inplace=True)
+    trim_graph.rename(columns={'scaf0':'from','strand0':'from_side'}, inplace=True)
+    trim_graph['from_side'] = np.where(trim_graph['from_side'] == '+', 'r', 'l')
+    scaffold_graph['trim'] = scaffold_graph[trim_graph.columns].merge(trim_graph, on=list(trim_graph.columns), how='left', indicator=True)['_merge'].values == "both"
+    if fullrem:
+        scaffold_graph = scaffold_graph[scaffold_graph['trim'] == False].drop(columns=['trim'])
+    else:
+        scaffold_graph = scaffold_graph[(scaffold_graph['trim'] == False) | (scaffold_graph['length'] > 2)].copy()
+        for l in np.unique(scaffold_graph.loc[scaffold_graph['trim'], 'length'].values): # The increasing order provided by np.unique is important here
+            scaffold_graph.loc[scaffold_graph['trim'] & (scaffold_graph['length'] == l), [f'scaf{l-1}',f'strand{l-1}',f'dist{l-1}']] = np.nan
+            scaffold_graph.loc[scaffold_graph['trim'] & (scaffold_graph['length'] == l), 'length'] -= 1
+        scaffold_graph.drop(columns=['trim'], inplace=True)
+        scaffold_graph = RemoveRedundantEntriesInScaffoldGraph(scaffold_graph)
+#
+    return scaffold_graph
+
+def DisconnectRepeatedContigsWithConnectionsOnOneSide(scaffold_graph, scaf_reps, end_reps, scaf_bridges):
+    # Merge scaf_reps and end_reps
+    all_reps = scaf_reps.drop(columns=['t_start','t_end']).drop_duplicates()
+    all_reps['side'] = 'lr'
+    all_reps = pd.concat([all_reps, end_reps[ end_reps[['scaffold','strand','t_con']].merge(all_reps[['scaffold','strand','t_con']], on=['scaffold','strand','t_con'], how='left', indicator=True)['_merge'].values == "left_only" ].drop(columns=['q_start','q_end'])], ignore_index=True)
     # Find scaf_reps that have connections only on one side
     onesided_reps = scaffold_graph[['from','from_side']].drop_duplicates().rename(columns={'from':'scaffold','from_side':'side'})
     onesided_reps = onesided_reps[(onesided_reps['scaffold'] != onesided_reps['scaffold'].shift(1)) & (onesided_reps['scaffold'] != onesided_reps['scaffold'].shift(-1))].copy()
-    onesided_reps = scaf_reps.drop(columns=['t_start','t_end']).drop_duplicates().rename(columns={'strand':'repstrand'}).merge(onesided_reps, on='scaffold', how='inner')
+    onesided_reps = all_reps.rename(columns={'strand':'repstrand','side':'rep_side'}).merge(onesided_reps, on='scaffold', how='inner')
     # Remove repeats with itself
     onesided_reps = onesided_reps[onesided_reps['scaffold'] != onesided_reps['t_con']].copy()
     # Check if that connection is identical along the graph
     if len(onesided_reps):
         onesided_reps = onesided_reps.merge(scaffold_graph[['from','from_side']].reset_index().rename(columns={'index':'sindex','from':'scaffold','from_side':'side'}), on=['scaffold','side'], how='left')
         onesided_reps['tside'] = np.where(onesided_reps['repstrand'] == '+', onesided_reps['side'], np.where(onesided_reps['side'] == 'r', 'l', 'r'))
+        onesided_reps.drop(columns=['repstrand'], inplace=True)
         onesided_reps = onesided_reps.merge(scaffold_graph[['from','from_side']].reset_index().rename(columns={'index':'tindex','from':'t_con','from_side':'tside'}), on=['t_con','tside'], how='inner')
     if len(onesided_reps):
         onesided_reps = onesided_reps[(scaffold_graph.loc[onesided_reps['sindex'].values, ['scaf1','strand1']].values == scaffold_graph.loc[onesided_reps['tindex'].values, ['scaf1','strand1']].values).all(axis=1)].copy()
     if len(onesided_reps):
-        onesided_reps['length'] = scaffold_graph.loc[onesided_reps['sindex'].values, 'length'].values
-        onesided_reps = onesided_reps[onesided_reps['length'] <= scaffold_graph.loc[onesided_reps['tindex'].values, 'length'].values].copy() # Only consider duplicates that do not reach further into graph then the target version
-    if len(onesided_reps):
+        onesided_reps['length'] = np.minimum(scaffold_graph.loc[onesided_reps['sindex'].values, 'length'].values, scaffold_graph.loc[onesided_reps['tindex'].values, 'length'].values)
         for s in range(2,onesided_reps['length'].max()):
             if len(onesided_reps) == 0:
                 break
             else:
                 onesided_reps = onesided_reps[(onesided_reps['length'] <= s) | (scaffold_graph.loc[onesided_reps['sindex'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values == scaffold_graph.loc[onesided_reps['tindex'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values).all(axis=1)].copy()
     if len(onesided_reps):
+        onesided_reps['length'] = scaffold_graph.loc[onesided_reps['sindex'].values, 'length'].values # Restore original length for later comparison, not minimum of the duplicated paths
+    remindex = []
+    if len(onesided_reps):
         # Remove indexes in scaffold_graph, where the target(t_con,tindex) is not in onesided_reps
-        remindex = onesided_reps.loc[onesided_reps[['scaffold','sindex']].merge(onesided_reps[['t_con','tindex']].drop_duplicates().rename(columns={'t_con':'scaffold','tindex':'sindex'}), on=['scaffold','sindex'], how='left', indicator=True)['_merge'].values == "left_only", ['scaffold','sindex']].drop_duplicates()
-        onesided_reps = onesided_reps[onesided_reps[['scaffold','sindex']].merge(remindex, on=['scaffold','sindex'], how='left', indicator=True)['_merge'].values == "left_only"].drop(columns=['repstrand','length'])
-        onesided_reps = onesided_reps[onesided_reps[['t_con','tindex']].merge(remindex.rename(columns={'scaffold':'t_con','sindex':'tindex'}), on=['t_con','tindex'], how='left', indicator=True)['_merge'].values == "left_only"].copy()
+        remindex.append( onesided_reps.loc[onesided_reps[['t_con','tindex']].rename(columns={'t_con':'scaffold','tindex':'sindex'}).merge(onesided_reps[['scaffold','sindex']].drop_duplicates(), on=['scaffold','sindex'], how='left', indicator=True)['_merge'].values == "left_only", ['scaffold','sindex','rep_side']].drop_duplicates() )
+        onesided_reps = DropRemovedScaffoldsFromRepeats(onesided_reps, remindex[-1])
+        # Remove indexes that are fully repeated, but the target is not
         if len(onesided_reps):
-            # If the target is also in scaffold_graph remove the one with fewer bridging reads
-            onesided_reps[['sto','sto_side','sdist']] = scaffold_graph.loc[onesided_reps['sindex'].values, ['scaf1','strand1','dist1']].values
-            onesided_reps['sto_side'] = np.where(onesided_reps['sto_side'] == '+', 'l', 'r')
+            remindex.append( onesided_reps.loc[(onesided_reps['rep_side'] == 'lr') & (onesided_reps[['t_con','tindex']].rename(columns={'t_con':'scaffold','tindex':'sindex'}).merge(onesided_reps.loc[onesided_reps['rep_side'] == 'lr', ['scaffold','sindex']].drop_duplicates(), on=['scaffold','sindex'], how='left', indicator=True)['_merge'].values == "left_only"), ['scaffold','sindex','rep_side']].drop_duplicates() )
+            onesided_reps = DropRemovedScaffoldsFromRepeats(onesided_reps, remindex[-1])
+        # Remove indexes that have the shorter scaffold_graph entries
+        if len(onesided_reps):
+            remindex.append( onesided_reps.loc[onesided_reps['length'] < onesided_reps[['t_con','tindex']].rename(columns={'t_con':'scaffold','tindex':'sindex'}).merge(onesided_reps[['scaffold','sindex','length']].drop_duplicates(), on=['scaffold','sindex'], how='left')['length'].values, ['scaffold','sindex','rep_side']].drop_duplicates() )
+            onesided_reps.drop(columns='length', inplace=True)
+            onesided_reps = DropRemovedScaffoldsFromRepeats(onesided_reps, remindex[-1])
+        # If the target is also in scaffold_graph remove the one with fewer bridging reads
+        if len(onesided_reps):
+            for q in ['s','t']:
+                onesided_reps[[f'{q}to',f'{q}to_side',f'{q}dist']] = scaffold_graph.loc[onesided_reps[f'{q}index'].values, ['scaf1','strand1','dist1']].values
+                onesided_reps[f'{q}to_side'] = np.where(onesided_reps[f'{q}to_side'] == '+', 'l', 'r')
             onesided_reps['scount'] = onesided_reps[['scaffold','side','sto','sto_side','sdist']].rename(columns={'scaffold':'from','side':'from_side','sto':'to','sto_side':'to_side','sdist':'mean_dist'}).merge(scaf_bridges[['from','from_side','to','to_side','mean_dist','bcount']], on=['from','from_side','to','to_side','mean_dist'], how='left')['bcount'].values
-            onesided_reps[['tto','tto_side','tdist']] = scaffold_graph.loc[onesided_reps['tindex'].values, ['scaf1','strand1','dist1']].values
-            onesided_reps['tto_side'] = np.where(onesided_reps['tto_side'] == '+', 'l', 'r')
             onesided_reps['tcount'] = onesided_reps[['t_con','tside','tto','tto_side','tdist']].rename(columns={'t_con':'from','tside':'from_side','tto':'to','tto_side':'to_side','tdist':'mean_dist'}).merge(scaf_bridges[['from','from_side','to','to_side','mean_dist','bcount']], on=['from','from_side','to','to_side','mean_dist'], how='left')['bcount'].values
-            remindex = pd.concat([remindex, onesided_reps.loc[onesided_reps['tcount'] > onesided_reps['scount'], ['scaffold','sindex']].drop_duplicates()], ignore_index=True)
-            onesided_reps = onesided_reps[onesided_reps[['scaffold','sindex']].merge(remindex, on=['scaffold','sindex'], how='left', indicator=True)['_merge'].values == "left_only"].drop(columns=['side','tside','sto','sto_side','sdist','scount','tto','tto_side','tdist','tcount'])
-            onesided_reps = onesided_reps[onesided_reps[['t_con','tindex']].merge(remindex.rename(columns={'scaffold':'t_con','sindex':'tindex'}), on=['t_con','tindex'], how='left', indicator=True)['_merge'].values == "left_only"].copy()
+            remindex.append( onesided_reps.loc[onesided_reps['tcount'] > onesided_reps['scount'], ['scaffold','sindex','rep_side']].drop_duplicates() )
+            onesided_reps.drop(columns=['side','tside','sto','sto_side','sdist','scount','tto','tto_side','tdist','tcount'], inplace=True)
+            onesided_reps = DropRemovedScaffoldsFromRepeats(onesided_reps, remindex[-1])
+        # In case of a tie remove the scaffold with the higher index
         if len(onesided_reps):
-            # In case of a tie remove the scaffold with the higher index
-            remindex = pd.concat([remindex, onesided_reps.loc[onesided_reps['scaffold'] > onesided_reps['t_con'], ['scaffold','sindex']].drop_duplicates()], ignore_index=True)
+            remindex.append( onesided_reps.loc[onesided_reps['scaffold'] > onesided_reps['t_con'], ['scaffold','sindex','rep_side']].drop_duplicates() )
+        remindex = pd.concat(remindex, ignore_index=True).drop_duplicates()
         # Delete remindex in scaffold_graph and trim reverse entries (multiple reverse entries, because we have one starting at every position)
-        remindex = np.unique(remindex['sindex'].values)
-        scaffold_graph = DeleteIndexInScaffoldGraph(scaffold_graph, remindex, False)
+        scaffold_graph = DeleteIndexInScaffoldGraph(scaffold_graph, np.unique(remindex['sindex'].values), False)
+    trim_repeats = remindex
+    if len(trim_repeats):
+        trim_repeats.drop(columns='sindex', inplace=True)
+        trim_repeats.drop_duplicates(inplace=True)
+        # Remove all scaffolds which are fully duplicated (including the repeats on it that are not)
+        trim_repeats = trim_repeats[np.isin(trim_repeats['scaffold'], trim_repeats.loc[trim_repeats['rep_side'] == 'lr', 'scaffold'].values) == False].copy()
+        trim_repeats.rename(columns={'scaffold':'q_con'}, inplace=True)
 #
+    return scaffold_graph, trim_repeats
+
+def RemoveEmptyColumns(df):
+    # Clean up columns with all NaN
+    cols = df.count()
+    df.drop(columns=cols[cols == 0].index.values,inplace=True)
+    return df
+
+def ApplyDistancesToDuplicationAlternative(cur, lpot, alt_graph, scaf_bridges, s):
+    cur[f'side{s}'] = np.where(cur[f'strand{s}'] == '+', 'r', 'l')
+    cur[f'side{s+1}'] = np.where(cur[f'strand{s+1}'] == '+', 'l', 'r')
+    cur = cur.merge(scaf_bridges[['from','from_side','to','to_side','mean_dist']].rename(columns={'from':f'scaf{s}','from_side':f'side{s}','to':f'scaf{s+1}','to_side':f'side{s+1}'}), on=[f'scaf{s}',f'side{s}',f'scaf{s+1}',f'side{s+1}'], how='inner')
+    cur[f'dist{s+1}'] = cur['mean_dist']
+    cur.drop(columns=[f'side{s}',f'side{s+1}','mean_dist'], inplace=True)
+    lpot.append( cur.copy() ) # Store the change to apply potential extensions of the replaced scaffold to the left later
+    cur[f'side{s-1}'] = np.where(cur[f'strand{s-1}'] == '+', 'r', 'l')
+    cur[f'side{s}'] = np.where(cur[f'strand{s}'] == '+', 'l', 'r')
+    cur = cur.merge(scaf_bridges[['from','from_side','to','to_side','mean_dist']].rename(columns={'from':f'scaf{s-1}','from_side':f'side{s-1}','to':f'scaf{s}','to_side':f'side{s}'}), on=[f'scaf{s-1}',f'side{s-1}',f'scaf{s}',f'side{s}'], how='inner')
+    cur[f'dist{s}'] = cur['mean_dist']
+    alt_graph.append( cur.drop(columns=['dscaf','t_con','t_start','t_end',f'side{s-1}',f'side{s}','mean_dist']) )
+#
+    return cur, lpot, alt_graph
+
+def AddConnectedIndexes(remindex, dup_combs):
+    old_len = 0
+    while old_len != len(remindex):
+        old_len = len(remindex)
+        remindex = np.unique(np.concatenate([remindex, dup_combs.loc[np.isin(dup_combs['sindex1'], remindex), 'sindex2'].values]))
+#
+    return remindex
+
+def DisconnectRepeatedContigsWithConnectionsOnBothSides(scaffold_graph, scaf_reps, scaf_bridges):
     # Find graph entries that contain a duplicated scaffold (not as first or last entry)
     dup_scafs = np.unique(scaf_reps['scaffold'].values)
     dup_graph = []
@@ -2415,6 +2481,14 @@ def DeduplicateScaffoldsInGraph(scaffold_graph, repeats, scaffold_parts, scaf_br
         scaffold_graph = RemoveRedundantEntriesInScaffoldGraph(scaffold_graph)
 #
     return scaffold_graph
+
+def DeduplicateScaffoldsInGraph(scaffold_graph, repeats, scaffold_parts, scaf_bridges):
+    scaf_reps = FindFullyDuplicatedScaffolds(scaffold_parts, repeats)
+    end_reps = FindSingleContigScaffoldsWithOneDuplicatedUnconnectedEnd(scaffold_parts, repeats, scaffold_graph)
+    scaffold_graph, trim_repeats = DisconnectRepeatedContigsWithConnectionsOnOneSide(scaffold_graph, scaf_reps, end_reps, scaf_bridges)
+    scaffold_graph = DisconnectRepeatedContigsWithConnectionsOnBothSides(scaffold_graph, scaf_reps, scaf_bridges)
+#
+    return scaffold_graph, trim_repeats
 
 def UpdateScafBridgesAccordingToScaffoldGraph(scaf_bridges, scaffold_graph):
     valid_bridges = scaffold_graph[['from','from_side','scaf1','strand1','dist1']].drop_duplicates()
@@ -6945,17 +7019,47 @@ def ScaffoldContigs(contig_parts, bridges, mappings, cov_probs, repeats, prob_fa
     long_range_connections, long_range_maplen = SummarizeLongRangeConnections(long_range_connections)
     long_range_connections = FilterLongRangeConnections(long_range_connections, long_range_maplen, scaffold_parts, contig_parts, cov_probs, prob_factor, min_mapping_length, prematurity_threshold)
     scaffold_graph = BuildScaffoldGraph(long_range_connections, scaf_bridges)
-    scaffold_graph = DeduplicateScaffoldsInGraph(scaffold_graph, repeats, scaffold_parts, scaf_bridges)
+    scaffold_graph, trim_repeats = DeduplicateScaffoldsInGraph(scaffold_graph, repeats, scaffold_parts, scaf_bridges)
     scaf_bridges = UpdateScafBridgesAccordingToScaffoldGraph(scaf_bridges, scaffold_graph)
     graph_ext = FindValidExtensionsInScaffoldGraph(scaffold_graph)
     scaffold_paths = TraverseScaffoldGraph(scaffolds, scaffold_graph, graph_ext, scaf_bridges, org_scaf_conns, ploidy, max_loop_units)
     scaffold_paths = PhaseScaffolds(scaffold_paths, graph_ext, scaf_bridges, ploidy)
-    
+#
     # Finish Scaffolding
     scaffold_paths = ExpandScaffoldsWithContigs(scaffold_paths, scaffolds, scaffold_parts, ploidy)
     scaffold_paths = OrderByUnbrokenOriginalScaffolds(scaffold_paths, contig_parts, ploidy)
+#
+    return scaffold_paths, trim_repeats
 
-    return scaffold_paths
+def RemoveScaffoldsFromAssembly(scaffold_paths, contig_parts, del_scafs):
+    # Update the original scaffolding in case of deleted contigs
+    scaffold_paths['del'] = np.isin(scaffold_paths['scaf'], del_scafs)
+    scaffold_paths.loc[scaffold_paths['del'].shift(1, fill_value=False), 'sdist_left'] = -1
+    scaffold_paths['conlen'] = 0
+    scaffold_paths.loc[scaffold_paths['con0'] >= 0, 'conlen'] = contig_parts.loc[scaffold_paths.loc[scaffold_paths['con0'] >= 0, 'con0'].values, 'end'].values - contig_parts.loc[scaffold_paths.loc[scaffold_paths['con0'] >= 0, 'con0'].values, 'start'].values
+    scaffold_paths.reset_index(drop=True, inplace=True)
+    cur_entries = scaffold_paths.loc[(scaffold_paths['sdist_right'] >= 0) & scaffold_paths['del'].shift(-1, fill_value=False) & (scaffold_paths['del'] == False), ['sdist_right']].reset_index()
+    cur_entries.index = cur_entries['index'].values
+    s = 1
+    while len(cur_entries):
+        bridged = cur_entries[scaffold_paths.loc[cur_entries['index'].values+s, 'del'].values == False].copy()
+        if len(bridged):
+            scaffold_paths.loc[bridged['index'].values, 'sdist_right'] = bridged['sdist_right'].values
+            scaffold_paths.loc[bridged['index'].values+s, 'sdist_left'] = bridged['sdist_right'].values
+            cur_entries.drop(bridged['index'].values, inplace=True)
+        broken = cur_entries[scaffold_paths.loc[cur_entries['index'].values+s, 'sdist_right'].values < 0].copy()
+        if len(broken):
+            scaffold_paths.loc[broken['index'].values, 'sdist_right'] = -1
+            cur_entries.drop(broken['index'].values, inplace=True)
+        if len(cur_entries):
+            cur_entries['sdist_right'] += scaffold_paths.loc[cur_entries['index'].values+s, 'sdist_right'].values + scaffold_paths.loc[cur_entries['index'].values+s, 'conlen'].values
+            s += 1
+    # Store removed length
+    removed_length = scaffold_paths.loc[scaffold_paths['del'], 'conlen'].values
+    # Remove the unconnected contigs scheduled for deletion
+    scaffold_paths = scaffold_paths[scaffold_paths['del'] == False].drop(columns=['del','conlen'])
+#
+    return scaffold_paths, removed_length
 
 def RemoveUnconnectedLowlyMappedOrDuplicatedContigs(scaffold_paths, result_info, mappings, contig_parts, cov_probs, repeats, ploidy, lowmap_threshold):
     # Find unconnected scaffolds
@@ -6983,40 +7087,59 @@ def RemoveUnconnectedLowlyMappedOrDuplicatedContigs(scaffold_paths, result_info,
     full_reps = np.unique(uncon_reps.loc[uncon_reps['q_con'] > uncon_reps['t_con'], 'q_con'].values)
     unconnected.loc[np.isin(unconnected['con'].values, full_reps), 'fullrep'] = True
 #
-    # Update the original scaffolding in case of deleted contigs
-    scaffold_paths['del'] = np.isin(scaffold_paths['scaf'], unconnected.loc[unconnected['lowmap'] | unconnected['fullrep'], 'scaf'].values)
-    scaffold_paths.loc[scaffold_paths['del'].shift(1, fill_value=False), 'sdist_left'] = -1
-    scaffold_paths['conlen'] = 0
-    scaffold_paths.loc[scaffold_paths['con0'] >= 0, 'conlen'] = contig_parts.loc[scaffold_paths.loc[scaffold_paths['con0'] >= 0, 'con0'].values, 'end'].values - contig_parts.loc[scaffold_paths.loc[scaffold_paths['con0'] >= 0, 'con0'].values, 'start'].values
-    scaffold_paths.reset_index(drop=True, inplace=True)
-    cur_entries = scaffold_paths.loc[(scaffold_paths['sdist_right'] >= 0) & scaffold_paths['del'].shift(-1, fill_value=False) & (scaffold_paths['del'] == False), ['sdist_right']].reset_index()
-    cur_entries.index = cur_entries['index'].values
-    s = 1
-    while len(cur_entries):
-        bridged = cur_entries[scaffold_paths.loc[cur_entries['index'].values+s, 'del'].values == False].copy()
-        if len(bridged):
-            scaffold_paths.loc[bridged['index'].values, 'sdist_right'] = bridged['sdist_right'].values
-            scaffold_paths.loc[bridged['index'].values+s, 'sdist_left'] = bridged['sdist_right'].values
-            cur_entries.drop(bridged['index'].values, inplace=True)
-        broken = cur_entries[scaffold_paths.loc[cur_entries['index'].values+s, 'sdist_right'].values < 0].copy()
-        if len(broken):
-            scaffold_paths.loc[broken['index'].values, 'sdist_right'] = -1
-            cur_entries.drop(broken['index'].values, inplace=True)
-        if len(cur_entries):
-            cur_entries['sdist_right'] += scaffold_paths.loc[cur_entries['index'].values+s, 'sdist_right'].values + scaffold_paths.loc[cur_entries['index'].values+s, 'conlen'].values
-            s += 1
+    # Remove the unconnected contigs scheduled for deletion
+    scaffold_paths, removed_length = RemoveScaffoldsFromAssembly(scaffold_paths, contig_parts, unconnected.loc[unconnected['lowmap'] | unconnected['fullrep'], 'scaf'].values)
     # Update result_info
-    removed_length = scaffold_paths.loc[scaffold_paths['del'], 'conlen'].values
     result_info['removed2'] = {}
     result_info['removed2']['num'] = len(removed_length)
     result_info['removed2']['total'] = np.sum(removed_length) if len(removed_length) else 0
     result_info['removed2']['min'] = np.min(removed_length) if len(removed_length) else 0
     result_info['removed2']['max'] = np.max(removed_length) if len(removed_length) else 0
     result_info['removed2']['mean'] = np.mean(removed_length) if len(removed_length) else 0
-    # Remove the unconnected contigs scheduled for deletion
-    scaffold_paths = scaffold_paths[scaffold_paths['del'] == False].drop(columns=['del','conlen'])
+
 #
     return scaffold_paths, result_info
+
+def TrimDuplicatedEnds(contig_parts, mappings, repeats, trim_repeats, scaffold_paths, min_mapping_length, alignment_precision):
+    # Trim previously selected contig sides
+    trim = repeats.merge(trim_repeats, on=['q_con'], how='inner')
+    trim = trim[(trim['side'] == 'lr') | (trim['side'] == trim['rep_side'])].drop(columns='side')
+    trim.rename(columns={'rep_side':'side'}, inplace=True)
+    # Trim the longest duplicated regions
+    trim = trim.groupby(['q_con','side','q_confrom','q_conto']).agg({'q_start':'min', 'q_end':'max'}).reset_index()
+    # Remove the contigs that have been already removed for other reasons
+    trim = trim.merge(scaffold_paths[['con0','scaf']].rename(columns={'con0':'q_con'}), on='q_con', how='inner') # Since they were disconnected from the graph before they must be on a separate path and thus the main haplotype
+    # Make sure they are also unconnected (in case not all paths were disconnected)
+    trim = trim[ trim[['scaf']].merge(scaffold_paths.groupby('scaf')['pos'].max().reset_index(name='len'), on='scaf', how='left')['len'] == 0 ].copy()
+    if len(trim):
+        # Trim left sides
+        if np.sum(trim['side'] == 'l'):
+            contig_parts.loc[trim.loc[trim['side'] == 'l', 'q_con'].values, 'start'] = trim.loc[trim['side'] == 'l', 'q_end'].values
+        # Trim right sides
+        if np.sum(trim['side'] == 'r'):
+            contig_parts.loc[trim.loc[trim['side'] == 'r', 'q_con'].values, 'end'] = trim.loc[trim['side'] == 'r', 'q_start'].values
+#
+    # Trim unconnected contigs that are duplicated on both sides by the same contig (likely alternative haplotypes)
+    ctrim = scaffold_paths.groupby(['scaf'])['pos'].max().reset_index(name='len')
+    ctrim = ctrim[ctrim['len'] == 0].drop(columns='len')
+    ctrim['q_con'] = ctrim[['scaf']].merge(scaffold_paths[['scaf','con0']], on='scaf', how='left')['con0'].values
+    ctrim = ctrim.merge(repeats.loc[repeats['side'] == 'l', ['q_con','q_end','strand','t_con','t_start','t_end']].rename(columns={'q_end':'new_start','t_start':'ltstart','t_end':'ltend'}), on='q_con', how='inner')
+    ctrim = ctrim.merge(repeats.loc[repeats['side'] == 'r', ['q_con','q_start','strand','t_con','t_start','t_end']].rename(columns={'q_start':'new_end','t_start':'rtstart','t_end':'rtend'}), on=['q_con','strand','t_con'], how='inner')
+    # Remove self-mappings
+    ctrim = ctrim[ctrim['q_con'] != ctrim['t_con']].copy()
+    # Remove overlapping duplications (we do not want to remove the contigs that passed the thresholds for not fully duplicated)
+    ctrim = ctrim[ np.where(ctrim['strand'] == '+', ctrim['ltend'] < ctrim['rtstart'], ctrim['rtend'] < ctrim['ltstart']) ].copy()
+    # Collect the trimming caused by different targets
+    ctrim = ctrim.groupby(['scaf','q_con']).agg({'new_start':'min','new_end':'max'}).reset_index()
+    if len(ctrim):
+        contig_parts.loc[ctrim['q_con'].values, ['start','end']] = ctrim[['new_start','new_end']].values
+#
+    # Remove contig_parts that became shorter than min_mapping_length+alignment_precision completely
+    scaffold_paths, removed_length = RemoveScaffoldsFromAssembly(scaffold_paths, contig_parts, scaffold_paths.loc[np.isin(scaffold_paths['con0'], contig_parts[contig_parts['end'] - contig_parts['start'] < min_mapping_length+alignment_precision].index.values), 'scaf'].values)
+    # Remove mappings for trimmed contigs, so that they will not be extended (must happen after RemoveUnconnectedLowlyMappedOrDuplicatedContigs or we will remove all of them)
+    mappings = mappings[np.isin(mappings['conpart'], np.concatenate([ctrim['q_con'].values, trim['q_con'].values])) == False].copy()
+#
+    return contig_parts, mappings
 
 def PrepareScaffoldPathForMapping(scaffold_paths, bridges, ploidy):
     # Prepare entries in scaffold_paths for mapping
@@ -7831,8 +7954,9 @@ def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     bridges, overlap_bridges = InsertBridgesOnUniqueContigOverlapsWithoutConnections(bridges, repeats, min_len_contig_overlap, min_num_reads)
 #
     print( str(timedelta(seconds=clock())), "Scaffold the contigs")
-    scaffold_paths = ScaffoldContigs(contig_parts, bridges, mappings, cov_probs, repeats, prob_factor, min_mapping_length, max_dist_contig_end, prematurity_threshold, ploidy, max_loop_units)
+    scaffold_paths, trim_repeats = ScaffoldContigs(contig_parts, bridges, mappings, cov_probs, repeats, prob_factor, min_mapping_length, max_dist_contig_end, prematurity_threshold, ploidy, max_loop_units)
     scaffold_paths, result_info = RemoveUnconnectedLowlyMappedOrDuplicatedContigs(scaffold_paths, result_info, mappings, contig_parts, cov_probs, repeats, ploidy, lowmap_threshold)
+    contig_parts, mappings = TrimDuplicatedEnds(contig_parts, mappings, repeats, trim_repeats, scaffold_paths, min_mapping_length, alignment_precision)
 #
     print( str(timedelta(seconds=clock())), "Fill gaps")
     mappings, scaffold_paths, overlap_bridges = MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploidy) # Might break apart scaffolds again, if we cannot find a mapping read for a connection
