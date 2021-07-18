@@ -6433,40 +6433,28 @@ def TrimAmbiguousOverlap(scaffold_paths, scaffold_graph, ploidy):
             break
         else:
             ends.loc[ends['from'] < 0, 'apos'] -= ends.loc[ends['from'] < 0, 'dir'] # Start after deletions
-    # Check how much the scaffold_graph extends the first unambiguous position into the overlap (unambiguous support)
-    #ends = GetPositionFromPaths(ends, scaffold_paths, ploidy, 'from_side', 'strand', 'apid', 'apos', 'ahap')
-    #ends['from_side'] = np.where((ends['from_side'] == '+') == (ends['dir'] == -1), 'l', 'r')
-    #ends.rename(columns={'apid':'bpid','ahap':'bhap'}, inplace=True)
-    #ends['mpos'] = ends['apos']
-    #ends = GetFullNextPositionInPathB(ends, scaffold_paths, ploidy)
-    #pairs = ends[['from','from_side','next_scaf','next_strand','next_dist']].reset_index()
-    #pairs.rename(columns={'index':'dindex','next_scaf':'scaf1','next_strand':'strand1','next_dist':'dist1'}, inplace=True)
-    #pairs = pairs.merge(scaffold_graph[['from','from_side','scaf1','strand1','dist1']].reset_index().rename(columns={'index':'sindex'}), on=['from','from_side','scaf1','strand1','dist1'], how='inner')
-    #pairs.drop(columns=['from','from_side','scaf1','strand1','dist1'], inplace=True)
-    #s = 2
-    #while len(pairs):
-        # If scaffold_graph extends further than the current position, we can store it
-    #    pairs = pairs[scaffold_graph.loc[pairs['sindex'].values, 'length'].values > s].copy()
-    #    if len(pairs):
-    #        valid = np.unique(pairs['dindex'].values)
-    #        ends.loc[valid, 'apos'] = ends.loc[valid, 'mpos']
-            # Check next position
-    #        ends = GetFullNextPositionInPathB(ends, scaffold_paths, ploidy)
-    #        pairs = pairs[ (scaffold_graph.loc[pairs['sindex'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values == ends.loc[pairs['dindex'].values, ['next_scaf','next_strand','next_dist']].values).all(axis=1) ].copy()
-    #        s += 1
-    #ends.rename(columns={'bpid':'pid','bhap':'hap'}, inplace=True)
     ends.rename(columns={'apid':'pid','ahap':'hap'}, inplace=True)
     # Take the haplotype with the longest support
     ends = ends.groupby(['pid','dir'])['apos'].agg(['min','max']).reset_index()
     ends['pos'] = np.where(ends['dir'] == 1, ends['max'], ends['min'])
     ends.drop(columns=['min','max'], inplace=True)
-    # In case the ambiguous part from both sides overlaps, remove the whole paths
+    # In case the ambiguous part from both sides overlaps, break up the path into the individual scaffolds (which are later removed in case they are already present somewhere else)
     ends['overlap'] = False
     ends.loc[(ends['pid'] == ends['pid'].shift(1)) & (ends['pos'] < ends['pos'].shift(1)), 'overlap'] = True
     ends.loc[(ends['pid'] == ends['pid'].shift(-1)) & (ends['pos'] > ends['pos'].shift(-1)), 'overlap'] = True
     rem_pid = np.unique(ends.loc[ends['overlap'], 'pid'].values)
     ends = ends[ends['overlap'] == False].drop(columns=['overlap'])
+    single_scaffolds = np.unique(scaffold_paths.loc[np.isin(scaffold_paths['pid'], rem_pid), [f'scaf{h}' for h in range(ploidy)]].values)
     scaffold_paths = scaffold_paths[np.isin(scaffold_paths['pid'], rem_pid) == False].copy()
+    single_scaffolds = pd.DataFrame({'pid':np.arange(len(single_scaffolds))+ 1 + scaffold_paths['pid'].max(), 'pos':0, 'phase0': -1, 'scaf0':single_scaffolds, 'strand0':'+', 'dist0':0})
+    single_scaffolds = single_scaffolds[single_scaffolds['scaf0'] >= 0].copy()
+    single_scaffolds['phase0'] = single_scaffolds['pid'] + 1
+    for h in range(1,ploidy):
+        single_scaffolds[f'phase{h}'] = -single_scaffolds['phase0']
+        single_scaffolds[f'scaf{h}'] = -1
+        single_scaffolds[f'strand{h}'] = ''
+        single_scaffolds[f'dist{h}'] = 0
+    scaffold_paths = pd.concat([scaffold_paths, single_scaffolds], ignore_index=True)
     # Separate the ambiguous overlap on both sides into their own paths and remove duplicates
     ends.rename(columns={'new_pos':'new_pid'}, inplace=True)
     ends['new_pid'] = np.arange(len(ends)) + 1 + scaffold_paths['pid'].max()
