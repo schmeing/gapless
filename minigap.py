@@ -6434,27 +6434,28 @@ def TrimAmbiguousOverlap(scaffold_paths, scaffold_graph, ploidy):
         else:
             ends.loc[ends['from'] < 0, 'apos'] -= ends.loc[ends['from'] < 0, 'dir'] # Start after deletions
     # Check how much the scaffold_graph extends the first unambiguous position into the overlap (unambiguous support)
-    ends = GetPositionFromPaths(ends, scaffold_paths, ploidy, 'from_side', 'strand', 'apid', 'apos', 'ahap')
-    ends['from_side'] = np.where((ends['from_side'] == '+') == (ends['dir'] == -1), 'l', 'r')
-    ends.rename(columns={'apid':'bpid','ahap':'bhap'}, inplace=True)
-    ends['mpos'] = ends['apos']
-    ends = GetFullNextPositionInPathB(ends, scaffold_paths, ploidy)
-    pairs = ends[['from','from_side','next_scaf','next_strand','next_dist']].reset_index()
-    pairs.rename(columns={'index':'dindex','next_scaf':'scaf1','next_strand':'strand1','next_dist':'dist1'}, inplace=True)
-    pairs = pairs.merge(scaffold_graph[['from','from_side','scaf1','strand1','dist1']].reset_index().rename(columns={'index':'sindex'}), on=['from','from_side','scaf1','strand1','dist1'], how='inner')
-    pairs.drop(columns=['from','from_side','scaf1','strand1','dist1'], inplace=True)
-    s = 2
-    while len(pairs):
+    #ends = GetPositionFromPaths(ends, scaffold_paths, ploidy, 'from_side', 'strand', 'apid', 'apos', 'ahap')
+    #ends['from_side'] = np.where((ends['from_side'] == '+') == (ends['dir'] == -1), 'l', 'r')
+    #ends.rename(columns={'apid':'bpid','ahap':'bhap'}, inplace=True)
+    #ends['mpos'] = ends['apos']
+    #ends = GetFullNextPositionInPathB(ends, scaffold_paths, ploidy)
+    #pairs = ends[['from','from_side','next_scaf','next_strand','next_dist']].reset_index()
+    #pairs.rename(columns={'index':'dindex','next_scaf':'scaf1','next_strand':'strand1','next_dist':'dist1'}, inplace=True)
+    #pairs = pairs.merge(scaffold_graph[['from','from_side','scaf1','strand1','dist1']].reset_index().rename(columns={'index':'sindex'}), on=['from','from_side','scaf1','strand1','dist1'], how='inner')
+    #pairs.drop(columns=['from','from_side','scaf1','strand1','dist1'], inplace=True)
+    #s = 2
+    #while len(pairs):
         # If scaffold_graph extends further than the current position, we can store it
-        pairs = pairs[scaffold_graph.loc[pairs['sindex'].values, 'length'].values > s].copy()
-        if len(pairs):
-            valid = np.unique(pairs['dindex'].values)
-            ends.loc[valid, 'apos'] = ends.loc[valid, 'mpos']
+    #    pairs = pairs[scaffold_graph.loc[pairs['sindex'].values, 'length'].values > s].copy()
+    #    if len(pairs):
+    #        valid = np.unique(pairs['dindex'].values)
+    #        ends.loc[valid, 'apos'] = ends.loc[valid, 'mpos']
             # Check next position
-            ends = GetFullNextPositionInPathB(ends, scaffold_paths, ploidy)
-            pairs = pairs[ (scaffold_graph.loc[pairs['sindex'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values == ends.loc[pairs['dindex'].values, ['next_scaf','next_strand','next_dist']].values).all(axis=1) ].copy()
-            s += 1
-    ends.rename(columns={'bpid':'pid','bhap':'hap'}, inplace=True)
+    #        ends = GetFullNextPositionInPathB(ends, scaffold_paths, ploidy)
+    #        pairs = pairs[ (scaffold_graph.loc[pairs['sindex'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values == ends.loc[pairs['dindex'].values, ['next_scaf','next_strand','next_dist']].values).all(axis=1) ].copy()
+    #        s += 1
+    #ends.rename(columns={'bpid':'pid','bhap':'hap'}, inplace=True)
+    ends.rename(columns={'apid':'pid','ahap':'hap'}, inplace=True)
     # Take the haplotype with the longest support
     ends = ends.groupby(['pid','dir'])['apos'].agg(['min','max']).reset_index()
     ends['pos'] = np.where(ends['dir'] == 1, ends['max'], ends['min'])
