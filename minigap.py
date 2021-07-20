@@ -5544,6 +5544,67 @@ def FindInvalidOverlaps(ends, scaffold_paths, ploidy):
 #
     return ends
 
+def SwitchHaplotypesToConnectPerfectMatches(scaffold_paths, connected_ends, scaffold_graph, ploidy):
+    # We only need to check entries with multiple haplotypes for both paths, otherwise nothing can be switched anyways
+    valid_matches = connected_ends.copy()
+    valid_matches['anhaps'] = valid_matches[['apid','bpid']].merge(valid_matches[['apid','bpid','ahap']].drop_duplicates().groupby(['apid','bpid']).size().reset_index(name='nhaps'), on=['apid','bpid'], how='left')['nhaps'].values
+    valid_matches['bnhaps']  = valid_matches[['apid','bpid']].merge(valid_matches[['apid','bpid','bhap']].drop_duplicates().groupby(['apid','bpid']).size().reset_index(name='nhaps'), on=['apid','bpid'], how='left')['nhaps'].values
+    valid_matches = valid_matches[ (valid_matches['anhaps'] > 1) & (valid_matches['bnhaps'] > 1)].copy()
+    # Check which of them are perfect_matches
+    perfect_matches = valid_matches.copy()
+    perfect_matches['matches'] = perfect_matches['amax'] - perfect_matches['amin'] + 1
+    long_matches = perfect_matches.loc[perfect_matches['matches'] > 1, ['apid','ahap','amin','amax','matches']].drop_duplicates()
+    if len(long_matches):
+        long_matches = long_matches.loc[np.repeat(long_matches.index.values, long_matches['matches'].values)].reset_index(drop=True)
+        long_matches.drop(columns=['matches'], inplace=True)
+        long_matches['pos'] = long_matches.groupby(['apid','ahap','amin','amax']).cumcount() + long_matches['amin']
+        long_matches = GetPositionFromPaths(long_matches, scaffold_paths, ploidy, 'scaf', 'scaf', 'apid', 'pos', 'ahap')
+        long_matches = long_matches[long_matches['scaf'] != 1].copy()
+        long_matches = long_matches.groupby(['apid','ahap','amin','amax']).size().reset_index(name='matches')
+        perfect_matches.loc[perfect_matches['matches'] > 1, 'matches'] = perfect_matches.loc[perfect_matches['matches'] > 1, ['apid','ahap','amin','amax']].merge(long_matches, on=['apid','ahap','amin','amax'], how='left')['matches'].values
+    perfect_matches = SelectBestConnections(perfect_matches, scaffold_paths, scaffold_graph, ploidy)
+    # Only keep the apath, bpath constellation of the merge not the opposite (we only needed it up to here for SelectBestConnections)
+    perfect_matches = perfect_matches.loc[perfect_matches['aside'] == 'r', ['apid','bpid','ahap','bhap','anhaps','bnhaps']].copy()
+    valid_matches = valid_matches.loc[valid_matches['aside'] == 'r', ['apid','bpid','ahap','bhap']].copy()
+    # If all haplotypes are already perfect, we do not need to do anything
+    perfect_matches['nhaps'] = np.minimum(perfect_matches['anhaps'], perfect_matches['bnhaps'])
+    perfect_matches['nperfect'] = perfect_matches[['apid','bpid']].merge( perfect_matches[perfect_matches['ahap'] == perfect_matches['bhap']].groupby(['apid','bpid']).size().reset_index(name='nperfect'), on=['apid','bpid'], how='left')['nperfect'].fillna(0).astype(int).values
+    perfect_matches = perfect_matches[perfect_matches['nperfect'] < perfect_matches['nhaps']].copy()
+    # Check which haplotypes are valid to switch
+    valid_matches = valid_matches.merge(perfect_matches[['apid','bpid']].drop_duplicates(), on=['apid','bpid'], how='inner').drop_duplicates()
+    switchable = valid_matches[valid_matches['ahap'] != valid_matches['bhap']].drop(columns=['apid'])
+    switchable = switchable.merge(switchable.rename(columns={'ahap':'bhap','bhap':'ahap'}), on=['bpid','ahap','bhap'], how='inner')
+    switchable = switchable[switchable['ahap'] > switchable['bhap']].rename(columns={'ahap':'to_hap','bhap':'from_hap'}) # We only need them in one direction
+    # Switch haplotypes if this results in more perfect_matches, but does not make any match invalid
+    new_haps = valid_matches[['bpid','bhap']].drop_duplicates()
+    new_haps['new_bhap'] = new_haps['bhap']
+    new_haps['ahap'] = new_haps['bhap']
+    while len(new_haps):
+        # Check for all valid switches if this improves the amount of perfect matches
+        switches = switchable[np.isin(switchable['bpid'], new_haps['bpid'].values)].copy()
+        switches['to_ahap'] = switches[['bpid','to_hap']].rename(columns={'to_hap':'new_bhap'}).merge(new_haps[['bpid','new_bhap','ahap']], on=['bpid','new_bhap'], how='left')['ahap'].values
+        switches['from_ahap'] = switches[['bpid','from_hap']].rename(columns={'from_hap':'new_bhap'}).merge(new_haps[['bpid','new_bhap','ahap']], on=['bpid','new_bhap'], how='left')['ahap'].values
+        switches['improvement'] = (switches[['bpid','from_ahap','to_hap']].rename(columns={'from_ahap':'ahap','to_hap':'bhap'}).merge(perfect_matches[['bpid','ahap','bhap']], on=['bpid','ahap','bhap'], how='left', indicator=True)['_merge'].values == "both").astype(int)
+        switches['improvement'] += switches[['bpid','from_hap','to_ahap']].rename(columns={'from_hap':'bhap','to_ahap':'ahap'}).merge(perfect_matches[['bpid','ahap','bhap']], on=['bpid','ahap','bhap'], how='left', indicator=True)['_merge'].values == "both"
+        switches['improvement'] -= switches[['bpid','from_hap','from_ahap']].rename(columns={'from_hap':'bhap','from_ahap':'ahap'}).merge(perfect_matches[['bpid','ahap','bhap']], on=['bpid','ahap','bhap'], how='left', indicator=True)['_merge'].values == "both"
+        switches['improvement'] -= switches[['bpid','to_hap','to_ahap']].rename(columns={'to_hap':'bhap','to_ahap':'ahap'}).merge(perfect_matches[['bpid','ahap','bhap']], on=['bpid','ahap','bhap'], how='left', indicator=True)['_merge'].values == "both"
+        # Only one change per path per round to avoid conflicts (The one with the largest improvement)
+        switches.drop(columns=['to_ahap','from_ahap'], inplace=True)
+        switches.sort_values(['bpid','to_hap','from_hap','improvement'], ascending=[True,True,True,False], inplace=True)
+        switches = switches.groupby(['bpid']).first().reset_index()
+        # Apply changes to haplotypes that cannot be improved anymore
+        new_haps = new_haps.merge(switches, on='bpid', how='left')
+        ap_switches = new_haps.loc[(new_haps['improvement'] <= 0) & (new_haps['bhap'] < new_haps['new_bhap']), ['bpid','bhap','new_bhap']].rename(columns={'bpid':'pid','bhap':'hap1','new_bhap':'hap2'})
+        if len(ap_switches):
+            scaffold_paths = SwitchHaplotypes(scaffold_paths, ap_switches, ploidy)
+        # Mark switch where it leads to an improvement
+        new_haps = new_haps[new_haps['improvement'] > 0].drop(columns=['improvement'])
+        cur_switch = (new_haps['new_bhap'] == new_haps['to_hap']) | (new_haps['new_bhap'] == new_haps['from_hap'])
+        new_haps.loc[cur_switch, 'new_bhap'] = np.where(new_haps.loc[cur_switch, 'new_bhap'] == new_haps.loc[cur_switch, 'to_hap'], new_haps.loc[cur_switch, 'from_hap'], new_haps.loc[cur_switch, 'to_hap'])
+        new_haps.drop(columns=['to_hap','from_hap'], inplace=True)
+#
+    return scaffold_paths
+
 def SetConnectablePathsInMetaScaffold(meta_scaffolds, ends, connectable):
     meta_scaffolds['connectable'] = meta_scaffolds['connectable'] | (meta_scaffolds[['new_pid','bpid']].rename(columns={'new_pid':'apid'}).merge(connectable[['apid','bpid']], on=['apid','bpid'], how='left', indicator=True)['_merge'].values == "both")
     ends = ends[ends[['apid','bpid']].merge(connectable[['apid','bpid']], on=['apid','bpid'], how='left', indicator=True)['_merge'].values == "left_only"].copy()
@@ -5587,12 +5648,83 @@ def SwitchHaplotypes(scaffold_paths, switches, ploidy):
 #
     return scaffold_paths
 
+def BringAllConnectableHaplotypesToTheLowerHaplotypes(scaffold_paths, ends, ploidy):
+    # The first step is to bring everything that is valid from both sides to the lower haplotypes
+    for p1, p2 in zip(['a','b'],['b','a']):
+        connectable = ends[ends['valid_overlap'] & (ends[f'{p1}nhaps'] > ends[f'{p2}nhaps'])].drop(columns=['valid_overlap','dup_hap','valid_path'])
+        connectable.sort_values(['apid','bpid',f'{p1}hap',f'{p2}hap'], inplace=True)
+        connectable['fixed'] = False
+        while np.sum(connectable['fixed'] == False):
+            # Lowest haplotypes of p2 are fixed for lowest haplotypes of p1
+            connectable.loc[(connectable['apid'] != connectable['apid'].shift(1)) | connectable['fixed'].shift(1), 'fixed'] = True
+            # Remove all other haplotypes of p2 for fixed haplotypes of p1
+            connectable['delete'] = False
+            connectable.loc[(connectable['apid'] == connectable['apid'].shift(1)) & (connectable[f'{p1}hap'] == connectable[f'{p1}hap'].shift(1)) & connectable['fixed'].shift(1), 'delete'] = True
+            while True:
+                old_ndels = np.sum(connectable['delete'])
+                connectable.loc[(connectable['apid'] == connectable['apid'].shift(1)) & (connectable[f'{p1}hap'] == connectable[f'{p1}hap'].shift(1)) & connectable['delete'].shift(1), 'delete'] = True
+                if old_ndels == np.sum(connectable['delete']):
+                    break
+            # Remove haplotypes of p2 that are fixed in a haplotype of p1 in all other haplotypes of p1
+            connectable.loc[connectable[['apid','bpid',f'{p2}hap']].merge(connectable.loc[connectable['fixed'], ['apid','bpid',f'{p2}hap']], on=['apid','bpid',f'{p2}hap'], how='left', indicator=True)['_merge'].values == "both", 'delete'] = True
+            connectable.loc[connectable['fixed'], 'delete'] = False
+            connectable = connectable[connectable['delete'] == False].copy()
+        switches = connectable.loc[connectable[f'{p1}hap'] != connectable[f'{p2}hap'], [f'{p1}pid',f'{p1}hap',f'{p2}hap']].rename(columns={f'{p1}pid':'pid',f'{p1}hap':'hap1',f'{p2}hap':'hap2'})
+        scaffold_paths = SwitchHaplotypes(scaffold_paths, switches, ploidy)
+#
+    return scaffold_paths
+
 def DuplicateHaplotypes(scaffold_paths, duplicate, ploidy):
     for h1 in range(1,ploidy):
         for h2 in range(h1+1, ploidy):
             copy = np.isin(scaffold_paths['pid'], duplicate.loc[(duplicate['hap1'] == h1) & (duplicate['hap2'] == h2), 'pid'].values)
             if np.sum(copy):
                 scaffold_paths.loc[copy, [f'phase{h2}',f'scaf{h2}', f'strand{h2}', f'dist{h2}']] = scaffold_paths.loc[copy, [f'phase{h1}',f'scaf{h1}', f'strand{h1}', f'dist{h1}']].values
+#
+    return scaffold_paths
+
+def DuplicateHaplotypesToCreateMatches(scaffold_paths, ends, ploidy):
+    # When all haplotypes either match to the corresponding haplotype or, if the corresponding haplotype does not exist, to another haplotype, scaffolds can be made connectable by duplicating haplotypes on the paths with less haplotypes(p1)
+    for p1, p2 in zip(['a','b'],['b','a']):
+        connectable = ends[ (ends[f'{p2}hap'] >= ends[f'{p1}nhaps']) & np.isin(ends['valid_path'],['ab',p2])].drop(columns=['valid_overlap','dup_hap','valid_path'])
+        connectable.sort_values(['apid','bpid',f'{p2}hap',f'{p1}hap'], inplace=True)
+        connectable = connectable.groupby(['apid','bpid',f'{p2}hap']).first().reset_index() # Take the lowest haplotype that can be duplicated to fill the missing one
+        connectable = connectable.loc[connectable[f'{p1}hap'] > 0, [f'{p1}pid',f'{p1}hap',f'{p2}hap']].rename(columns={f'{p1}pid':'pid', f'{p1}hap':'hap1', f'{p2}hap':'hap2'}) # If the lowest is the main, we do not need to do anything
+        scaffold_paths = DuplicateHaplotypes(scaffold_paths, connectable, ploidy)
+#
+    return scaffold_paths
+
+def SwitchHaplotypesToCreateMatches(scaffold_paths, ends, ploidy):
+    # Switching haplotypes might also help to make paths connectable
+    connectable = ends[ends['valid_overlap'] | (ends['dup_hap'] != '')].drop(columns=['valid_overlap','valid_path'])
+    connectable.rename(columns={'dup_hap':'switchcol'}, inplace=True)
+    connectable['switchcol'] = np.where(connectable['switchcol'] != 'b', 'b', 'a') # Switch the column that is not a duplicated haplotype, because switching a duplicated haplotype to a position lower than the duplicate would remove that status (as we always want to keep one version and chose the lowest haplotype with that version for it)
+    connectable['nhaps'] = np.minimum(connectable['anhaps'], connectable['bnhaps'])
+    connectable = connectable[(connectable['ahap'] < connectable['nhaps']) & (connectable['bhap'] < connectable['nhaps'])].drop(columns=['anhaps','bnhaps'])
+    connectable['nmatches'] = connectable[['apid','bpid']].merge(connectable[connectable['ahap'] == connectable['bhap']].groupby(['apid','bpid']).size().reset_index(name='matches'), on=['apid','bpid'], how='left')['matches'].fillna(0).values.astype(int)
+    connectable = connectable[connectable['nmatches'] < connectable['nhaps']].copy()
+    connectable['new_ahap'] = connectable['ahap']
+    connectable['new_bhap'] = connectable['bhap']
+    while len(connectable):
+        connectable['match'] = connectable['new_ahap'] == connectable['new_bhap']
+        connectable['amatch'] = connectable[['apid','bpid','new_ahap']].merge(connectable.groupby(['apid','bpid','new_ahap'])['match'].max().reset_index(), on=['apid','bpid','new_ahap'], how='left')['match'].values
+        connectable['bmatch'] = connectable[['apid','bpid','new_bhap']].merge(connectable.groupby(['apid','bpid','new_bhap'])['match'].max().reset_index(), on=['apid','bpid','new_bhap'], how='left')['match'].values
+        connectable['switchable'] = connectable[['apid','bpid','new_ahap','new_bhap']].merge( connectable[['apid','bpid','new_ahap','new_bhap']].rename(columns={'new_ahap':'new_bhap','new_bhap':'new_ahap'}), on=['apid','bpid','new_ahap','new_bhap'], how='left', indicator=True)['_merge'].values == "both"
+        for p1, p2 in zip(['a','b'],['b','a']):
+            switches = connectable.loc[(connectable[f'{p1}match'] == False) & (connectable['switchcol'] == p2) & ((connectable[f'{p2}match'] == False) | connectable['switchable']), ['apid','new_ahap','bpid','new_bhap','switchcol']].copy()
+            switches = switches.groupby(['apid','bpid']).first().reset_index() # Only one switch per meta_paths per round to avoid conflicts
+            switches.rename(columns={f'new_{p2}hap':f'{p2}hap',f'new_{p1}hap':f'new_{p2}hap'}, inplace=True)
+            switches = pd.concat([switches.rename(columns={f'new_{p2}hap':f'{p2}hap',f'{p2}hap':f'new_{p2}hap'}), switches], ignore_index=True)
+            switches = connectable[['apid','bpid',f'new_{p2}hap']].rename(columns={f'new_{p2}hap':f'{p2}hap'}).merge(switches, on=['apid','bpid',f'{p2}hap'], how='left')[f'new_{p2}hap'].values
+            connectable[f'new_{p2}hap'] = np.where(np.isnan(switches), connectable[f'new_{p2}hap'], switches).astype(int)
+        connectable['old_nmatches'] = connectable['nmatches']
+        connectable['nmatches'] = connectable[['apid','bpid']].merge(connectable[connectable['new_ahap'] == connectable['new_bhap']].groupby(['apid','bpid']).size().reset_index(name='matches'), on=['apid','bpid'], how='left')['matches'].fillna(0).values.astype(int)
+        improvable = (connectable['old_nmatches'] < connectable['nmatches']) & (connectable['nmatches'] < connectable['nhaps'])
+        for p in ['a','b']:
+            switches = connectable.loc[(improvable == False) & (connectable[f'{p}hap'] != connectable[f'new_{p}hap']), [f'{p}pid',f'{p}hap',f'new_{p}hap']].drop_duplicates()
+            switches.rename(columns={f'{p}pid':'pid',f'{p}hap':'hap1',f'new_{p}hap':'hap2'}, inplace=True)
+            scaffold_paths = SwitchHaplotypes(scaffold_paths, switches, ploidy)
+        connectable = connectable[improvable].copy()
 #
     return scaffold_paths
 
@@ -5620,7 +5752,38 @@ def GetHaplotypesThatDifferOnlyByDistance(scaffold_paths, check_pids, ploidy):
 #
     return dist_diff_only
 
-def CombinePathAccordingToMetaParts(scaffold_paths, meta_parts_in, conns, graph_ext, scaf_bridges, scaf_len, ploidy):
+def RemoveDistanceOnlyDifferences(scaffold_paths, ends, ploidy):
+    # Remove haplotypes that block a connection if they differ only by distance from a valid haplotype
+    delete_haps = []
+    connectable_pids = []
+    for p in ['a','b']:
+        dist_diff_only = GetHaplotypesThatDifferOnlyByDistance(scaffold_paths, ends[f'{p}pid'].drop_duplicates().values, ploidy)
+        valid_haps = ends.loc[ends['valid_overlap'], [f'{p}pid',f'{p}hap']].drop_duplicates()
+        valid_haps.rename(columns={f'{p}pid':'pid',f'{p}hap':'hap'}, inplace=True)
+        dist_diff_only = dist_diff_only.merge(valid_haps.rename(columns={'hap':'hap1'}), on=['pid','hap1'], how='inner')
+        invalid_haps = ends[[f'{p}pid',f'{p}nhaps']].drop_duplicates()
+        invalid_haps.rename(columns={f'{p}pid':'pid'}, inplace=True)
+        invalid_haps = invalid_haps.loc[np.repeat(invalid_haps.index.values, invalid_haps[f'{p}nhaps'].values), ['pid']].copy()
+        invalid_haps['hap'] = invalid_haps.groupby(['pid']).cumcount()
+        invalid_haps = invalid_haps[invalid_haps.merge(valid_haps, on=['pid','hap'], how='left', indicator=True)['_merge'].values == "left_only"].copy()
+        invalid_haps['dist_diff_only'] = invalid_haps.merge(dist_diff_only[['pid','hap2']].rename(columns={'hap2':'hap'}), on=['pid','hap'], how='left', indicator=True)['_merge'].values == "both"
+        delete_haps.append(invalid_haps.loc[invalid_haps['dist_diff_only'], ['pid','hap']])
+        valid_haps['valid'] = True
+        valid_haps = pd.concat([valid_haps, invalid_haps.rename(columns={'dist_diff_only':'valid'})], ignore_index=True)
+        valid_haps = valid_haps.groupby(['pid'])['valid'].min().reset_index()
+        valid_haps = valid_haps.loc[valid_haps['valid'], ['pid']].rename(columns={'pid':f'{p}pid'})
+        valid_haps = valid_haps.merge(ends[['apid','bpid']].drop_duplicates(), on=[f'{p}pid'], how='left')
+        connectable_pids.append(valid_haps)
+    connectable_pids = connectable_pids[0].merge(connectable_pids[1], on=['apid','bpid'], how='inner')
+    delete_haps[0] = delete_haps[0][np.isin(delete_haps[0]['pid'], connectable_pids['apid'].values)].copy()
+    delete_haps[1] = delete_haps[1][np.isin(delete_haps[1]['pid'], connectable_pids['bpid'].values)].copy()
+    delete_haps = pd.concat(delete_haps, ignore_index=True)
+    scaffold_paths = RemoveHaplotypes(scaffold_paths, delete_haps, ploidy)
+    scaffold_paths = ShiftHaplotypesToLowestPossible(scaffold_paths, ploidy)
+#
+    return scaffold_paths
+
+def CombinePathAccordingToMetaParts(scaffold_paths, meta_parts_in, conns, graph_ext, scaffold_graph, scaf_bridges, scaf_len, ploidy):
     # Combine scaffold_paths from lowest to highest position in meta scaffolds
     meta_scaffolds = meta_parts_in.loc[meta_parts_in['pos'] == 0].drop(columns=['pos'])
     scaffold_paths['reverse'] = scaffold_paths[['pid']].merge(meta_scaffolds[['pid','reverse']], on=['pid'], how='left')['reverse'].fillna(False).values.astype(bool)
@@ -5671,8 +5834,9 @@ def CombinePathAccordingToMetaParts(scaffold_paths, meta_parts_in, conns, graph_
                 break
             else:
                 ends['samedir'] = True
+                connected_ends = ends.copy() # Store ends for a later check
                 ends = FindInvalidOverlaps(ends, scaffold_paths, ploidy)
-                ends = ends[['apid','ahap','bpid','bhap','valid_overlap','dup_hap','valid_path']].merge(meta_scaffolds[['new_pid','bpid']].rename(columns={'new_pid':'apid'}), on=['apid','bpid'], how='inner')
+                ends = ends.loc[ends['aside'] == 'r', ['apid','ahap','bpid','bhap','valid_overlap','dup_hap','valid_path']].copy()
                 ends['valid_overlap'] = ends['valid_overlap'] & (ends['valid_path'] == 'ab')
                 ends.loc[ends['valid_path'] == 'a', 'dup_hap'] = np.where(np.isin(ends.loc[ends['valid_path'] == 'a', 'dup_hap'],['ab','b']), 'b', '')
                 ends.loc[ends['valid_path'] == 'b', 'dup_hap'] = np.where(np.isin(ends.loc[ends['valid_path'] == 'b', 'dup_hap'],['ab','a']), 'a', '')
@@ -5686,96 +5850,16 @@ def CombinePathAccordingToMetaParts(scaffold_paths, meta_parts_in, conns, graph_
                                     ((ends['bhap'] == 0) & (ends['ahap'] >= ends['bnhaps']) & np.isin(ends['valid_path'],['ab','a'])) ].drop(columns=['valid_overlap','dup_hap','valid_path'])
                 connectable = connectable.groupby(['apid','bpid','nhaps']).size().reset_index(name='matches')
                 connectable = connectable[connectable['nhaps'] == connectable['matches']].copy()
+                connected_ends = connected_ends.merge(pd.concat([connectable[['apid','bpid']], connectable[['apid','bpid']].rename(columns={'apid':'bpid','bpid':'apid'})], ignore_index=True).drop_duplicates(), on=['apid','bpid'], how='inner')
+                scaffold_paths = SwitchHaplotypesToConnectPerfectMatches(scaffold_paths, connected_ends, scaffold_graph, ploidy)
                 meta_scaffolds, ends = SetConnectablePathsInMetaScaffold(meta_scaffolds, ends, connectable)
                 if 0 == iteration:
-                    # The first step is to bring everything that is valid from both sides to the lower haplotypes
-                    for p1, p2 in zip(['a','b'],['b','a']):
-                        connectable = ends[ends['valid_overlap'] & (ends[f'{p1}nhaps'] > ends[f'{p2}nhaps'])].drop(columns=['valid_overlap','dup_hap','valid_path'])
-                        connectable.sort_values(['apid','bpid',f'{p1}hap',f'{p2}hap'], inplace=True)
-                        connectable['fixed'] = False
-                        while np.sum(connectable['fixed'] == False):
-                            # Lowest haplotypes of p2 are fixed for lowest haplotypes of p1
-                            connectable.loc[(connectable['apid'] != connectable['apid'].shift(1)) | connectable['fixed'].shift(1), 'fixed'] = True
-                            # Remove all other haplotypes of p2 for fixed haplotypes of p1
-                            connectable['delete'] = False
-                            connectable.loc[(connectable['apid'] == connectable['apid'].shift(1)) & (connectable[f'{p1}hap'] == connectable[f'{p1}hap'].shift(1)) & connectable['fixed'].shift(1), 'delete'] = True
-                            while True:
-                                old_ndels = np.sum(connectable['delete'])
-                                connectable.loc[(connectable['apid'] == connectable['apid'].shift(1)) & (connectable[f'{p1}hap'] == connectable[f'{p1}hap'].shift(1)) & connectable['delete'].shift(1), 'delete'] = True
-                                if old_ndels == np.sum(connectable['delete']):
-                                    break
-                            # Remove haplotypes of p2 that are fixed in a haplotype of p1 in all other haplotypes of p1
-                            connectable.loc[connectable[['apid','bpid',f'{p2}hap']].merge(connectable.loc[connectable['fixed'], ['apid','bpid',f'{p2}hap']], on=['apid','bpid',f'{p2}hap'], how='left', indicator=True)['_merge'].values == "both", 'delete'] = True
-                            connectable.loc[connectable['fixed'], 'delete'] = False
-                            connectable = connectable[connectable['delete'] == False].copy()
-                        switches = connectable.loc[connectable[f'{p1}hap'] != connectable[f'{p2}hap'], [f'{p1}pid',f'{p1}hap',f'{p2}hap']].rename(columns={f'{p1}pid':'pid',f'{p1}hap':'hap1',f'{p2}hap':'hap2'})
-                        scaffold_paths = SwitchHaplotypes(scaffold_paths, switches, ploidy)
+                    scaffold_paths = BringAllConnectableHaplotypesToTheLowerHaplotypes(scaffold_paths, ends, ploidy)
                 elif 1 == iteration or 3 == iteration:
-                    # When all haplotypes either match to the corresponding haplotype or, if the corresponding haplotype does not exist, to another haplotype, scaffolds can be made connectable by duplicating haplotypes on the paths with less haplotypes(p1)
-                    for p1, p2 in zip(['a','b'],['b','a']):
-                        connectable = ends[ (ends[f'{p2}hap'] >= ends[f'{p1}nhaps']) & np.isin(ends['valid_path'],['ab',p2])].drop(columns=['valid_overlap','dup_hap','valid_path'])
-                        connectable.sort_values(['apid','bpid',f'{p2}hap',f'{p1}hap'], inplace=True)
-                        connectable = connectable.groupby(['apid','bpid',f'{p2}hap']).first().reset_index() # Take the lowest haplotype that can be duplicated to fill the missing one
-                        connectable = connectable.loc[connectable[f'{p1}hap'] > 0, [f'{p1}pid',f'{p1}hap',f'{p2}hap']].rename(columns={f'{p1}pid':'pid', f'{p1}hap':'hap1', f'{p2}hap':'hap2'}) # If the lowest is the main, we do not need to do anything
-                        scaffold_paths = DuplicateHaplotypes(scaffold_paths, connectable, ploidy)
-                    # Switching haplotypes might also help to make paths connectable
-                    connectable = ends[ends['valid_overlap'] | (ends['dup_hap'] != '')].drop(columns=['valid_overlap','valid_path'])
-                    connectable.rename(columns={'dup_hap':'switchcol'}, inplace=True)
-                    connectable['switchcol'] = np.where(connectable['switchcol'] != 'b', 'b', 'a') # Switch the column that is not a duplicated haplotype, because switching a duplicated haplotype to a position lower than the duplicate would remove that status (as we always want to keep one version and chose the lowest haplotype with that version for it)
-                    connectable['nhaps'] = np.minimum(connectable['anhaps'], connectable['bnhaps'])
-                    connectable = connectable[(connectable['ahap'] < connectable['nhaps']) & (connectable['bhap'] < connectable['nhaps'])].drop(columns=['anhaps','bnhaps'])
-                    connectable['nmatches'] = connectable[['apid','bpid']].merge(connectable[connectable['ahap'] == connectable['bhap']].groupby(['apid','bpid']).size().reset_index(name='matches'), on=['apid','bpid'], how='left')['matches'].fillna(0).values.astype(int)
-                    connectable = connectable[connectable['nmatches'] < connectable['nhaps']].copy()
-                    connectable['new_ahap'] = connectable['ahap']
-                    connectable['new_bhap'] = connectable['bhap']
-                    while len(connectable):
-                        connectable['match'] = connectable['new_ahap'] == connectable['new_bhap']
-                        connectable['amatch'] = connectable[['apid','bpid','new_ahap']].merge(connectable.groupby(['apid','bpid','new_ahap'])['match'].max().reset_index(), on=['apid','bpid','new_ahap'], how='left')['match'].values
-                        connectable['bmatch'] = connectable[['apid','bpid','new_bhap']].merge(connectable.groupby(['apid','bpid','new_bhap'])['match'].max().reset_index(), on=['apid','bpid','new_bhap'], how='left')['match'].values
-                        connectable['switchable'] = connectable[['apid','bpid','new_ahap','new_bhap']].merge( connectable[['apid','bpid','new_ahap','new_bhap']].rename(columns={'new_ahap':'new_bhap','new_bhap':'new_ahap'}), on=['apid','bpid','new_ahap','new_bhap'], how='left', indicator=True)['_merge'].values == "both"
-                        for p1, p2 in zip(['a','b'],['b','a']):
-                            switches = connectable.loc[(connectable[f'{p1}match'] == False) & (connectable['switchcol'] == p2) & ((connectable[f'{p2}match'] == False) | connectable['switchable']), ['apid','new_ahap','bpid','new_bhap','switchcol']].copy()
-                            switches = switches.groupby(['apid','bpid']).first().reset_index() # Only one switch per meta_paths per round to avoid conflicts
-                            switches.rename(columns={f'new_{p2}hap':f'{p2}hap',f'new_{p1}hap':f'new_{p2}hap'}, inplace=True)
-                            switches = pd.concat([switches.rename(columns={f'new_{p2}hap':f'{p2}hap',f'{p2}hap':f'new_{p2}hap'}), switches], ignore_index=True)
-                            switches = connectable[['apid','bpid',f'new_{p2}hap']].rename(columns={f'new_{p2}hap':f'{p2}hap'}).merge(switches, on=['apid','bpid',f'{p2}hap'], how='left')[f'new_{p2}hap'].values
-                            connectable[f'new_{p2}hap'] = np.where(np.isnan(switches), connectable[f'new_{p2}hap'], switches).astype(int)
-                        connectable['old_nmatches'] = connectable['nmatches']
-                        connectable['nmatches'] = connectable[['apid','bpid']].merge(connectable[connectable['new_ahap'] == connectable['new_bhap']].groupby(['apid','bpid']).size().reset_index(name='matches'), on=['apid','bpid'], how='left')['matches'].fillna(0).values.astype(int)
-                        improvable = (connectable['old_nmatches'] < connectable['nmatches']) & (connectable['nmatches'] < connectable['nhaps'])
-                        for p in ['a','b']:
-                            switches = connectable.loc[(improvable == False) & (connectable[f'{p}hap'] != connectable[f'new_{p}hap']), [f'{p}pid',f'{p}hap',f'new_{p}hap']].drop_duplicates()
-                            switches.rename(columns={f'{p}pid':'pid',f'{p}hap':'hap1',f'new_{p}hap':'hap2'}, inplace=True)
-                            scaffold_paths = SwitchHaplotypes(scaffold_paths, switches, ploidy)
-                        connectable = connectable[improvable].copy()
+                    scaffold_paths = DuplicateHaplotypesToCreateMatches(scaffold_paths, ends, ploidy)
+                    scaffold_paths = SwitchHaplotypesToCreateMatches(scaffold_paths, ends, ploidy)
                 elif 2 == iteration:
-                        # Remove haplotypes that block a connection if they differ only by distance from a valid haplotype
-                        delete_haps = []
-                        connectable_pids = []
-                        for p in ['a','b']:
-                            dist_diff_only = GetHaplotypesThatDifferOnlyByDistance(scaffold_paths, ends[f'{p}pid'].drop_duplicates().values, ploidy)
-                            valid_haps = ends.loc[ends['valid_overlap'], [f'{p}pid',f'{p}hap']].drop_duplicates()
-                            valid_haps.rename(columns={f'{p}pid':'pid',f'{p}hap':'hap'}, inplace=True)
-                            dist_diff_only = dist_diff_only.merge(valid_haps.rename(columns={'hap':'hap1'}), on=['pid','hap1'], how='inner')
-                            invalid_haps = ends[[f'{p}pid',f'{p}nhaps']].drop_duplicates()
-                            invalid_haps.rename(columns={f'{p}pid':'pid'}, inplace=True)
-                            invalid_haps = invalid_haps.loc[np.repeat(invalid_haps.index.values, invalid_haps[f'{p}nhaps'].values), ['pid']].copy()
-                            invalid_haps['hap'] = invalid_haps.groupby(['pid']).cumcount()
-                            invalid_haps = invalid_haps[invalid_haps.merge(valid_haps, on=['pid','hap'], how='left', indicator=True)['_merge'].values == "left_only"].copy()
-                            invalid_haps['dist_diff_only'] = invalid_haps.merge(dist_diff_only[['pid','hap2']].rename(columns={'hap2':'hap'}), on=['pid','hap'], how='left', indicator=True)['_merge'].values == "both"
-                            delete_haps.append(invalid_haps.loc[invalid_haps['dist_diff_only'], ['pid','hap']])
-                            valid_haps['valid'] = True
-                            valid_haps = pd.concat([valid_haps, invalid_haps.rename(columns={'dist_diff_only':'valid'})], ignore_index=True)
-                            valid_haps = valid_haps.groupby(['pid'])['valid'].min().reset_index()
-                            valid_haps = valid_haps.loc[valid_haps['valid'], ['pid']].rename(columns={'pid':f'{p}pid'})
-                            valid_haps = valid_haps.merge(ends[['apid','bpid']].drop_duplicates(), on=[f'{p}pid'], how='left')
-                            connectable_pids.append(valid_haps)
-                        connectable_pids = connectable_pids[0].merge(connectable_pids[1], on=['apid','bpid'], how='inner')
-                        delete_haps[0] = delete_haps[0][np.isin(delete_haps[0]['pid'], connectable_pids['apid'].values)].copy()
-                        delete_haps[1] = delete_haps[1][np.isin(delete_haps[1]['pid'], connectable_pids['bpid'].values)].copy()
-                        delete_haps = pd.concat(delete_haps, ignore_index=True)
-                        scaffold_paths = RemoveHaplotypes(scaffold_paths, delete_haps, ploidy)
-                        scaffold_paths = ShiftHaplotypesToLowestPossible(scaffold_paths, ploidy)
+                    scaffold_paths = RemoveDistanceOnlyDifferences(scaffold_paths, ends, ploidy)
         meta_scaffolds.drop(columns=['bside'], inplace=True)
 #
         # Since all the existing haplotypes must match take the paths with more haplotypes in the overlapping region (only relevant starting at the second position, since the first cannot have a variant or they would not have been merged)
@@ -5927,7 +6011,7 @@ def CombinePathOnUniqueOverlap(scaffold_paths, scaffold_graph, graph_ext, scaf_b
         meta_parts.sort_values(['meta','pos'], inplace=True)
 #
         scaf_len = scaffold_paths.groupby(['pid'])['pos'].max().reset_index()
-        scaffold_paths = CombinePathAccordingToMetaParts(scaffold_paths, meta_parts, conns, graph_ext, scaf_bridges, scaf_len, ploidy)
+        scaffold_paths = CombinePathAccordingToMetaParts(scaffold_paths, meta_parts, conns, graph_ext, scaffold_graph, scaf_bridges, scaf_len, ploidy)
 
     return scaffold_paths
 
@@ -6051,7 +6135,7 @@ def RemoveDuplicates(scaffold_paths, remove_all, ploidy):
 #
     return scaffold_paths
 
-def PlacePathAInPathB(duplications, scaffold_paths, graph_ext, scaf_bridges, ploidy):
+def PlacePathAInPathB(duplications, scaffold_paths, graph_ext, scaffold_graph, scaf_bridges, ploidy):
     includes = duplications.groupby(['ldid','rdid','apid','ahap','bpid','bhap'])['bpos'].agg(['min','max']).reset_index()
     scaf_len = scaffold_paths.groupby(['pid'])['pos'].max().reset_index()
     includes['blen'] = includes[['bpid']].rename(columns={'bpid':'pid'}).merge(scaf_len, on=['pid'], how='left')['pos'].values
@@ -6128,7 +6212,7 @@ def PlacePathAInPathB(duplications, scaffold_paths, graph_ext, scaf_bridges, plo
         conns['aoverlap'] = 1
         conns['boverlap'] = 1
         scaf_len = test_paths.groupby(['pid'])['pos'].max().reset_index()
-        test_paths = CombinePathAccordingToMetaParts(test_paths, meta_parts, conns, graph_ext, scaf_bridges, scaf_len, ploidy)
+        test_paths = CombinePathAccordingToMetaParts(test_paths, meta_parts, conns, graph_ext, scaffold_graph, scaf_bridges, scaf_len, ploidy)
         pids = np.unique(test_paths['pid'])
         includes['success'] = (np.isin(includes[['tpid1','tpid2','tpid3']], pids).sum(axis=1) == 1)
         test_paths = test_paths.merge(pd.concat([ includes.loc[includes['success'], [f'tpid{i}','tpid3']].rename(columns={f'tpid{i}':'pid'}) for i in [1,2] ], ignore_index=True), on=['pid'], how='inner')
@@ -6139,7 +6223,7 @@ def PlacePathAInPathB(duplications, scaffold_paths, graph_ext, scaf_bridges, plo
 #
     return test_paths, includes
 
-def PlaceUnambigouslyPlaceablePathsAsAlternativeHaplotypes(scaffold_paths, graph_ext, scaf_bridges, ploidy):
+def PlaceUnambigouslyPlaceablePathsAsAlternativeHaplotypes(scaffold_paths, graph_ext, scaffold_graph, scaf_bridges, ploidy):
     duplications = GetDuplications(scaffold_paths, ploidy)
     # Only insert a maximum of one path a per path b per round to avoid conflicts between inserted path
     while len(duplications):
@@ -6192,7 +6276,7 @@ def PlaceUnambigouslyPlaceablePathsAsAlternativeHaplotypes(scaffold_paths, graph
         duplications['valid'] = duplications[['ldid','rdid']].merge(duplications.groupby(['ldid','rdid'])['valid'].min().reset_index(), on=['ldid','rdid'], how='left')['valid'].values
         duplications = duplications[duplications['valid']].copy()
         # Check that including path a as haplotype of path b does not violate scaffold_graph
-        test_paths, includes = PlacePathAInPathB(duplications, scaffold_paths, graph_ext, scaf_bridges, ploidy)
+        test_paths, includes = PlacePathAInPathB(duplications, scaffold_paths, graph_ext, scaffold_graph, scaf_bridges, ploidy)
         # Require that path a has a unique placement
         includes.sort_values(['apid'], inplace=True)
         includes = includes[(includes['apid'] != includes['apid'].shift(1)) & (includes['apid'] != includes['apid'].shift(-1))].copy()
@@ -6555,7 +6639,7 @@ def TraverseScaffoldGraph(scaffolds, scaffold_graph, graph_ext, scaf_bridges, or
             scaffold_paths = RemoveDuplicates(scaffold_paths, True, ploidy)
         elif i==1:
             print("PlaceUnambigouslyPlaceables")
-            scaffold_paths = PlaceUnambigouslyPlaceablePathsAsAlternativeHaplotypes(scaffold_paths, graph_ext, scaf_bridges, ploidy)
+            scaffold_paths = PlaceUnambigouslyPlaceablePathsAsAlternativeHaplotypes(scaffold_paths, graph_ext, scaffold_graph, scaf_bridges, ploidy)
         if i != 2:
             print(len(np.unique(scaffold_paths['pid'].values)))
             TestPrint(scaffold_paths)
@@ -10169,28 +10253,28 @@ def TestTraverseScaffoldGraph():
         {'from': 118892, 'from_side':    'r', 'to':   9344, 'to_side':    'r', 'mean_dist':      8, 'mapq':  60060, 'bcount':     20, 'min_dist':      0, 'max_dist':     35, 'probability': 0.319050, 'to_alt':      2, 'from_alt':      1}
         ]) )
     result_paths.append( pd.DataFrame({
-        'pid':      [    100,    100,    100,    100,    100,    100,    100,    100,    100,    100,    100,    100,    100,    100,    100],
-        'pos':      [      0,      1,      2,      3,      4,      5,      6,      7,      8,      9,     10,     11,     12,     13,     14],
-        'phase0':   [    101,    101,    101,    101,    101,    101,    101,    101,    101,    101,    101,    101,    101,    101,    101],
-        'scaf0':    [   2799,    674,  20727,   2885,  15812,  10723,  12896,  76860,  32229,  71091,   1306,     44,  99342,  99341,   9344],
-        'strand0':  [    '-',    '+',    '-',    '+',    '+',    '-',    '-',    '-',    '+',    '-',    '+',    '-',    '-',    '-',    '+'],
-        'dist0':    [      0,     60,    -68,    -44,    -44,    -43,    -43,    -46,   -456,      3,    -45,    -43,    -44,      0,      0],
-        'phase1':   [   -102,   -102,    102,    102,    102,    102,    102,    102,    102,    102,    102,    102,   -102,   -102,   -102],
-        'scaf1':    [     -1,     -1,  20727,   2885,  13452,  10723,  12910,  76860,     -1,  71091,     -1,     44,     -1,     -1,     -1],
-        'strand1':  [     '',     '',    '-',    '+',    '-',    '-',    '-',    '-',     '',    '-',     '',    '-',     '',     '',     ''],
-        'dist1':    [      0,      0,    -18,    245,    -45,    -41,    -43,    -42,      0,   2134,      0,      1,      0,      0,      0]
+        'pid':      [    100,    100,    100,    100,    100,    100,    100,    100,    100,    100,    100,    100,    100,    100],
+        'pos':      [      0,      1,      2,      3,      4,      5,      6,      7,      8,      9,     10,     11,     12,     13],
+        'phase0':   [    101,    101,    101,    101,    101,    101,    101,    101,    101,    101,    101,    101,    101,    101],
+        'scaf0':    [   2799,    674,  20727,   2885,  15812,  10723,  12896,  76860,  32229,  71091,   1306,     44,  99342,  99341],
+        'strand0':  [    '-',    '+',    '-',    '+',    '+',    '-',    '-',    '-',    '+',    '-',    '+',    '-',    '-',    '-'],
+        'dist0':    [      0,     60,    -68,    -44,    -44,    -43,    -43,    -46,   -456,      3,    -45,    -43,    -44,      0],
+        'phase1':   [   -102,   -102,    102,    102,    102,    102,    102,    102,    102,    102,    102,    102,   -102,   -102],
+        'scaf1':    [     -1,     -1,  20727,   2885,  13452,  10723,  12910,  76860,     -1,  71091,     -1,     44,     -1,     -1],
+        'strand1':  [     '',     '',    '-',    '+',    '-',    '-',    '-',    '-',     '',    '-',     '',    '-',     '',     ''],
+        'dist1':    [      0,      0,    -18,    245,    -45,    -41,    -43,    -42,      0,   2134,      0,      1,      0,      0]
         }) )
     result_paths.append( pd.DataFrame({
-        'pid':      [    101,    101,    101,    101,    101],
-        'pos':      [      0,      1,      2,      3,      4],
-        'phase0':   [    103,    103,    103,    103,    103],
-        'scaf0':    [  99342, 107483, 107484, 107485, 107486],
-        'strand0':  [    '+',    '+',    '+',    '+',    '+'],
-        'dist0':    [      0,    -44,      0,      0,      0],
-        'phase1':   [   -104,   -104,   -104,   -104,   -104],
-        'scaf1':    [     -1,     -1,     -1,     -1,     -1],
-        'strand1':  [     '',     '',     '',     '',     ''],
-        'dist1':    [      0,      0,      0,      0,      0]
+        'pid':      [    101,    101],
+        'pos':      [      0,      1],
+        'phase0':   [    103,    103],
+        'scaf0':    [  99342, 107483],
+        'strand0':  [    '+',    '+'],
+        'dist0':    [      0,    -44],
+        'phase1':   [   -104,   -104],
+        'scaf1':    [     -1,     -1],
+        'strand1':  [     '',     ''],
+        'dist1':    [      0,      0]
         }) )
     result_paths.append( pd.DataFrame({
         'pid':      [    102,    102,    102,    102,    102,    102,    102,    102,    102,    102,    102,    102],
@@ -10253,16 +10337,16 @@ def TestTraverseScaffoldGraph():
         'dist1':    [      0]
         }) )
     result_paths.append( pd.DataFrame({
-        'pid':      [    107,    107],
-        'pos':      [      0,      1],
-        'phase0':   [    115,    115],
-        'scaf0':    [  99004, 107486],
-        'strand0':  [    '+',    '-'],
-        'dist0':    [      0,    838],
-        'phase1':   [   -116,   -116],
-        'scaf1':    [     -1,     -1],
-        'strand1':  [     '',     ''],
-        'dist1':    [      0,      0]
+        'pid':      [    107],
+        'pos':      [      0],
+        'phase0':   [    115],
+        'scaf0':    [  99004],
+        'strand0':  [    '+'],
+        'dist0':    [      0],
+        'phase1':   [   -116],
+        'scaf1':    [     -1],
+        'strand1':  [     ''],
+        'dist1':    [      0]
         }) )
     result_paths.append( pd.DataFrame({
         'pid':      [    108],
@@ -10301,16 +10385,16 @@ def TestTraverseScaffoldGraph():
         'dist1':    [      0,      0,      0,      0,      0]
         }) )
     result_paths.append( pd.DataFrame({
-        'pid':      [    111,    111,    111,    111,    111,    111,    111],
-        'pos':      [      0,      1,      2,      3,      4,      5,      6],
-        'phase0':   [    123,    123,    123,    123,    123,    123,    123],
-        'scaf0':    [ 107486, 101373,  31749,  53480, 101373,  31749,  31756],
-        'strand0':  [    '+',    '-',    '-',    '-',    '-',    '-',    '-'],
-        'dist0':    [      0,  -1922,   -350,   -646,  -1383,   -350,     -1],
-        'phase1':   [   -124,   -124,   -124,   -124,   -124,   -124,   -124],
-        'scaf1':    [     -1,     -1,     -1,     -1,     -1,     -1,     -1],
-        'strand1':  [     '',     '',     '',     '',     '',     '',     ''],
-        'dist1':    [      0,      0,      0,      0,      0,      0,      0]
+        'pid':      [    111,    111,    111,    111,    111],
+        'pos':      [      0,      1,      2,      3,      4],
+        'phase0':   [    123,    123,    123,    123,    123],
+        'scaf0':    [  31749,  53480, 101373,  31749,  31756],
+        'strand0':  [    '-',    '-',    '-',    '-',    '-'],
+        'dist0':    [   -350,   -646,  -1383,   -350,     -1],
+        'phase1':   [   -124,   -124,   -124,   -124,   -124],
+        'scaf1':    [     -1,     -1,     -1,     -1,     -1],
+        'strand1':  [     '',     '',     '',     '',     ''],
+        'dist1':    [      0,      0,      0,      0,      0]
         }) )
     result_paths.append( pd.DataFrame({
         'pid':      [    112,    112,    112],
@@ -10402,11 +10486,11 @@ def TestTraverseScaffoldGraph():
         'dist0':    [      0,     -6,     17,    -14,      5,    453,    -45,    -38,      8]
         }) )
     result_unique_paths.append( pd.DataFrame({
-        'pid':      [    111,    111,    111,    111,    111,    111],
-        'pos':      [      0,      1,      2,      3,      4,      5],
-        'scaf0':    [   9344,  99342, 107483, 107484, 107485, 107486],
-        'strand0':  [    '-',    '+',    '+',    '+',    '+',    '+'],
-        'dist0':    [      0,     73,    -44,      0,      0,      0]
+        'pid':      [    111,    111,    111,    111,    111],
+        'pos':      [      0,      1,      2,      3,      4],
+        'scaf0':    [   9344,  99342, 107483, 107484, 107485],
+        'strand0':  [    '-',    '+',    '+',    '+',    '+'],
+        'dist0':    [      0,     73,    -44,      0,      0]
         }) )
     result_unique_paths.append( pd.DataFrame({
         'pid':      [    112,    112,    112],
@@ -10456,20 +10540,6 @@ def TestTraverseScaffoldGraph():
         'scaf0':    [    115,  15177, 115803],
         'strand0':  [    '+',    '+',    '+'],
         'dist0':    [      0,    -42,      5]
-        }) )
-    result_unique_paths.append( pd.DataFrame({
-        'pid':      [    119,    119,    119],
-        'pos':      [      0,      1,      2],
-        'scaf0':    [    372, 107485, 107486],
-        'strand0':  [    '+',    '+',    '+'],
-        'dist0':    [      0,  -1436,      0]
-        }) )
-    result_unique_paths.append( pd.DataFrame({
-        'pid':      [    120,    120,    120],
-        'pos':      [      0,      1,      2],
-        'scaf0':    [ 107486, 101373,  70951],
-        'strand0':  [    '+',    '-',    '+'],
-        'dist0':    [      0,  -1922,      0]
         }) )
     result_unique_paths.append( pd.DataFrame({
         'pid':      [    121,    121,    121],
@@ -10617,6 +10687,20 @@ def TestTraverseScaffoldGraph():
         'scaf0':    [    115, 115803],
         'strand0':  [    '+',    '+'],
         'dist0':    [      0,    885]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    116,    116],
+        'pos':      [      0,      1],
+        'scaf0':    [    372, 107485],
+        'strand0':  [    '+',    '+'],
+        'dist0':    [      0,  -1436]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    117,    117],
+        'pos':      [      0,      1],
+        'scaf0':    [ 107485, 107486],
+        'strand0':  [    '+',    '+'],
+        'dist0':    [      0,      0]
         }) )
 #
     # Test 2
@@ -11023,28 +11107,28 @@ def TestTraverseScaffoldGraph():
         'dist1':    [      0,    387,      0,      0,      0,      0,      0,      0,      0,   9158]
         }) )
     result_paths.append( pd.DataFrame({
-        'pid':      [    501,    501,    501,    501,    501,    501,    501],
-        'pos':      [      0,      1,      2,      3,      4,      5,      6],
-        'phase0':   [    503,    503,    503,    503,    503,    503,    503],
-        'scaf0':    [  93920,      7,     -1,     -1,  45782,  45783,  31737],
-        'strand0':  [    '-',    '+',     '',     '',    '+',    '+',    '+'],
-        'dist0':    [      0,    383,      0,      0,   -230,      0,   1044],
-        'phase1':   [   -504,   -504,    504,    504,    504,   -504,   -504],
-        'scaf1':    [     -1,     -1,  74998,  32135,  45782,     -1,     -1],
-        'strand1':  [     '',     '',    '+',    '-',    '+',     '',     ''],
-        'dist1':    [      0,      0,   -558,    739,   -502,      0,      0]
+        'pid':      [    501,    501,    501,    501,    501,    501],
+        'pos':      [      0,      1,      2,      3,      4,      5],
+        'phase0':   [    503,    503,    503,    503,    503,    503],
+        'scaf0':    [  93920,      7,     -1,     -1,  45782,  45783],
+        'strand0':  [    '-',    '+',     '',     '',    '+',    '+'],
+        'dist0':    [      0,    383,      0,      0,   -230,      0],
+        'phase1':   [   -504,   -504,    504,    504,    504,   -504],
+        'scaf1':    [     -1,     -1,  74998,  32135,  45782,     -1],
+        'strand1':  [     '',     '',    '+',    '-',    '+',     ''],
+        'dist1':    [      0,      0,   -558,    739,   -502,      0]
         }) )
     result_paths.append( pd.DataFrame({
-        'pid':      [    502,    502,    502,    502,    502],
-        'pos':      [      0,      1,      2,      3,      4],
-        'phase0':   [    505,    505,    505,    505,    505],
-        'scaf0':    [  54753,  95291,  10945, 105853,  32135],
-        'strand0':  [    '+',    '+',    '+',    '-',    '-'],
-        'dist0':    [      0,    -18,    -45,    -43,    -45],
-        'phase1':   [   -506,   -506,   -506,   -506,   -506],
-        'scaf1':    [     -1,     -1,     -1,     -1,     -1],
-        'strand1':  [     '',     '',     '',     '',     ''],
-        'dist1':    [      0,      0,      0,      0,      0]
+        'pid':      [    502,    502,    502,    502],
+        'pos':      [      0,      1,      2,      3],
+        'phase0':   [    505,    505,    505,    505],
+        'scaf0':    [  54753,  95291,  10945, 105853],
+        'strand0':  [    '+',    '+',    '+',    '-'],
+        'dist0':    [      0,    -18,    -45,    -43],
+        'phase1':   [   -506,   -506,   -506,   -506],
+        'scaf1':    [     -1,     -1,     -1,     -1],
+        'strand1':  [     '',     '',     '',     ''],
+        'dist1':    [      0,      0,      0,      0]
         }) )
     result_paths.append( pd.DataFrame({
         'pid':      [    503,    503,    503,    503,    503],
@@ -11071,73 +11155,37 @@ def TestTraverseScaffoldGraph():
         'dist1':    [      0,      0,      0,    686]
         }) )
     result_paths.append( pd.DataFrame({
-        'pid':      [    505,    505],
-        'pos':      [      0,      1],
-        'phase0':   [    511,    511],
-        'scaf0':    [  30446,  31729],
-        'strand0':  [    '+',    '+'],
-        'dist0':    [      0,    630],
-        'phase1':   [   -512,   -512],
-        'scaf1':    [     -1,     -1],
-        'strand1':  [     '',     ''],
-        'dist1':    [      0,      0]
-        }) )
-    result_paths.append( pd.DataFrame({
-        'pid':      [    506,    506],
-        'pos':      [      0,      1],
-        'phase0':   [    513,    513],
-        'scaf0':    [  76037,  31729],
-        'strand0':  [    '-',    '+'],
-        'dist0':    [      0,   -162],
-        'phase1':   [   -514,   -514],
-        'scaf1':    [     -1,     -1],
-        'strand1':  [     '',     ''],
-        'dist1':    [      0,      0]
-        }) )
-    result_paths.append( pd.DataFrame({
-        'pid':      [    507,    507],
-        'pos':      [      0,      1],
-        'phase0':   [    515,    515],
-        'scaf0':    [  30446,  76037],
-        'strand0':  [    '+',    '-'],
-        'dist0':    [      0,      0],
-        'phase1':   [   -516,   -516],
-        'scaf1':    [     -1,     -1],
-        'strand1':  [     '',     ''],
-        'dist1':    [      0,      0]
-        }) )
-    result_paths.append( pd.DataFrame({
-        'pid':      [    508,    508],
-        'pos':      [      0,      1],
-        'phase0':   [    517,    517],
-        'scaf0':    [  76037,  31737],
-        'strand0':  [    '-',    '+'],
-        'dist0':    [      0,   -168],
-        'phase1':   [   -518,   -518],
-        'scaf1':    [     -1,     -1],
-        'strand1':  [     '',     ''],
-        'dist1':    [      0,      0]
-        }) )
-    result_paths.append( pd.DataFrame({
-        'pid':      [    509,    509],
-        'pos':      [      0,      1],
-        'phase0':   [    519,    519],
-        'scaf0':    [  31737,  31758],
-        'strand0':  [    '+',    '+'],
-        'dist0':    [      0,     86],
-        'phase1':   [   -520,   -520],
-        'scaf1':    [     -1,     -1],
-        'strand1':  [     '',     ''],
-        'dist1':    [      0,      0]
-        }) )
-    result_paths.append( pd.DataFrame({
-        'pid':      [    510],
+        'pid':      [    505],
         'pos':      [      0],
-        'phase0':   [    521],
+        'phase0':   [    511],
+        'scaf0':    [  31737],
+        'strand0':  [    '+'],
+        'dist0':    [      0],
+        'phase1':   [   -512],
+        'scaf1':    [     -1],
+        'strand1':  [     ''],
+        'dist1':    [      0]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    506],
+        'pos':      [      0],
+        'phase0':   [    513],
+        'scaf0':    [  76037],
+        'strand0':  [    '+'],
+        'dist0':    [      0],
+        'phase1':   [   -514],
+        'scaf1':    [     -1],
+        'strand1':  [     ''],
+        'dist1':    [      0]
+        }) )
+    result_paths.append( pd.DataFrame({
+        'pid':      [    507],
+        'pos':      [      0],
+        'phase0':   [    515],
         'scaf0':    [  31108],
         'strand0':  [    '+'],
         'dist0':    [      0],
-        'phase1':   [   -522],
+        'phase1':   [   -516],
         'scaf1':    [     -1],
         'strand1':  [     ''],
         'dist1':    [      0]
