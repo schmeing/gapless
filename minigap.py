@@ -4705,7 +4705,7 @@ def CompressPaths(scaffold_paths, ploidy):
 #
     return scaffold_paths
 
-def MergeHaplotypes(scaffold_paths, scaf_bridges, ploidy, ends_in=[]):
+def MergeHaplotypes(scaffold_paths, graph_ext, scaf_bridges, ploidy, ends_in=[]):
     if len(ends_in):
         ends = ends_in
     else:
@@ -4750,6 +4750,29 @@ def MergeHaplotypes(scaffold_paths, scaf_bridges, ploidy, ends_in=[]):
         duplications.loc[(duplications['did'] != duplications['did'].shift(-1)) & (duplications[f'{p}pos'] != duplications['max_pos']), 'del'] = True
     duplications['del']  = duplications[['did']].merge(duplications.groupby(['did'])['del'].max().reset_index(), on=['did'], how='left')['del'].values
     duplications = duplications[duplications['del'] == False].drop(columns=['max_pos','del'])
+#
+#    # Check if the haplotypes to be merged share an extension (reduces continuity without reducing misassemblies)
+#    if len(duplications):
+#        # Get both ends for the paths
+#        ends = duplications[['apid','ahap','bpid','bhap']].drop_duplicates()
+#        ends = ends.loc[np.repeat(ends.index.values, 2)].reset_index(drop=True)
+#        for p in ['a','b']:
+#            ends[f'{p}side'] = np.tile(['l','r'], len(ends)//2)
+#        ends, patha = GetPathAFromEnds(ends, scaffold_paths, ploidy)
+#        # Get matching origins
+#        cur_org = MatchOriginsToPathA(patha, graph_ext)
+#        ends = ends.merge(cur_org.rename(columns={'pid':'opid'}), on='opid', how='inner')
+#        # Get paired extensions (and -1 if no extension exists at all)
+#        ends = ends.merge(graph_ext['pairs'], on='oindex', how='inner').merge(ends[['apid','ahap','bpid','bhap','aside','bside']].drop_duplicates(), on=['apid','ahap','bpid','bhap','aside','bside'], how='right')
+#        ends = ends.drop(columns=['opid','oindex']).drop_duplicates()
+#        ends['eindex'] = ends['eindex'].fillna(-1).astype(int)
+#        ends = ends.rename(columns={'eindex':'aindex'}).merge(ends.rename(columns={'apid':'bpid','bpid':'apid','ahap':'bhap','bhap':'ahap','aside':'bside','bside':'aside','eindex':'bindex'}), on=['apid','ahap','bpid','bhap','aside','bside'], how='inner')
+#        # Check if the pair shares at least one extension on both sides
+#        ends = ends[ends['aindex'] == ends['bindex']].drop(columns=['aindex','bindex']).drop_duplicates().groupby(['apid','ahap','bpid','bhap']).size().reset_index(name='nsides')
+#        ends = ends[ends['nsides'] == 2].drop(columns='nsides')
+#        # Only keep the duplications between pairs that share an extension on both sides
+#        duplications = duplications.merge(ends, on=['apid','ahap','bpid','bhap'], how='inner')
+#
     # Add the duplications between haplotypes of the same path
     if len(duplications):
         new_duplications = [duplications]
@@ -6163,7 +6186,7 @@ def PlacePathAInPathB(duplications, scaffold_paths, graph_ext, scaffold_graph, s
         includes['success'] = False
     else:
         SetDistanceAtFirstPositionToZero(test_paths, ploidy)
-        test_paths, group_info = MergeHaplotypes(test_paths, scaf_bridges, ploidy, ends)
+        test_paths, group_info = MergeHaplotypes(test_paths, graph_ext, scaf_bridges, ploidy, ends)
         pids = np.unique(test_paths['pid'])
         includes['success'] = (np.isin(includes['tpid1'], pids) == False) & (np.isin(includes['tpid2'], pids) == False) # If we still have the original pids they could not be merged
         group_info['new_pid'] = group_info[[f'pid{h}' for h in range(ploidy)]].max(axis=1) # We get here tpid2 from includes, which is the pid we want to assign to the now merged middle part
@@ -6299,6 +6322,50 @@ def PlaceUnambigouslyPlaceablePathsAsAlternativeHaplotypes(scaffold_paths, graph
         includes = duplications[['apid','bpid']].drop_duplicates()
         duplications = GetDuplications(scaffold_paths, ploidy)
         duplications = duplications.merge(includes, on=['apid','bpid'], how='inner')
+#
+    return scaffold_paths
+
+def RemoveNearlyDuplicatedPaths(scaffold_paths, ploidy):
+    # Get duplications that contain both path ends for side a
+    duplications = GetDuplications(scaffold_paths, ploidy)
+    scaf_len = scaffold_paths.groupby(['pid'])['pos'].max().reset_index()
+    ends = duplications.groupby(['apid','bpid'])['apos'].agg(['min','max']).reset_index()
+    ends['alen'] = ends[['apid']].rename(columns={'apid':'pid'}).merge(scaf_len, on=['pid'], how='left')['pos'].values
+    ends = ends.loc[(ends['min'] == 0) & (ends['max'] == ends['alen']), ['apid','bpid','alen']].copy()
+    duplications = duplications.merge(ends, on=['apid','bpid'], how='inner')
+    # Only keep duplications, where path a is haploid
+    nhaps = GetNumberOfHaplotypes(scaffold_paths, ploidy)
+    duplications['anhaps'] = duplications[['apid']].rename(columns={'apid':'pid'}).merge(nhaps, on=['pid'], how='left')['nhaps'].values
+    duplications = duplications[duplications['anhaps'] == 1].drop(columns=['anhaps'])
+    # Check if they are on the same or opposite strand (alone it is useless, but it sets the requirements for the direction of change for the positions)
+    duplications = AddStrandToDuplications(duplications, scaffold_paths, ploidy)
+    duplications['samedir'] = duplications['astrand'] == duplications['bstrand']
+    duplications.drop(columns=['astrand','bstrand'], inplace=True)
+    # Start at position 0 and check if we can extend only accepting differences in distance
+    duplications = SeparateDuplicationsByHaplotype(duplications, scaffold_paths, ploidy)
+    ext_dups = []
+    edups = duplications[duplications['apos'] == 0].copy()
+    edups['did'] = np.arange(len(edups))
+    ext_dups.append(edups.copy())
+    while len(edups):
+        # Get next position to see if we can extend the duplication
+        edups = GetPositionsBeforeDuplication(edups, scaffold_paths, ploidy, True)
+        # Remove everything that does not fit (different distances are allowed)
+        edups = edups[(edups['aprev_pos'] >= 0) & (edups['bprev_pos'] >= 0)].drop(columns=['adist','bdist'])
+        edups['apos'] = edups['aprev_pos']
+        edups['bpos'] = edups['bprev_pos']
+        # Check if we have a duplication at the new position
+        edups = edups[['apid','apos','ahap','bpid','bpos','bhap','samedir','did']].merge(duplications, on=['apid','apos','ahap','bpid','bpos','bhap','samedir'], how='inner')
+        # Insert the valid extensions
+        ext_dups.append(edups.copy())
+    ext_dups = pd.concat(ext_dups, ignore_index=True)
+    # Check if the whole patha is duplicated
+    ext_dups.sort_values(['did','apos'], inplace=True)
+    duplications = ext_dups.drop_duplicates()
+    duplications = duplications.groupby(['did','apid','alen','samedir'])['apos'].agg(['min','max']).reset_index()
+    duplications = duplications[(duplications['min'] == 0) & (duplications['max'] == duplications['alen'])].drop_duplicates()
+    # Remove the completely duplicated paths
+    scaffold_paths = scaffold_paths[np.isin(scaffold_paths['pid'], duplications['apid'].values) == False].copy()
 #
     return scaffold_paths
 
@@ -6624,7 +6691,7 @@ def TraverseScaffoldGraph(scaffolds, scaffold_graph, graph_ext, scaf_bridges, or
             print(f"Iteration {n}")
             n+=1
              # First Merge then Combine to not accidentially merge a haplotype, where the other haplotype of the paths is not compatible and thus joining wrong paths
-            scaffold_paths = MergeHaplotypes(scaffold_paths, scaf_bridges, ploidy)
+            scaffold_paths = MergeHaplotypes(scaffold_paths, graph_ext, scaf_bridges, ploidy)
             time1 = clock()
             print(str(timedelta(seconds=time1-time0)), len(np.unique(scaffold_paths['pid'].values)))
             TestPrint(scaffold_paths)
@@ -6640,6 +6707,7 @@ def TraverseScaffoldGraph(scaffolds, scaffold_graph, graph_ext, scaf_bridges, or
         elif i==1:
             print("PlaceUnambigouslyPlaceables")
             scaffold_paths = PlaceUnambigouslyPlaceablePathsAsAlternativeHaplotypes(scaffold_paths, graph_ext, scaffold_graph, scaf_bridges, ploidy)
+            scaffold_paths = RemoveNearlyDuplicatedPaths(scaffold_paths, ploidy)
         if i != 2:
             print(len(np.unique(scaffold_paths['pid'].values)))
             TestPrint(scaffold_paths)
