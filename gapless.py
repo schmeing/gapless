@@ -7241,7 +7241,7 @@ def RemoveUnconnectedLowlyMappedOrDuplicatedContigs(scaffold_paths, result_info,
 #
     return scaffold_paths, result_info
 
-def TrimDuplicatedEnds(contig_parts, mappings, repeats, trim_repeats, scaffold_paths, min_mapping_length, alignment_precision):
+def TrimDuplicatedEnds(contig_parts, scaffold_paths, mappings, repeats, trim_repeats, min_mapping_length, alignment_precision):
     # Trim previously selected contig sides
     trim = repeats.merge(trim_repeats, on=['q_con'], how='inner')
     trim = trim[(trim['side'] == 'lr') | (trim['side'] == trim['rep_side'])].drop(columns='side')
@@ -7280,7 +7280,7 @@ def TrimDuplicatedEnds(contig_parts, mappings, repeats, trim_repeats, scaffold_p
     # Remove mappings for trimmed contigs, so that they will not be extended (must happen after RemoveUnconnectedLowlyMappedOrDuplicatedContigs or we will remove all of them)
     mappings = mappings[np.isin(mappings['conpart'], np.concatenate([ctrim['q_con'].values, trim['q_con'].values])) == False].copy()
 #
-    return contig_parts, mappings
+    return contig_parts, scaffold_paths, mappings
 
 def PrepareScaffoldPathForMapping(scaffold_paths, bridges, ploidy):
     # Prepare entries in scaffold_paths for mapping
@@ -7646,17 +7646,19 @@ def MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploi
             for h in range(1,ploidy):
                 rem = conn_cov.loc[(conn_cov['cov'] == 0) & (conn_cov['hap'] == h), ['scaf','rpos']].rename(columns={'rpos':'pos'}).merge(scaffold_paths[['scaf','pos',f'phase{h}']], on=['scaf','pos'], how='inner')[f'phase{h}'].values
                 rem = np.isin(scaffold_paths[f'phase{h}'], rem)
-                scaffold_paths.loc[rem, [f'con{h}',f'strand{h}',f'dist{h}']] = [-1,'',0]
-                scaffold_paths.loc[rem, f'phase{h}'] = -scaffold_paths.loc[rem, f'phase{h}']
+                if np.sum(rem):
+                    scaffold_paths.loc[rem, [f'con{h}',f'strand{h}',f'dist{h}']] = [-1,'',0]
+                    scaffold_paths.loc[rem, f'phase{h}'] = -scaffold_paths.loc[rem, f'phase{h}']
             # Continue with main paths that has alternatives
             rem_conns = conn_cov[(conn_cov['cov'] == 0) & (conn_cov['hap'] == 0)].copy()
             for h in range(1,ploidy):
                 rem = rem_conns[['scaf','rpos']].reset_index().rename(columns={'rpos':'pos'}).merge(scaffold_paths.loc[scaffold_paths[f'phase{h}'] >= 0, ['scaf','pos',f'phase{h}']], on=['scaf','pos'], how='inner')
                 rem_conns.drop(rem['index'].values, inplace=True)
                 rem = np.isin(scaffold_paths[f'phase{h}'], rem[f'phase{h}'].values)
-                scaffold_paths.loc[rem, ['phase0','con0','strand0','dist0']] = scaffold_paths.loc[rem, [f'phase{h}',f'con{h}',f'strand{h}',f'dist{h}']].values
-                scaffold_paths.loc[rem, [f'con{h}',f'strand{h}',f'dist{h}']] = [-1,'',0]
-                scaffold_paths.loc[rem, f'phase{h}'] = -scaffold_paths.loc[rem, f'phase{h}']
+                if np.sum(rem):
+                    scaffold_paths.loc[rem, ['phase0','con0','strand0','dist0']] = scaffold_paths.loc[rem, [f'phase{h}',f'con{h}',f'strand{h}',f'dist{h}']].values
+                    scaffold_paths.loc[rem, [f'con{h}',f'strand{h}',f'dist{h}']] = [-1,'',0]
+                    scaffold_paths.loc[rem, f'phase{h}'] = -scaffold_paths.loc[rem, f'phase{h}']
             # Finally split contig, where we do not have any valid connection
             scaffold_paths['split'] = scaffold_paths[['scaf','pos']].merge(rem_conns[['scaf','rpos']].rename(columns={'rpos':'pos'}), on=['scaf','pos'], how='left', indicator=True)['_merge'].values == "both"
             scaffold_paths['scaf'] = ((scaffold_paths['scaf'] != scaffold_paths['scaf'].shift(1)) | scaffold_paths['split']).cumsum()-1
@@ -7728,45 +7730,53 @@ def MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploi
 def CountResealedBreaks(result_info, scaffold_paths, contig_parts, ploidy):
     ## Get resealed breaks (Number of total contig_parts - minimum number of scaffold chunks needed to have them all included in the proper order)
     broken_contigs = contig_parts.reset_index().rename(columns={'index':'conpart'}).loc[(contig_parts['part'] > 0) | (contig_parts['part'].shift(-1) > 0), ['contig','part','conpart']]
-    # For this treat haplotypes as different scaffolds
-    resealed_breaks = scaffold_paths.loc[np.repeat(scaffold_paths.index.values, ploidy), ['scaf','pos']+[f'{n}{h}' for h in range(ploidy) for n in ['phase','con','strand']]]
-    resealed_breaks['hap'] = list(range(ploidy))*len(scaffold_paths)
-    resealed_breaks.rename(columns={'con0':'con','strand0':'strand'}, inplace=True)
-    for h in range(1,ploidy):
-        change = (resealed_breaks['hap'] == h) & (resealed_breaks[f'phase{h}'] >= 0)
-        resealed_breaks.loc[change, ['con','strand']] = resealed_breaks.loc[change, [f'con{h}',f'strand{h}']].values
-    resealed_breaks['scaf'] = resealed_breaks['scaf']*ploidy + resealed_breaks['hap']
-    resealed_breaks.drop(columns=['hap','phase0'] + [f'{n}{h}' for h in range(1,ploidy) for n in ['phase','con','strand']], inplace=True)
-    resealed_breaks = resealed_breaks[resealed_breaks['con'] >= 0].copy()
-    resealed_breaks.sort_values(['scaf','pos'], inplace=True)
-    resealed_breaks['pos'] = resealed_breaks.groupby(['scaf']).cumcount()
-    # Reduce scaffolds to the chunks of connected broken contig parts
-    resealed_breaks = resealed_breaks[np.isin(resealed_breaks['con'].values, broken_contigs['conpart'].values)].copy()
-    resealed_breaks['chunk'] = ( (resealed_breaks['scaf'] != resealed_breaks['scaf'].shift(1)) | (resealed_breaks['strand'] != resealed_breaks['strand'].shift(1)) |
-                                 (resealed_breaks['pos'] != resealed_breaks['pos'].shift(1)+1) | (resealed_breaks['con'] != resealed_breaks['con'].shift(1)+np.where(resealed_breaks['strand'] == '-', -1, 1))).cumsum()
-    resealed_breaks = resealed_breaks.groupby(['chunk'], sort=False)['con'].agg(['min','max']).reset_index(drop=True)
-    resealed_breaks = resealed_breaks[resealed_breaks['min'] < resealed_breaks['max']].sort_values(['min','max']).drop_duplicates()
-    resealed_breaks['group'] = (resealed_breaks['min'] > resealed_breaks['max'].shift(1)).cumsum()
-    resealed_breaks['length'] = resealed_breaks['max'] - resealed_breaks['min'] + 1
-    # Count resealed parts
-    resealed_parts = resealed_breaks.loc[np.repeat(resealed_breaks.index.values, resealed_breaks['length'].values)].reset_index()[['index','min']]
-    resealed_parts['conpart'] = resealed_parts['min'] + resealed_parts.groupby(['index'], sort=False).cumcount()
-    # num_resealed = Number of total contig_parts - number of contig_parts not sealed at all - number of scaffold chunks uniquely sealing contigs
-    num_resealed = len(broken_contigs) - len(np.setdiff1d(broken_contigs['conpart'].values, resealed_parts['conpart'].values)) - np.sum((resealed_breaks['group'] != resealed_breaks['group'].shift(1)) & (resealed_breaks['group'] != resealed_breaks['group'].shift(-1)))
-
-    # The non-unqiue sealing events still have to be processed
-    resealed_breaks = resealed_breaks[(resealed_breaks['group'] == resealed_breaks['group'].shift(1)) | (resealed_breaks['group'] == resealed_breaks['group'].shift(-1))].copy()
-    resealed_breaks = resealed_breaks.reset_index(drop=True).reset_index()
-    resealed_breaks['keep'] = False
-    while np.sum(False == resealed_breaks['keep']):
-        resealed_parts = resealed_breaks.loc[np.repeat(resealed_breaks.index.values, resealed_breaks['length'].values)].reset_index()[['index','min']]
-        resealed_parts['conpart'] = resealed_parts['min'] + resealed_parts.groupby(['index'], sort=False).cumcount()
-        resealed_parts = resealed_parts.groupby('conpart')['index'].agg(['first','size'])
-        resealed_breaks['keep'] = np.isin(resealed_breaks['index'], resealed_parts.loc[resealed_parts['size'] == 1, ['first']].reset_index()['first'].values) # Keep all chunks with unique contig parts
-        resealed_breaks.sort_values(['group','keep','length'], ascending=[True,False,False], inplace=True)
-        resealed_breaks = resealed_breaks[resealed_breaks['keep'] | (resealed_breaks['group'] == resealed_breaks['group'].shift(-1))].copy() # Remove shortest non-unqiue chunk in each group
-
-    result_info['breaks']['resealed'] = num_resealed - len(resealed_breaks)
+    if len(broken_contigs) == 0:
+        result_info['breaks']['resealed'] = 0
+    else:
+        # For this treat haplotypes as different scaffolds
+        resealed_breaks = scaffold_paths.loc[np.repeat(scaffold_paths.index.values, ploidy), ['scaf','pos']+[f'{n}{h}' for h in range(ploidy) for n in ['phase','con','strand']]]
+        if len(resealed_breaks):
+            resealed_breaks['hap'] = list(range(ploidy))*len(scaffold_paths)
+            resealed_breaks.rename(columns={'con0':'con','strand0':'strand'}, inplace=True)
+            for h in range(1,ploidy):
+                change = (resealed_breaks['hap'] == h) & (resealed_breaks[f'phase{h}'] >= 0)
+                resealed_breaks.loc[change, ['con','strand']] = resealed_breaks.loc[change, [f'con{h}',f'strand{h}']].values
+            resealed_breaks['scaf'] = resealed_breaks['scaf']*ploidy + resealed_breaks['hap']
+            resealed_breaks.drop(columns=['hap','phase0'] + [f'{n}{h}' for h in range(1,ploidy) for n in ['phase','con','strand']], inplace=True)
+            resealed_breaks = resealed_breaks[resealed_breaks['con'] >= 0].copy()
+        if len(resealed_breaks):
+            resealed_breaks.sort_values(['scaf','pos'], inplace=True)
+            resealed_breaks['pos'] = resealed_breaks.groupby(['scaf']).cumcount()
+            # Reduce scaffolds to the chunks of connected broken contig parts
+            resealed_breaks = resealed_breaks[np.isin(resealed_breaks['con'].values, broken_contigs['conpart'].values)].copy()
+            if len(resealed_breaks):
+                resealed_breaks['chunk'] = ( (resealed_breaks['scaf'] != resealed_breaks['scaf'].shift(1)) | (resealed_breaks['strand'] != resealed_breaks['strand'].shift(1)) |
+                                             (resealed_breaks['pos'] != resealed_breaks['pos'].shift(1)+1) | (resealed_breaks['con'] != resealed_breaks['con'].shift(1)+np.where(resealed_breaks['strand'] == '-', -1, 1))).cumsum()
+                resealed_breaks = resealed_breaks.groupby(['chunk'], sort=False)['con'].agg(['min','max']).reset_index(drop=True)
+                resealed_breaks = resealed_breaks[resealed_breaks['min'] < resealed_breaks['max']].sort_values(['min','max']).drop_duplicates()
+            if len(resealed_breaks):
+                resealed_breaks['group'] = (resealed_breaks['min'] > resealed_breaks['max'].shift(1)).cumsum()
+                resealed_breaks['length'] = resealed_breaks['max'] - resealed_breaks['min'] + 1
+                # Count resealed parts
+                resealed_parts = resealed_breaks.loc[np.repeat(resealed_breaks.index.values, resealed_breaks['length'].values)].reset_index()[['index','min']]
+                resealed_parts['conpart'] = resealed_parts['min'] + resealed_parts.groupby(['index'], sort=False).cumcount()
+        if len(resealed_breaks):
+            # num_resealed = Number of total contig_parts - number of contig_parts not sealed at all - number of scaffold chunks uniquely sealing contigs
+            num_resealed = len(broken_contigs) - len(np.setdiff1d(broken_contigs['conpart'].values, resealed_parts['conpart'].values)) - np.sum((resealed_breaks['group'] != resealed_breaks['group'].shift(1)) & (resealed_breaks['group'] != resealed_breaks['group'].shift(-1)))
+#
+            # The non-unqiue sealing events still have to be processed
+            resealed_breaks = resealed_breaks[(resealed_breaks['group'] == resealed_breaks['group'].shift(1)) | (resealed_breaks['group'] == resealed_breaks['group'].shift(-1))].copy()
+            resealed_breaks = resealed_breaks.reset_index(drop=True).reset_index()
+            resealed_breaks['keep'] = False
+            while np.sum(False == resealed_breaks['keep']):
+                resealed_parts = resealed_breaks.loc[np.repeat(resealed_breaks.index.values, resealed_breaks['length'].values)].reset_index()[['index','min']]
+                resealed_parts['conpart'] = resealed_parts['min'] + resealed_parts.groupby(['index'], sort=False).cumcount()
+                resealed_parts = resealed_parts.groupby('conpart')['index'].agg(['first','size'])
+                resealed_breaks['keep'] = np.isin(resealed_breaks['index'], resealed_parts.loc[resealed_parts['size'] == 1, ['first']].reset_index()['first'].values) # Keep all chunks with unique contig parts
+                resealed_breaks.sort_values(['group','keep','length'], ascending=[True,False,False], inplace=True)
+                resealed_breaks = resealed_breaks[resealed_breaks['keep'] | (resealed_breaks['group'] == resealed_breaks['group'].shift(-1))].copy() # Remove shortest non-unique chunk in each group
+#
+            result_info['breaks']['resealed'] = num_resealed - len(resealed_breaks)
 
     return result_info
 
@@ -8097,7 +8107,7 @@ def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     print( str(timedelta(seconds=clock())), "Scaffold the contigs")
     scaffold_paths, trim_repeats = ScaffoldContigs(contig_parts, bridges, mappings, cov_probs, repeats, prob_factor, min_mapping_length, max_dist_contig_end, prematurity_threshold, ploidy, max_loop_units)
     scaffold_paths, result_info = RemoveUnconnectedLowlyMappedOrDuplicatedContigs(scaffold_paths, result_info, mappings, contig_parts, cov_probs, repeats, ploidy, lowmap_threshold)
-    contig_parts, mappings = TrimDuplicatedEnds(contig_parts, mappings, repeats, trim_repeats, scaffold_paths, min_mapping_length, alignment_precision)
+    contig_parts, scaffold_paths, mappings = TrimDuplicatedEnds(contig_parts, scaffold_paths, mappings, repeats, trim_repeats, min_mapping_length, alignment_precision)
 #
     print( str(timedelta(seconds=clock())), "Fill gaps")
     mappings, scaffold_paths, overlap_bridges = MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploidy) # Might break apart scaffolds again, if we cannot find a mapping read for a connection
