@@ -21,7 +21,7 @@ import seaborn as sns
 import sys
 from time import clock
 
-def MiniGapSplit(fa_file,o_file=False,min_n=False):
+def GaplessSplit(fa_file,o_file=False,min_n=False):
     if False == o_file:
         if ".gz" == fa_file[-3:len(fa_file)]:
             o_file = fa_file.rsplit('.',2)[0]+"_split.fa"
@@ -1172,7 +1172,7 @@ def MaskRepeatEnds(contigs, repeat_file, contig_ids, max_repeat_extension, min_l
     
     # Add low complexity contigs and tandem repeats to complete_repeats, where you get a similar sequence when shifting the frame a bit
     # We want to keep them as they are no duplications but don't do anything with them afterwards, because the mappings cannot be anchored and are therefore likely at the wrong place
-    # The idea is to run minigap multiple times until another contig with a proper anchor is extended enough to overlap this contig and then it is removed as a duplicate
+    # The idea is to run gapless multiple times until another contig with a proper anchor is extended enough to overlap this contig and then it is removed as a duplicate
     complete_repeats = np.unique(np.concatenate([ complete_repeats, np.unique(repeat_table.loc[repeat_table['left_repeat'] & repeat_table['right_repeat'] & (repeat_table['q_id'] == repeat_table['t_id']), 'q_id'])]))
     # Mask the whole read, so mappings to it will be ignored, as we remove it anyways
     contigs.iloc[complete_repeats, contigs.columns.get_loc('repeat_mask_right')] = 0
@@ -8003,7 +8003,7 @@ def PrintStats(result_info):
     print("Output assembly:    {:8,.0f} contigs   (Total sequence: {:,.0f} Min: {:,.0f} Max: {:,.0f} N50: {:,.0f})".format(result_info['output']['contigs']['num'], result_info['output']['contigs']['total'], result_info['output']['contigs']['min'], result_info['output']['contigs']['max'], result_info['output']['contigs']['N50']))
     print("                    {:8,.0f} scaffolds (Total sequence: {:,.0f} Min: {:,.0f} Max: {:,.0f} N50: {:,.0f})".format(result_info['output']['scaffolds']['num'], result_info['output']['scaffolds']['total'], result_info['output']['scaffolds']['min'], result_info['output']['scaffolds']['max'], result_info['output']['scaffolds']['N50']))
 
-def MiniGapScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapping_length, min_length_contig_break, prefix=False, stats=None):
+def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapping_length, min_length_contig_break, prefix=False, stats=None):
     # Put in default parameters if nothing was specified
     if False == prefix:
         if ".gz" == assembly_file[-3:len(assembly_file)]:
@@ -8456,7 +8456,7 @@ def ExtendScaffolds(scaffold_paths, extensions, hap_merger, new_scaffolds, mappi
         
     return scaffold_paths, extension_info
 
-def MiniGapExtend(all_vs_all_mapping_file, prefix, min_length_contig_break):
+def GaplessExtend(all_vs_all_mapping_file, prefix, min_length_contig_break):
     # Define parameters
     min_extension = 500    
     min_num_reads = 3
@@ -8502,16 +8502,16 @@ def RemoveBubbleHaplotype(outpaths, hap, remove):
 #
     return outpaths
 
-def MiniGapFinish(assembly_file, read_file, read_format, scaffold_file, output_files, haplotypes):
+def GaplessFinish(assembly_file, read_file, read_format, scaffold_file, output_files, haplotypes):
     min_length = 600 # Minimum length for a contig or alternative haplotype to be in the output
     skip_length = 50 # Haplotypes with a length shorter than this get lowest priority for being included in the main scaffold for mixed mode
     merge_dist = 1000 # Alternative haplotypes separated by at max merge_dist of common sequence are merged and output as a whole alternative contig in mixed mode
 #
     if False == output_files[0]:
         if ".gz" == assembly_file[-3:len(assembly_file)]:
-            output_files[0] = assembly_file.rsplit('.',2)[0]+"_minigap.fa"
+            output_files[0] = assembly_file.rsplit('.',2)[0]+"_gapless.fa"
         else:
-            output_files[0] = assembly_file.rsplit('.',1)[0]+"_minigap.fa"
+            output_files[0] = assembly_file.rsplit('.',1)[0]+"_gapless.fa"
 #
     # Remove output files, such that we do not accidentially use an old one after a crash
     for f in output_files:
@@ -8929,7 +8929,7 @@ def DrawMappings(draw, fnt, regions, mappings, region_part_height, pixel_per_rea
         last_read_id = row.read_id
 
 
-def MiniGapVisualize(region_defs, mapping_file, output, min_mapq, min_mapping_length, min_length_contig_break, keep_all_subreads):
+def GaplessVisualize(region_defs, mapping_file, output, min_mapq, min_mapping_length, min_length_contig_break, keep_all_subreads):
     alignment_precision = 100
     max_dist_contig_end = 2000
     
@@ -11802,7 +11802,7 @@ def TestTraverseScaffoldGraph():
 #
     return failed
 
-def MiniGapTest():
+def GaplessTest():
     failed_tests = 0
     failed_tests += TestFindBreakPoints()
     failed_tests += TestDuplicationConflictResolution()
@@ -11816,11 +11816,11 @@ def MiniGapTest():
     
 def Usage(module=""):
     if "" == module:
-        print("Program: minigap")
+        print("Program: gapless")
         print("Version: 0.1")
         print("Contact: Stephan Schmeing <stephan.schmeing@uzh.ch>")
         print()
-        print("Usage:  minigap.py <module> [options]")
+        print("Usage:  gapless.py <module> [options]")
         print("Modules:")
         print("split         Splits scaffolds into contigs")
         print("scaffold      Scaffolds contigs and assigns reads to gaps")
@@ -11829,13 +11829,13 @@ def Usage(module=""):
         print("visualize     Visualizes regions to manually inspect breaks or joins")
         print("test          Short test")
     elif "split" == module:
-        print("Usage: minigap.py split [OPTIONS] {assembly}.fa")
+        print("Usage: gapless.py split [OPTIONS] {assembly}.fa")
         print("Splits scaffolds into contigs.")
         print("  -h, --help                Display this help and exit")
         print("  -n, --minN [int]          Minimum number of N's to split at that position (1)")
         print("  -o, --output FILE.fa      File to which the split sequences should be written to ({assembly}_split.fa)")
     elif "scaffold" == module:
-        print("Usage: minigap.py scaffold [OPTIONS] {assembly}.fa {mapping}.paf {repeat}.paf")
+        print("Usage: gapless.py scaffold [OPTIONS] {assembly}.fa {mapping}.paf {repeat}.paf")
         print("Scaffolds contigs and assigns reads to gaps.")
         print("  -h, --help                Display this help and exit")
         print("  -p, --prefix FILE         Prefix for output files ({assembly})")
@@ -11844,23 +11844,23 @@ def Usage(module=""):
         print("      --minMapLength INT    Minimum length of individual mappings of reads (400)")
         print("      --minMapQ INT         Minimum mapping quality of reads (20)")
     elif "extend" == module:
-        print("Usage: minigap.py extend -p {prefix} {all_vs_all}.paf")
+        print("Usage: gapless.py extend -p {prefix} {all_vs_all}.paf")
         print("Extend scaffold ends with reads reaching over the ends.")
         print("  -h, --help                Display this help and exit")
         print("  -p, --prefix FILE         Prefix for output files of scaffolding step (mandatory)")
         print("      --minLenBreak INT     Minimum length for two reads to diverge to consider them incompatible for this contig (1000)")
     elif "finish" == module:
-        print("Usage: minigap.py finish [OPTIONS] -s {scaffolds}.csv {assembly}.fa {reads}.fq")
+        print("Usage: gapless.py finish [OPTIONS] -s {scaffolds}.csv {assembly}.fa {reads}.fq")
         print("Creates previously defined scaffolds. Only providing necessary reads increases speed and substantially reduces memory requirements.")
         print("  -h, --help                Display this help and exit")
         print("  -f, --format FORMAT       Format of {reads}.fq (fasta/fastq) (Default: fastq if not determinable from read ending)")
         print("  -H, --hap INT             Haplotype starting from 0 written to {output} (default: optimal mix)")
         print("  --hap[1-9] INT            Haplotypes starting from 0 written to {out[1-9]} (default: optimal mix)")
-        print("  -o, --output FILE.fa      Output file for modified assembly ({assembly}_minigap.fa)")
+        print("  -o, --output FILE.fa      Output file for modified assembly ({assembly}_gapless.fa)")
         print("  --out[1-9] FILE.fa        Additional output files for modified assembly (deactivated)")
         print("  -s, --scaffolds FILE.csv  Csv file from previous steps describing the scaffolding (mandatory)")
     elif "visualize" == module:
-        print("Usage: minigap.py visualize [OPTIONS] -o {output}.pdf {mapping}.paf {scaffold}:{start}-{end} [{scaffold}:{start}-{end} ...]")
+        print("Usage: gapless.py visualize [OPTIONS] -o {output}.pdf {mapping}.paf {scaffold}:{start}-{end} [{scaffold}:{start}-{end} ...]")
         print("Visualizes specified regions to manually inspect breaks or joins.")
         print("  -h, --help                Display this help and exit")
         print("  -o, --output FILE.pdf     Output file for visualization (mandatory)")
@@ -11907,7 +11907,7 @@ def main(argv):
             Usage(module)
             sys.exit(1)
     
-        MiniGapSplit(args[0],o_file,min_n)
+        GaplessSplit(args[0],o_file,min_n)
     elif "scaffold" == module:
         try:
             optlist, args = getopt.getopt(argv, 'hp:s:', ['help','prefix=','stats=','--minLenBreak=','minMapLength=','minMapQ='])
@@ -11958,7 +11958,7 @@ def main(argv):
             Usage(module)
             sys.exit(2)
 
-        MiniGapScaffold(args[0], args[1], args[2], min_mapq, min_mapping_length, min_length_contig_break, prefix, stats)
+        GaplessScaffold(args[0], args[1], args[2], min_mapq, min_mapping_length, min_length_contig_break, prefix, stats)
     elif "extend" == module:
         try:
             optlist, args = getopt.getopt(argv, 'hp:', ['help','prefix=','--minLenBreak'])
@@ -11992,7 +11992,7 @@ def main(argv):
             Usage(module)
             sys.exit(1)
 
-        MiniGapExtend(args[0], prefix, min_length_contig_break)
+        GaplessExtend(args[0], prefix, min_length_contig_break)
     elif "finish" == module:
         num_slots = 10
         try:
@@ -12052,7 +12052,7 @@ def main(argv):
                 selected_output.append(output[i])
                 selected_haplotypes.append(haplotypes[i])
 
-        MiniGapFinish(args[0], args[1], read_format, scaffolds, selected_output, selected_haplotypes)
+        GaplessFinish(args[0], args[1], read_format, scaffolds, selected_output, selected_haplotypes)
     elif "visualize" == module:
         try:
             optlist, args = getopt.getopt(argv, 'ho:', ['help','output=','--keepAllSubreads','--minLenBreak=','minMapLength=','minMapQ='])
@@ -12103,9 +12103,9 @@ def main(argv):
             Usage(module)
             sys.exit(1)
             
-        MiniGapVisualize(args[1:], args[0], output, min_mapq, min_mapping_length, min_length_contig_break, keep_all_subreads)
+        GaplessVisualize(args[1:], args[0], output, min_mapq, min_mapping_length, min_length_contig_break, keep_all_subreads)
     elif "test" == module:
-        MiniGapTest()
+        GaplessTest()
     else:
         print("Unknown module: {}.".format(module))
         Usage()
