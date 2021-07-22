@@ -4837,14 +4837,15 @@ def MergeHaplotypes(scaffold_paths, graph_ext, scaf_bridges, ploidy, ends_in=[])
                 groups = groups.merge(groups.rename(columns={'agroup':'bgroup','bgroup':'agroup'}), on=['agroup','bgroup'], how='inner')
                 groups = groups[groups['agroup'] < groups['bgroup']].rename(columns={'bgroup':'group','agroup':'new_group'})
                 if len(groups) == 0 and error_shown == False:
-                    print("Error: Stuck in an endless loop while regrouping in MergeHaplotypes.")
+                    raise RuntimeError("Error: Stuck in an endless loop while regrouping in MergeHaplotypes.")
                 for p in ['a','b']:
                     duplications['new_group'] = duplications[[f'{p}group']].rename(columns={f'{p}group':'group'}).merge(groups, on=['group'], how='left')['new_group'].values
                     duplications.loc[np.isnan(duplications['new_group']) == False, f'{p}group'] = duplications.loc[np.isnan(duplications['new_group']) == False, 'new_group'].astype(int)
+                duplications.drop(columns=['new_group'], inplace=True)
             else:
                 break
         duplications['group'] = duplications['agroup']
-        duplications.drop(columns=['agroup','bgroup','new_group'], inplace=True)
+        duplications.drop(columns=['agroup','bgroup'], inplace=True)
 #
     if len(duplications):
         # Get minimum difference to another haplotype in group
@@ -7392,28 +7393,33 @@ def BasicMappingToScaffolds(mappings, all_scafs):
         else:
             groups = groups.merge(new_groups, on=['group'], how='outer')
     mappings.drop(columns=['check_pos'], inplace=True)
-    for d in ['l','r']:
-        groups.loc[np.isnan(groups[f'{d}group']), f'{d}group'] = groups.loc[np.isnan(groups[f'{d}group']), 'group']
-    groups = groups.astype(int)
-    groups['new_group'] = groups.min(axis=1)
-    while True:
-        # Assign lowest connected group to all groups
-        groups['check'] = groups['new_group']
-        groups = groups.merge(groups[['group','new_group']].rename(columns={'group':'lgroup','new_group':'lngroup'}), on=['lgroup'], how='left')
-        groups = groups.merge(groups[['group','new_group']].rename(columns={'group':'rgroup','new_group':'rngroup'}), on=['rgroup'], how='left')
-        groups['new_group'] = groups[['new_group','lngroup','rngroup']].min(axis=1).astype(int)
-        groups.drop(columns=['lngroup','rngroup'], inplace=True)
-        groups.drop_duplicates(inplace=True)
-        groups = groups.groupby(['group','lgroup','rgroup','check'])['new_group'].min().reset_index()
-        tmp = groups.groupby(['group'], sort=False)['new_group'].agg(['min','size'])
-        groups['new_group'] = np.repeat(tmp['min'].values, tmp['size'].values)
-        if np.sum(groups['new_group'] != groups['check']) == 0:
-            groups = groups.groupby(['group'])['new_group'].max().reset_index()
-            break
-    groups = groups.loc[groups['group'] != groups['new_group'], :]
-    mappings = mappings.merge(groups, on=['group'], how='left')
-    mappings.loc[np.isnan(mappings['new_group']) == False, 'group'] = mappings.loc[np.isnan(mappings['new_group']) == False, 'new_group'].astype(int)
-    mappings.drop(columns=['new_group'], inplace=True)
+    if len(groups):
+        for d in ['l','r']:
+            if f'{d}group' in groups.columns:
+                groups.loc[np.isnan(groups[f'{d}group']), f'{d}group'] = groups.loc[np.isnan(groups[f'{d}group']), 'group']
+            else:
+                groups[f'{d}group'] = groups['group']
+        groups = groups.astype(int)
+        groups['new_group'] = groups.min(axis=1)
+        while True:
+            # Assign lowest connected group to all groups
+            groups['check'] = groups['new_group']
+            groups = groups.merge(groups[['group','new_group']].rename(columns={'group':'lgroup','new_group':'lngroup'}), on=['lgroup'], how='left')
+            groups = groups.merge(groups[['group','new_group']].rename(columns={'group':'rgroup','new_group':'rngroup'}), on=['rgroup'], how='left')
+            groups['new_group'] = groups[['new_group','lngroup','rngroup']].min(axis=1).astype(int)
+            groups.drop(columns=['lngroup','rngroup'], inplace=True)
+            groups.drop_duplicates(inplace=True)
+            groups = groups.groupby(['group','lgroup','rgroup','check'])['new_group'].min().reset_index()
+            tmp = groups.groupby(['group'], sort=False)['new_group'].agg(['min','size'])
+            groups['new_group'] = np.repeat(tmp['min'].values, tmp['size'].values)
+            if np.sum(groups['new_group'] != groups['check']) == 0:
+                groups = groups.groupby(['group'])['new_group'].max().reset_index()
+                break
+        groups = groups[groups['group'] != groups['new_group']].copy()
+        mappings['new_group'] = mappings[['group']].merge(groups, on=['group'], how='left')['new_group'].values
+        if np.sum(np.isnan(mappings['new_group']) == False):
+            mappings.loc[np.isnan(mappings['new_group']) == False, 'group'] = mappings.loc[np.isnan(mappings['new_group']) == False, 'new_group'].astype(int)
+        mappings.drop(columns=['new_group'], inplace=True)
     # If a read matches multiple haplotypes of the same read they might end up in the same group. To resolve this, duplicate the groups.
     merged_groups = mappings.groupby(['group','read_pos']).size()
     merged_groups = merged_groups[merged_groups > 1].reset_index()[['group']].drop_duplicates()
@@ -7531,37 +7537,37 @@ def MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploi
             zero_cov = zero_cov.merge(overlap_bridges[['q_con','q_side','t_con','t_side']], on=['q_con','q_side','t_con','t_side'], how='inner')
             conn_cov.loc[ conn_cov[['scaf','lpos','rpos','hap']].merge(zero_cov[['scaf','lpos','rpos','hap']], on=['scaf','lpos','rpos','hap'], how='left', indicator=True)['_merge'].values == "both", ['cov','ucov']] = 1
 #
-        # Try to fix scaffold_paths, where no reads support the connection
-        # Start by getting mappings that have both sides in them
-        unsupp_conns = conn_cov[conn_cov['ucov'] == 0].copy()
-        if len(unsupp_conns):
-            unsupp_conns = unsupp_conns.merge(scaffold_paths[['scaf','pos']+[f'con{h}' for h in range(ploidy)]].rename(columns={'pos':'lpos','con0':'lcon'}), on=['scaf','lpos'], how='left')
-            for h in range(1,ploidy):
-                sel = (h == unsupp_conns['hap']) & (unsupp_conns[f'con{h}'] >= 0)
-                unsupp_conns.loc[sel, 'lcon'] = unsupp_conns.loc[sel, f'con{h}'] 
-            unsupp_conns.drop(columns=[f'con{h}' for h in range(1,ploidy)], inplace=True)
-            unsupp_conns = unsupp_conns.merge(scaffold_paths[['scaf','pos']+[f'con{h}' for h in range(ploidy)]].rename(columns={'pos':'rpos','con0':'rcon'}), on=['scaf','rpos'], how='left')
-            for h in range(1,ploidy):
-                sel = (h == unsupp_conns['hap']) & (unsupp_conns[f'con{h}'] >= 0)
-                unsupp_conns.loc[sel, 'rcon'] = unsupp_conns.loc[sel, f'con{h}'] 
-            unsupp_conns.drop(columns=[f'con{h}' for h in range(1,ploidy)], inplace=True)
-            lreads = unsupp_conns[['lcon']].reset_index().merge(org_mappings[['conpart','read_name']].rename(columns={'conpart':'lcon'}), on=['lcon'], how='inner')
-            rreads = unsupp_conns[['rcon']].reset_index().merge(org_mappings[['conpart','read_name']].rename(columns={'conpart':'rcon'}), on=['rcon'], how='inner')
-            supp_reads = lreads.drop(columns=['lcon']).merge(rreads.drop(columns=['rcon']), on=['index','read_name'], how='inner')[['read_name']].drop_duplicates()
-            # Remove reads that already have a valid mapping to scaffold_paths
-            supp_reads = supp_reads.loc[supp_reads.merge(mappings[['read_name']].drop_duplicates(), on=['read_name'], how='left', indicator=True)['_merge'].values == "left_only", :]
-            supp_reads = supp_reads.loc[supp_reads.merge(dups_maps[['read_name']].drop_duplicates(), on=['read_name'], how='left', indicator=True)['_merge'].values == "left_only", :]
-            supp_reads = supp_reads.merge(org_mappings, on=['read_name'], how='inner')
-            supp_reads.sort_values(['read_name','read_start','read_pos'], inplace=True)
-            # Remove the unsupported connections from all_scafs and try mapping supp_reads again
-            all_scafs.loc[all_scafs[['scaf','pos','rhap']].merge(unsupp_conns[['scaf','lpos','hap']].rename(columns={'lpos':'pos','hap':'rhap'}), on=['scaf','pos','rhap'], how='left', indicator=True)['_merge'].values == "both", ['rpos','rcon','rstrand','rdist','rdmin','rdmax']] = [-1,-1,'',0,-int(sys.maxsize*0.99),int(sys.maxsize)*0.99]
-            all_scafs.loc[all_scafs[['scaf','pos','lhap']].merge(unsupp_conns[['scaf','rpos','hap']].rename(columns={'rpos':'pos','hap':'lhap'}), on=['scaf','pos','lhap'], how='left', indicator=True)['_merge'].values == "both", ['lpos','lcon','lstrand','ldist','ldmin','ldmax']] = [-1,-1,'',0,-int(sys.maxsize*0.99),int(sys.maxsize)*0.99]
-            supp_reads = BasicMappingToScaffolds(supp_reads, all_scafs)
-            # Only keep supp_reads that still map to both sides of a the unsupported connection
-            lreads = unsupp_conns[['lcon']].reset_index().merge(supp_reads[['conpart','read_name']].rename(columns={'conpart':'lcon'}), on=['lcon'], how='inner')
-            rreads = unsupp_conns[['rcon']].reset_index().merge(supp_reads[['conpart','read_name']].rename(columns={'conpart':'rcon'}), on=['rcon'], how='inner')
-            supp_reads = lreads.drop(columns=['lcon']).merge(rreads.drop(columns=['rcon']), on=['index','read_name'], how='inner')[['read_name']].drop_duplicates().merge(supp_reads, on=['read_name'], how='inner')
-            supp_reads.sort_values(['read_name','read_start','read_pos'], inplace=True)
+#        # Try to fix scaffold_paths, where no reads support the connection
+#        # Start by getting mappings that have both sides in them
+#        unsupp_conns = conn_cov[conn_cov['ucov'] == 0].copy()
+#        if len(unsupp_conns):
+#            unsupp_conns = unsupp_conns.merge(scaffold_paths[['scaf','pos']+[f'con{h}' for h in range(ploidy)]].rename(columns={'pos':'lpos','con0':'lcon'}), on=['scaf','lpos'], how='left')
+#            for h in range(1,ploidy):
+#                sel = (h == unsupp_conns['hap']) & (unsupp_conns[f'con{h}'] >= 0)
+#                unsupp_conns.loc[sel, 'lcon'] = unsupp_conns.loc[sel, f'con{h}'] 
+#            unsupp_conns.drop(columns=[f'con{h}' for h in range(1,ploidy)], inplace=True)
+#            unsupp_conns = unsupp_conns.merge(scaffold_paths[['scaf','pos']+[f'con{h}' for h in range(ploidy)]].rename(columns={'pos':'rpos','con0':'rcon'}), on=['scaf','rpos'], how='left')
+#            for h in range(1,ploidy):
+#                sel = (h == unsupp_conns['hap']) & (unsupp_conns[f'con{h}'] >= 0)
+#                unsupp_conns.loc[sel, 'rcon'] = unsupp_conns.loc[sel, f'con{h}'] 
+#            unsupp_conns.drop(columns=[f'con{h}' for h in range(1,ploidy)], inplace=True)
+#            lreads = unsupp_conns[['lcon']].reset_index().merge(org_mappings[['conpart','read_name']].rename(columns={'conpart':'lcon'}), on=['lcon'], how='inner')
+#            rreads = unsupp_conns[['rcon']].reset_index().merge(org_mappings[['conpart','read_name']].rename(columns={'conpart':'rcon'}), on=['rcon'], how='inner')
+#            supp_reads = lreads.drop(columns=['lcon']).merge(rreads.drop(columns=['rcon']), on=['index','read_name'], how='inner')[['read_name']].drop_duplicates()
+#            # Remove reads that already have a valid mapping to scaffold_paths
+#            supp_reads = supp_reads.loc[supp_reads.merge(mappings[['read_name']].drop_duplicates(), on=['read_name'], how='left', indicator=True)['_merge'].values == "left_only", :]
+#            supp_reads = supp_reads.loc[supp_reads.merge(dups_maps[['read_name']].drop_duplicates(), on=['read_name'], how='left', indicator=True)['_merge'].values == "left_only", :]
+#            supp_reads = supp_reads.merge(org_mappings, on=['read_name'], how='inner')
+#            supp_reads.sort_values(['read_name','read_start','read_pos'], inplace=True)
+#            # Remove the unsupported connections from all_scafs and try mapping supp_reads again
+#            all_scafs.loc[all_scafs[['scaf','pos','rhap']].merge(unsupp_conns[['scaf','lpos','hap']].rename(columns={'lpos':'pos','hap':'rhap'}), on=['scaf','pos','rhap'], how='left', indicator=True)['_merge'].values == "both", ['rpos','rcon','rstrand','rdist','rdmin','rdmax']] = [-1,-1,'',0,-int(sys.maxsize*0.99),int(sys.maxsize)*0.99]
+#            all_scafs.loc[all_scafs[['scaf','pos','lhap']].merge(unsupp_conns[['scaf','rpos','hap']].rename(columns={'rpos':'pos','hap':'lhap'}), on=['scaf','pos','lhap'], how='left', indicator=True)['_merge'].values == "both", ['lpos','lcon','lstrand','ldist','ldmin','ldmax']] = [-1,-1,'',0,-int(sys.maxsize*0.99),int(sys.maxsize)*0.99]
+#            supp_reads = BasicMappingToScaffolds(supp_reads, all_scafs)
+#            # Only keep supp_reads that still map to both sides of a the unsupported connection
+#            lreads = unsupp_conns[['lcon']].reset_index().merge(supp_reads[['conpart','read_name']].rename(columns={'conpart':'lcon'}), on=['lcon'], how='inner')
+#            rreads = unsupp_conns[['rcon']].reset_index().merge(supp_reads[['conpart','read_name']].rename(columns={'conpart':'rcon'}), on=['rcon'], how='inner')
+#            supp_reads = lreads.drop(columns=['lcon']).merge(rreads.drop(columns=['rcon']), on=['index','read_name'], how='inner')[['read_name']].drop_duplicates().merge(supp_reads, on=['read_name'], how='inner')
+#            supp_reads.sort_values(['read_name','read_start','read_pos'], inplace=True)
             # Remove supp_reads, where read_pos have been filtered out between both sides of the unsupported connection
             
             # supp_reads[supp_reads['scaf'] == 214].drop(columns=['read_start','read_end','read_from','read_to','con_from','con_to','matches','lmatches','rmatches'])
