@@ -8610,21 +8610,21 @@ def GaplessFinish(assembly_file, read_file, read_format, scaffold_file, output_f
                 outpaths = RemoveBubbleHaplotype(outpaths, h, outpaths['identical'] | outpaths['identical2'])
             outpaths.drop(columns=['identical','identical2'], inplace=True)
             # Take the worst to map (shortest) haplotype as main, except if we are going to remove the alternative, because it is shorter min_length: than keep longest by putting it in main (bubble pathes shorter than skip_length are only kept by putting it into main if no longer path exist, because they can be easily recreated from reads)
-            for h in range(ploidy):
-                outpaths[f'len{h}'] = np.where(outpaths[f'phase{h}'] < 0, outpaths['len0'], outpaths[f'end{h}']-outpaths[f'start{h}'])
-            bubbles = outpaths.groupby(['bubble'])[[f'len{h}' for h in range(ploidy)]].sum().reset_index()
-            bubbles = bubbles.merge(outpaths.groupby(['bubble'])[[f'phase{h}' for h in range(1,ploidy)]].max().reset_index(), on=['bubble'], how='left')
-            bubbles = bubbles.loc[(bubbles[[f'phase{h}' for h in range(1,ploidy)]] > 0).any(axis=1), ['bubble']+[f'len{h}' for h in range(ploidy)]].melt(id_vars='bubble',var_name='hap',value_name='len')
-            bubbles['hap'] = bubbles['hap'].str[3:].astype(int)
-            bubbles['prio'] = np.where(bubbles['len'] >= min_length, 2, np.where(bubbles['len'] < skip_length, 3, 1))
-            bubbles.loc[bubbles['len'] < min_length, 'len'] = -bubbles.loc[bubbles['len'] < min_length, 'len'] # For everything shorter than min_length we want the longest not the shortest
-            bubbles.sort_values(['bubble','prio','len','hap'], inplace=True) # Sort by hap to keep main if no reason to switch
-            bubbles = bubbles.groupby(['bubble'], sort=False).first().reset_index()
-            bubbles = bubbles[bubbles['hap'] > 0].copy()
-            outpaths = outpaths.merge(bubbles[['bubble','hap']].rename(columns={'hap':'switch'}), on=['bubble'], how='left')
-            for h in range(1,ploidy):
-                outpaths = SwitchBubbleWithMain(outpaths, h, outpaths['switch']==h)
-            outpaths.drop(columns=['len0','len1','switch'], inplace=True)
+            #for h in range(ploidy):
+            #    outpaths[f'len{h}'] = np.where(outpaths[f'phase{h}'] < 0, outpaths['len0'], outpaths[f'end{h}']-outpaths[f'start{h}'])
+            #bubbles = outpaths.groupby(['bubble'])[[f'len{h}' for h in range(ploidy)]].sum().reset_index()
+            #bubbles = bubbles.merge(outpaths.groupby(['bubble'])[[f'phase{h}' for h in range(1,ploidy)]].max().reset_index(), on=['bubble'], how='left')
+            #bubbles = bubbles.loc[(bubbles[[f'phase{h}' for h in range(1,ploidy)]] > 0).any(axis=1), ['bubble']+[f'len{h}' for h in range(ploidy)]].melt(id_vars='bubble',var_name='hap',value_name='len')
+            #bubbles['hap'] = bubbles['hap'].str[3:].astype(int)
+            #bubbles['prio'] = np.where(bubbles['len'] >= min_length, 2, np.where(bubbles['len'] < skip_length, 3, 1))
+            #bubbles.loc[bubbles['len'] < min_length, 'len'] = -bubbles.loc[bubbles['len'] < min_length, 'len'] # For everything shorter than min_length we want the longest not the shortest
+            #bubbles.sort_values(['bubble','prio','len','hap'], inplace=True) # Sort by hap to keep main if no reason to switch
+            #bubbles = bubbles.groupby(['bubble'], sort=False).first().reset_index()
+            #bubbles = bubbles[bubbles['hap'] > 0].copy()
+            #outpaths = outpaths.merge(bubbles[['bubble','hap']].rename(columns={'hap':'switch'}), on=['bubble'], how='left')
+            #for h in range(1,ploidy):
+            #    outpaths = SwitchBubbleWithMain(outpaths, h, outpaths['switch']==h)
+            #outpaths.drop(columns=['len0','len1','switch'], inplace=True)
             # Separate every alternative from a bubble into its own haplotype
             outpaths.rename(columns={'name0':'name','start0':'start','end0':'end','strand0':'strand'}, inplace=True)
             alternatives = []
