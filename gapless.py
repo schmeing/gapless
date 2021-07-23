@@ -385,6 +385,8 @@ def GetBestSubreads(mappings, alignment_precision):
 
 def ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, alignment_precision, num_read_len_groups, pdf):
     mappings = ReadPaf(mapping_file)
+    if len(mappings) == 0:
+        raise RuntimeError("Read mapping file empty.")
 
     length_thresholds = GetThresholdsFromReadLenDist(mappings, num_read_len_groups)
     cov_counts = GetBinnedCoverage(mappings, length_thresholds)
