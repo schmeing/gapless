@@ -3295,7 +3295,7 @@ def FindConnectionsBetweenLoopUnits(loops, scaffold_graph, full_info):
             if len(overlapping_units):
                 loop_conns = pd.concat([loop_conns, overlapping_units], ignore_index=True)
             # If multiple starting positions of unit 2 exist in unit 1 take the first, such that we have the minimum length of the combined unit
-            loop_conns = loop_conns.groupby(['lindex1','dir1','lindex2','dir2','wildcard'])['sfrom'].min().reset_index()
+            loop_conns = loop_conns.groupby(['lindex1','dir1','lindex2','dir2'])[['wildcard','sfrom']].min().reset_index()
             # Prepare possible extensions of the loop units
             if len(extensions):
                 extensions = extendible.merge(extensions, on=['index1'], how='inner').drop(columns=['index1'])
@@ -3432,7 +3432,7 @@ def TurnHorizontalPathIntoVertical(vpaths, min_path_id):
 #
     return hpaths
 
-def AddPathThroughLoops(scaffold_paths, scaffold_graph, scaf_bridges, org_scaf_conns, ploidy, max_loop_units):
+def AddPathThroughLoops(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges, org_scaf_conns, ploidy, max_loop_units):
     loop_scafs = FindScaffoldsConnectedToLoops(scaffold_graph)
 #
     if len(loop_scafs):
@@ -3612,6 +3612,7 @@ def AddPathThroughLoops(scaffold_paths, scaffold_graph, scaf_bridges, org_scaf_c
             exit_conns = exit_conns[exit_conns['from_units'] <= ploidy].copy()
         exit_conns['ifrom'] = exit_conns.index.values
         exit_conns = exit_conns.merge( exit_conns[['loop','from','from_side','to','to_side','distance','from_alts','from_units','ifrom']].rename(columns={'from':'to','from_side':'to_side','to':'from','to_side':'from_side','from_alts':'to_alts','from_units':'to_units','ifrom':'ito'}), on=['loop','from','from_side','to','to_side','distance'], how='inner')
+        exit_conns.drop_duplicates(inplace=True)
 #
     # Handle direct connections, where no loop unit fits in by chosing one side and then extending it with the other side
     if len(exit_conns) and len(loops):
@@ -3634,6 +3635,52 @@ def AddPathThroughLoops(scaffold_paths, scaffold_graph, scaf_bridges, org_scaf_c
     if len(direct_conns):
         direct_conns = AppendScaffoldsToExitConnection(direct_conns)
         CheckConsistencyOfVerticalPaths(direct_conns)
+    # Remove direct conns, where the extensions do not match
+    if len(direct_conns):
+        # Check where the extensions overlap
+        direct_conns['lena'] = direct_conns[['ifrom','ito']].merge(exit_conns[['ifrom','ito','length']], on=['ifrom','ito'], how='left')['length'].values
+        direct_conns['lenb'] = direct_conns[['ifrom','ito']].merge(exit_conns[['ifrom','ito','length']].rename(columns={'ifrom':'ito','ito':'ifrom'}), on=['ifrom','ito'], how='left')['length'].values
+        direct_conns['startb'] = direct_conns['length'] - direct_conns['lenb']
+        # Prepare ends
+        ends = direct_conns[['ifrom','ito','lena','startb']].copy()
+        ends['amin'] = ends['startb']
+        ends['amax'] = ends['lena'] - 1
+        ends['bmin'] = 0
+        ends['bmax'] = ends['lena'] - ends['startb'] - 1
+        ends.drop(columns={'lena','startb'}, inplace=True)
+        ends['aside'] = 'r'
+        ends['bside'] = 'l'
+        ends[['ahap','bhap']] = 0
+        ends.rename(columns={'ifrom':'apid','ito':'bpid'}, inplace=True)
+        ends = pd.concat([ends, ends.rename(columns={'apid':'bpid','bpid':'apid','aside':'bside','bside':'aside','amin':'bmin','bmin':'amin','amax':'bmax','bmax':'amax'})], ignore_index=True)
+        # Prepare paths
+        test_paths = direct_conns[['ifrom','from','from_side']].rename(columns={'ifrom':'pid','from':'scaf0','from_side':'strand0'})
+        test_paths['strand0'] = np.where(test_paths['strand0'] == 'r', '+', '-')
+        test_paths['pos'] = 0
+        test_paths['dist0'] = 0
+        test_paths = [test_paths]
+        for s in range(1, direct_conns['lena'].max()):
+            test_paths.append( direct_conns.loc[direct_conns['lena'] > s, ['ifrom',f'scaf{s}',f'strand{s}',f'dist{s}']].rename(columns={'ifrom':'pid',f'scaf{s}':'scaf0',f'strand{s}':'strand0',f'dist{s}':'dist0'}) )
+            test_paths[-1]['pos'] = s
+        for s in range(direct_conns['startb'].min(), direct_conns['length'].max()):
+            test_paths.append( direct_conns.loc[(direct_conns['startb'] <= s) & (direct_conns['length'] > s), ['ito',f'scaf{s}',f'strand{s}',f'dist{s}']].rename(columns={'ito':'pid',f'scaf{s}':'scaf0',f'strand{s}':'strand0',f'dist{s}':'dist0'}) )
+            test_paths[-1]['pos'] = s
+        test_paths = pd.concat(test_paths, ignore_index=True)
+        test_paths.sort_values(['pid','pos'], inplace=True)
+        test_paths.drop_duplicates(inplace=True) # We might add the same paths from multiple combinations of ifrom with ito or vice versa
+        test_paths['pos'] = test_paths.groupby(['pid'], sort=False).cumcount()
+        test_paths['dist0'] = np.where(test_paths['pos'] == 0, 0, test_paths['dist0'].astype(int))
+        test_paths['scaf0'] = test_paths['scaf0'].astype(int)
+        test_paths['phase0'] = test_paths['pid'] + 1
+        # Check validity
+        ends = FilterInvalidConnections(ends, test_paths, graph_ext, 1)
+        if len(ends):
+            ends[ends['valid_path'] == 'ab'].drop(columns='valid_path', inplace=True)
+        if len(ends):
+            direct_conns.drop(columns={'lena','lenb','startb'}, inplace=True)
+            direct_conns = direct_conns.merge(ends[['apid','bpid']].rename(columns={'apid':'ifrom','bpid':'ito'}), on=['ifrom','ito'], how='inner')
+        else:
+            direct_conns = []
     # If we do not have loop units and cannot build a direct connection, we cannot use the exit_conns
     if len(loops) == 0:
         exit_conns = []
@@ -5352,10 +5399,10 @@ def SelectBestConnections(ends, scaffold_paths, scaffold_graph, ploidy):
                         for s in range(pairs['length'].max()):
                             cur = (pairs['length'] > s) & pairs['match']
                             pairs.loc[cur, 'match'] = ( pairs.loc[cur, ['epid']].rename(columns={'epid':'pid'}).merge(pathb[pathb['pos'] == s], on=['pid'], how='left')[['scaf','strand','dist']].values == patha_ext.loc[pairs.loc[cur, 'eindex'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values ).all(axis=1)
-                    # Remove ends without a matching pairing
-                    pairs = pairs.groupby(['endindex'])['match'].max().reset_index()
-                    pairs = pairs[pairs['match'] == False].drop(columns=['match'])
-                    ends.drop(pairs['endindex'].values, inplace=True)
+                        # Remove ends without a matching pairing
+                        pairs = pairs.groupby(['endindex'])['match'].max().reset_index()
+                        pairs = pairs[pairs['match'] == False].drop(columns=['match'])
+                        ends.drop(pairs['endindex'].values, inplace=True)
                 # Remove handled branch_points and go to next ones
                 branch_points['trim'] = np.where(branch_points['opid'] == branch_points['opid'].shift(1), branch_points['pos'].shift(1, fill_value=0) - branch_points['pos'], -1)
                 branch_points = branch_points[branch_points['trim'] > 0].copy()
@@ -5724,6 +5771,10 @@ def SwitchHaplotypesToCreateMatches(scaffold_paths, ends, ploidy):
     # Switching haplotypes might also help to make paths connectable
     connectable = ends[ends['valid_overlap'] | (ends['dup_hap'] != '')].drop(columns=['valid_overlap','valid_path'])
     connectable.rename(columns={'dup_hap':'switchcol'}, inplace=True)
+    dupa = connectable[['apid','bpid']].merge(connectable.loc[connectable['switchcol'] == 'b', ['apid','bpid']].drop_duplicates(), on=['apid','bpid'], how='left', indicator=True)['_merge'].values == "both"
+    dupb = connectable[['apid','bpid']].merge(connectable.loc[connectable['switchcol'] == 'a', ['apid','bpid']].drop_duplicates(), on=['apid','bpid'], how='left', indicator=True)['_merge'].values == "both"
+    connectable.loc[dupa & (dupb == False), 'switchcol'] = 'b' # We need consistent switchcols within pids
+    connectable = connectable[(dupa & dupb) == False].copy() 
     connectable['switchcol'] = np.where(connectable['switchcol'] != 'b', 'b', 'a') # Switch the column that is not a duplicated haplotype, because switching a duplicated haplotype to a position lower than the duplicate would remove that status (as we always want to keep one version and chose the lowest haplotype with that version for it)
     connectable['nhaps'] = np.minimum(connectable['anhaps'], connectable['bnhaps'])
     connectable = connectable[(connectable['ahap'] < connectable['nhaps']) & (connectable['bhap'] < connectable['nhaps'])].drop(columns=['anhaps','bnhaps'])
@@ -5741,7 +5792,7 @@ def SwitchHaplotypesToCreateMatches(scaffold_paths, ends, ploidy):
             switches = switches.groupby(['apid','bpid']).first().reset_index() # Only one switch per meta_paths per round to avoid conflicts
             switches.rename(columns={f'new_{p2}hap':f'{p2}hap',f'new_{p1}hap':f'new_{p2}hap'}, inplace=True)
             switches = pd.concat([switches.rename(columns={f'new_{p2}hap':f'{p2}hap',f'{p2}hap':f'new_{p2}hap'}), switches], ignore_index=True)
-            switches = connectable[['apid','bpid',f'new_{p2}hap']].rename(columns={f'new_{p2}hap':f'{p2}hap'}).merge(switches, on=['apid','bpid',f'{p2}hap'], how='left')[f'new_{p2}hap'].values
+            switches = connectable[['apid','bpid',f'new_{p2}hap']].rename(columns={f'new_{p2}hap':f'{p2}hap'}).merge(switches.drop_duplicates(), on=['apid','bpid',f'{p2}hap'], how='left')[f'new_{p2}hap'].values
             connectable[f'new_{p2}hap'] = np.where(np.isnan(switches), connectable[f'new_{p2}hap'], switches).astype(int)
         connectable['old_nmatches'] = connectable['nmatches']
         connectable['nmatches'] = connectable[['apid','bpid']].merge(connectable[connectable['new_ahap'] == connectable['new_bhap']].groupby(['apid','bpid']).size().reset_index(name='matches'), on=['apid','bpid'], how='left')['matches'].fillna(0).values.astype(int)
@@ -6660,6 +6711,7 @@ def TrimCircularPaths(scaffold_paths, ploidy):
 
 def TestPrint(scaffold_paths):
     #print(scaffold_paths)
+    #print( scaffold_paths[np.isin(scaffold_paths['pid'], scaffold_paths.loc[np.isin(scaffold_paths['scaf0'], [57465,57466]), 'pid'].values )] )
     #print( scaffold_paths[np.isin(scaffold_paths['pid'], scaffold_paths.loc[np.isin(scaffold_paths['scaf0'], [9064, 41269, 51925, 67414, 123224, 123225, 123226, 123227, 123228, 123229, 123230, 123231, 123236, 123237, 123238]), 'pid'].values )] ) # Test 6
     #print( scaffold_paths[np.isin(scaffold_paths['pid'], scaffold_paths.loc[np.isin(scaffold_paths['scaf0'], [7, 1440, 7349, 10945, 11769, 23515, 29100, 30446, 31108, 31729, 31737, 31758, 32135, 32420, 45782, 45783, 47750, 49372, 54753, 74998, 76037, 86633, 93920, 95291, 105853, 110006, 113898]), 'pid'].values )] ) # Test 5
     return
@@ -6667,7 +6719,7 @@ def TestPrint(scaffold_paths):
 def TraverseScaffoldGraph(scaffolds, scaffold_graph, graph_ext, scaf_bridges, org_scaf_conns, ploidy, max_loop_units):
     # Get phased haplotypes
     scaffold_paths, handled_origins = FollowUniquePathsThroughGraph(graph_ext)
-    scaffold_paths, handled_scaf_conns = AddPathThroughLoops(scaffold_paths, scaffold_graph, scaf_bridges, org_scaf_conns, ploidy, max_loop_units)
+    scaffold_paths, handled_scaf_conns = AddPathThroughLoops(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges, org_scaf_conns, ploidy, max_loop_units)
     scaffold_paths, handled_scaf_conns = AddPathThroughInvertedRepeats(scaffold_paths, handled_scaf_conns, scaffold_graph, scaf_bridges, ploidy)
     scaffold_paths = AddUntraversedConnectedPaths(scaffold_paths, graph_ext, handled_origins, handled_scaf_conns)
     scaffold_paths = AddUnconnectedPaths(scaffold_paths, scaffolds, scaffold_graph)
@@ -11736,7 +11788,7 @@ def TestTraverseScaffoldGraph():
     # Run function
     graph_ext = FindValidExtensionsInScaffoldGraph(scaffold_graph)
     unique_paths, handled_origins = FollowUniquePathsThroughGraph(graph_ext)
-    loop_paths, handled_scaf_conns = AddPathThroughLoops([], scaffold_graph, scaf_bridges, org_scaf_conns, ploidy, max_loop_units)
+    loop_paths, handled_scaf_conns = AddPathThroughLoops([], scaffold_graph, graph_ext, scaf_bridges, org_scaf_conns, ploidy, max_loop_units)
     inversion_paths, handled_scaf_conns = AddPathThroughInvertedRepeats([], handled_scaf_conns, scaffold_graph, scaf_bridges, ploidy)
     untraversed_paths = AddUntraversedConnectedPaths([], graph_ext, handled_origins, handled_scaf_conns)
     scaffold_paths = TraverseScaffoldGraph(scaffolds.drop(columns=['case']), scaffold_graph, graph_ext, scaf_bridges, org_scaf_conns, ploidy, max_loop_units)
