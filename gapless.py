@@ -2324,7 +2324,7 @@ def DisconnectRepeatedContigsWithConnectionsOnBothSides(scaffold_graph, scaf_rep
                 # Extend the replacement by removing the additional scaffold
                 rpot.drop(columns=[f'scaf{s+1}',f'strand{s+1}',f'dist{s+1}'], inplace=True)
                 rpot = RemoveEmptyColumns(rpot)
-                rpot.rename(columns={f'{n}{s}':f'{n}{s-1}' for s in range(s+2, rpot['length'].max()) for n in ['scaf','strand','dist']}, inplace=True)
+                rpot.rename(columns={f'{n}{s2}':f'{n}{s2-1}' for s2 in range(s+2, rpot['length'].max()) for n in ['scaf','strand','dist']}, inplace=True)
                 rpot['length'] -= 1
                 # Add the distances, which is specific for this extension and not relevant for further extensions
                 cur = rpot.drop(columns=['dscaf2','t_start2','t_end2'])
@@ -2340,13 +2340,13 @@ def DisconnectRepeatedContigsWithConnectionsOnBothSides(scaffold_graph, scaf_rep
             # Check that the order of duplications matches the one in the graph
             if len(lpot):
                 lpot = lpot[ np.where(lpot[f'strand{e+1}'] == '+', (lpot['t_start'] > lpot['t_start2']) & (lpot['t_end'] > lpot['t_end2']), (lpot['t_start'] < lpot['t_start2']) & (lpot['t_end'] < lpot['t_end2']) ) |
-                            ( (lpot['t_start'] == lpot['t_start2']) & (lpot['t_end'] == lpot['t_end2']) & (lpot['dscaf'] == lpot['dscaf2'] + np.where(lpot[f'strand{s}'] == '+', 1, -1)) ) ].drop(columns=['dscaf','t_start','t_end'])
+                            ( (lpot['t_start'] == lpot['t_start2']) & (lpot['t_end'] == lpot['t_end2']) & (lpot['dscaf'] == lpot['dscaf2'] + np.where(lpot[f'strand{e+1}'] == '+', 1, -1)) ) ].drop(columns=['dscaf','t_start','t_end'])
                 lpot.rename(columns={'dscaf2':'dscaf','t_start2':'t_start','t_end2':'t_end'}, inplace=True)
             if len(lpot):
                 # Extend the replacement by removing the additional scaffold
                 lpot.drop(columns=[f'scaf{e}',f'strand{e}',f'dist{e}'], inplace=True)
                 lpot = RemoveEmptyColumns(lpot)
-                lpot.rename(columns={f'{n}{s}':f'{n}{s-1}' for s in range(e+1, lpot['length'].max()) for n in ['scaf','strand','dist']}, inplace=True)
+                lpot.rename(columns={f'{n}{s2}':f'{n}{s2-1}' for s2 in range(e+1, lpot['length'].max()) for n in ['scaf','strand','dist']}, inplace=True)
                 lpot['length'] -= 1
                 # Add the distances, which is specific for this extension and not relevant for further extensions
                 cur = lpot.drop(columns=['t_con','dscaf','t_start','t_end'])
