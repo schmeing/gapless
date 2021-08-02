@@ -9,6 +9,7 @@ function echo_usage {
     echo "  -j [INT]                 number of threads [4]"
     echo "  -n [INT]                 number of iterations [5]"
     echo "  -o [STRING]              output directory (improved assembly is written to gapless.fa in this directory)"
+    echo "  -s [INT]                 start iteration (in case previous runs are present) [1]"
     echo "  -t [STRING]              type of long reads ('pb_clr','pb_hifi','nanopore')"
 }
 
@@ -20,9 +21,10 @@ asm=""
 threads=4
 iterations=5
 output="gapless"
+start=1
 type=""
 
-while getopts "h?i:j:n:o:t:" opt; do
+while getopts "h?i:j:n:o:s:t:" opt; do
   case "$opt" in
   h|\?)
 	echo_usage
@@ -35,6 +37,8 @@ while getopts "h?i:j:n:o:t:" opt; do
   n) iterations=$OPTARG
     ;;
   o) output=$OPTARG
+    ;;
+  s) start=$OPTARG
     ;;
   t) type=$OPTARG
     ;;
@@ -94,7 +98,7 @@ org_path=$(pwd)
 cd "${output}"
 rm -f gapless.fa
 
-for (( i=1; i<=${iterations}; i++ ))
+for (( i=${start}; i<=$(expr ${start} + ${iterations} - 1); i++ ))
 do
   mkdir -p pass${i}/logs
   mkdir -p pass${i}/timing
