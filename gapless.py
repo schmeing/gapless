@@ -4797,7 +4797,7 @@ def MergeHaplotypes(scaffold_paths, graph_ext, scaf_bridges, ploidy, ends_in=[])
         duplications.loc[(duplications['did'] != duplications['did'].shift(1)) & (duplications[f'{p}pos'] > 0), 'del'] = True
         duplications['max_pos'] = duplications[[f'{p}pid']].rename(columns={f'{p}pid':'pid'}).merge(path_len, on=['pid'], how='left')['max_pos'].values
         duplications.loc[(duplications['did'] != duplications['did'].shift(-1)) & (duplications[f'{p}pos'] != duplications['max_pos']), 'del'] = True
-    duplications['del']  = duplications[['did']].merge(duplications.groupby(['did'])['del'].max().reset_index(), on=['did'], how='left')['del'].values
+    duplications['del']  = duplications[['apid','bpid']].merge(duplications.groupby(['apid','bpid'])['del'].max().reset_index(), on=['apid','bpid'], how='left')['del'].values
     duplications = duplications[duplications['del'] == False].drop(columns=['max_pos','del'])
 #
 #    # Check if the haplotypes to be merged share an extension (reduces continuity without reducing misassemblies)
@@ -4863,7 +4863,6 @@ def MergeHaplotypes(scaffold_paths, graph_ext, scaf_bridges, ploidy, ends_in=[])
     if len(duplications):
         duplications['agroup'] = duplications['apid']
         duplications['bgroup'] = duplications['bpid']
-        error_shown = False
         while True:
             # Count the matches(scaffold duplications) in each pid pair with duplicate
             matches = duplications.groupby(['agroup','apid','ahap','bgroup','bpid','bhap']).size().reset_index(name='matches')
@@ -4885,7 +4884,7 @@ def MergeHaplotypes(scaffold_paths, graph_ext, scaf_bridges, ploidy, ends_in=[])
                 groups.drop(columns=['min','median','max'], inplace=True)
                 groups = groups.merge(groups.rename(columns={'agroup':'bgroup','bgroup':'agroup'}), on=['agroup','bgroup'], how='inner')
                 groups = groups[groups['agroup'] < groups['bgroup']].rename(columns={'bgroup':'group','agroup':'new_group'})
-                if len(groups) == 0 and error_shown == False:
+                if len(groups) == 0:
                     raise RuntimeError("Error: Stuck in an endless loop while regrouping in MergeHaplotypes.")
                 for p in ['a','b']:
                     duplications['new_group'] = duplications[[f'{p}group']].rename(columns={f'{p}group':'group'}).merge(groups, on=['group'], how='left')['new_group'].values
@@ -6360,6 +6359,7 @@ def PlaceUnambigouslyPlaceablePathsAsAlternativeHaplotypes(scaffold_paths, graph
         duplications = duplications.merge(includes[['ldid','rdid']], on=['ldid','rdid'], how='inner')
         # A path a cannot be at the same time a path b
         includes = includes[np.isin(includes['apid'],includes['bpid'].values) == False].copy()
+        duplications = duplications[ duplications[['apid','bpid']].merge(duplications[['apid','bpid']].drop_duplicates().rename(columns={'apid':'bpid','bpid':'apid'}), on=['apid','bpid'], how='left', indicator=True)['_merge'].values == "left_only" ].copy()
         # Only one include per path b per round
         includes.sort_values(['bpid'], inplace=True)
         includes = includes[includes['bpid'] != includes['bpid'].shift(1)].copy()
@@ -7264,8 +7264,9 @@ def RemoveUnconnectedLowlyMappedOrDuplicatedContigs(scaffold_paths, result_info,
     unconnected = scaffold_paths.loc[np.isin(scaffold_paths['scaf'], unconnected) & (scaffold_paths[[f'con{h}' for h in range(1,ploidy)]].max(axis=1) < 0), ['scaf','con0']].rename(columns={'con0':'con'})
 #    
     # Check unconnected for lowly mapped contigs
-    unconnected['nmapped'] = unconnected[['con']].merge(mappings.groupby(['conpart']).size().reset_index(name='nmapped').rename(columns={'conpart':'con'}), on='con', how='left')['nmapped'].fillna(0).astype(int).values
-    unconnected['lowmap'] = GetConProb(cov_probs, 1, unconnected['nmapped']) <= lowmap_threshold
+    #unconnected['nmapped'] = unconnected[['con']].merge(mappings.groupby(['conpart']).size().reset_index(name='nmapped').rename(columns={'conpart':'con'}), on='con', how='left')['nmapped'].fillna(0).astype(int).values
+    #unconnected['lowmap'] = GetConProb(cov_probs, 1, unconnected['nmapped']) <= lowmap_threshold
+    unconnected['lowmap'] = False
 #
     # check unconnected for completely duplicated contigs
     unconnected['fullrep'] = False
@@ -8162,7 +8163,10 @@ def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
 #
     print( str(timedelta(seconds=clock())), "Search for possible bridges")
     bridges = GetBridges(mappings, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, cov_probs, prob_factor, min_mapping_length, min_distance_tolerance, rel_distance_tolerance, prematurity_threshold, max_dist_contig_end, pdf)
-    bridges, overlap_bridges = InsertBridgesOnUniqueContigOverlapsWithoutConnections(bridges, repeats, min_len_contig_overlap, min_num_reads)
+    if min_len_contig_overlap == 0:
+        overlap_bridges = []
+    else:
+        bridges, overlap_bridges = InsertBridgesOnUniqueContigOverlapsWithoutConnections(bridges, repeats, min_len_contig_overlap, min_num_reads)
 #
     print( str(timedelta(seconds=clock())), "Scaffold the contigs")
     scaffold_paths, trim_repeats = ScaffoldContigs(contig_parts, bridges, mappings, cov_probs, repeats, prob_factor, min_mapping_length, max_dist_contig_end, prematurity_threshold, ploidy, max_loop_units)
