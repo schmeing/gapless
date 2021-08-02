@@ -6890,17 +6890,19 @@ def PhaseScaffoldsWithScafBridges(scaffold_paths, scaf_bridges, ploidy):
                 s += 1
             else:
                 break
-    scaffold_paths.drop(columns=['deletion','add','from_phase','to_phase','to','to_side','mean_dist'], inplace=True)
-    deletions = pd.concat(deletions, ignore_index=True)
-    deletions = deletions[deletions['from_phase'] != deletions['to_phase']].copy()
-    deletions['from_side'] = np.where(deletions['from_side'] == '+', 'r', 'l')
-    deletions['to_side'] = np.where(deletions['to_side'] == '+', 'l', 'r')
-    deletions['valid'] = deletions[['from','from_side','to','to_side','mean_dist']].merge(scaf_bridges[['from','from_side','to','to_side','mean_dist']], on=['from','from_side','to','to_side','mean_dist'], how='left', indicator=True)['_merge'].values == "both"
-    deletions.sort_values(['pid','pos','from_phase','to_phase'], inplace=True)
-    valid = deletions.groupby(['pid','pos','from_phase','to_phase'], sort=False)['valid'].agg(['max','size'])
-    deletions['valid'] = np.repeat(valid['max'].values, valid['size'].values)
-    deletions = deletions.loc[deletions['valid'] == False, ['from_phase','to_phase']].drop_duplicates()
-    scaffold_paths = AssignNewPhases(scaffold_paths, deletions, ploidy)
+    scaffold_paths.drop(columns=['deletion','add','from_phase','to_phase','to','to_side','mean_dist'], inplace=True, errors='ignore')
+    if len(deletions):
+        deletions = pd.concat(deletions, ignore_index=True)
+        deletions = deletions[deletions['from_phase'] != deletions['to_phase']].copy()
+    if len(deletions):
+        deletions['from_side'] = np.where(deletions['from_side'] == '+', 'r', 'l')
+        deletions['to_side'] = np.where(deletions['to_side'] == '+', 'l', 'r')
+        deletions['valid'] = deletions[['from','from_side','to','to_side','mean_dist']].merge(scaf_bridges[['from','from_side','to','to_side','mean_dist']], on=['from','from_side','to','to_side','mean_dist'], how='left', indicator=True)['_merge'].values == "both"
+        deletions.sort_values(['pid','pos','from_phase','to_phase'], inplace=True)
+        valid = deletions.groupby(['pid','pos','from_phase','to_phase'], sort=False)['valid'].agg(['max','size'])
+        deletions['valid'] = np.repeat(valid['max'].values, valid['size'].values)
+        deletions = deletions.loc[deletions['valid'] == False, ['from_phase','to_phase']].drop_duplicates()
+        scaffold_paths = AssignNewPhases(scaffold_paths, deletions, ploidy)
 #
     return scaffold_paths
 
