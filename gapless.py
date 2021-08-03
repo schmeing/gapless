@@ -11889,12 +11889,15 @@ def GaplessTest():
         print("All tests succeeded.")
     else:
         print(failed_tests, "tests failed.")
-    
+
+def Version():
+    print("Program: gapless")
+    print("Version: 0.1")
+    print("Contact: Stephan Schmeing <stephan.schmeing@uzh.ch>")
+
 def Usage(module=""):
     if "" == module:
-        print("Program: gapless")
-        print("Version: 0.1")
-        print("Contact: Stephan Schmeing <stephan.schmeing@uzh.ch>")
+        Version()
         print()
         print("Usage:  gapless.py <module> [options]")
         print("Modules:")
@@ -11955,9 +11958,12 @@ def main(argv):
     if "-h" == module or "--help" == module:
         Usage()
         sys.exit()
+    if "--version" == module:
+        Version()
+        sys.exit()
     if "split" == module:
         try:
-            optlist, args = getopt.getopt(argv, 'hn:o:', ['help','minN=','output='])
+            optlist, args = getopt.getopt(argv, 'hn:o:', ['help','minN=','output=','version'])
         except getopt.GetoptError:
             print("Unknown option")
             Usage(module)
@@ -11977,7 +11983,10 @@ def main(argv):
                     sys.exit(1)
             elif opt in ("-o", "--output"):
                 o_file = par
-    
+            elif opt == "--version":
+                Version()
+                sys.exit()
+
         if 1 != len(args):
             print("Wrong number of files. Exactly one file is required.")
             Usage(module)
@@ -11986,7 +11995,7 @@ def main(argv):
         GaplessSplit(args[0],o_file,min_n)
     elif "scaffold" == module:
         try:
-            optlist, args = getopt.getopt(argv, 'hp:s:', ['help','prefix=','stats=','--minLenBreak=','minMapLength=','minMapQ='])
+            optlist, args = getopt.getopt(argv, 'hp:s:', ['help','prefix=','stats=','--minLenBreak=','minMapLength=','minMapQ=','version'])
         except getopt.GetoptError:
             print("Unknown option\n")
             Usage(module)
@@ -12027,6 +12036,9 @@ def main(argv):
                 except ValueError:
                     print("--minMapQ option only accepts integers")
                     sys.exit(1)
+            elif opt == "--version":
+                Version()
+                sys.exit()
 
                     
         if 3 != len(args):
@@ -12037,7 +12049,7 @@ def main(argv):
         GaplessScaffold(args[0], args[1], args[2], min_mapq, min_mapping_length, min_length_contig_break, prefix, stats)
     elif "extend" == module:
         try:
-            optlist, args = getopt.getopt(argv, 'hp:', ['help','prefix=','--minLenBreak'])
+            optlist, args = getopt.getopt(argv, 'hp:', ['help','prefix=','--minLenBreak','version'])
         except getopt.GetoptError:
             print("Unknown option\n")
             Usage(module)
@@ -12057,6 +12069,9 @@ def main(argv):
                 except ValueError:
                     print("--minLenBreak option only accepts integers")
                     sys.exit(1)
+            elif opt == "--version":
+                Version()
+                sys.exit()
                     
         if 1 != len(args):
             print("Wrong number of files. Exactly one file is required.\n")
@@ -12072,7 +12087,7 @@ def main(argv):
     elif "finish" == module:
         num_slots = 10
         try:
-            optlist, args = getopt.getopt(argv, 'hf:H:o:s:', ['help','format=','hap=','output=','scaffolds=']+[f'hap{i}=' for i in range(1,num_slots)]+[f'out{i}=' for i in range(1,num_slots)])
+            optlist, args = getopt.getopt(argv, 'hf:H:o:s:', ['help','format=','hap=','output=','scaffolds=','version']+[f'hap{i}=' for i in range(1,num_slots)]+[f'out{i}=' for i in range(1,num_slots)])
         except getopt.GetoptError:
             print("Unknown option\n")
             Usage(module)
@@ -12105,6 +12120,9 @@ def main(argv):
                 output[int(opt[5:])] = par
             elif opt in ("-s", "--scaffolds"):
                 scaffolds = par
+            elif opt == "--version":
+                Version()
+                sys.exit()
         
         if 2 != len(args):
             print("Wrong number of files. Exactly two files are required.")
@@ -12131,7 +12149,7 @@ def main(argv):
         GaplessFinish(args[0], args[1], read_format, scaffolds, selected_output, selected_haplotypes)
     elif "visualize" == module:
         try:
-            optlist, args = getopt.getopt(argv, 'ho:', ['help','output=','--keepAllSubreads','--minLenBreak=','minMapLength=','minMapQ='])
+            optlist, args = getopt.getopt(argv, 'ho:', ['help','output=','--keepAllSubreads','--minLenBreak=','minMapLength=','minMapQ=','version'])
         except getopt.GetoptError:
             print("Unknown option\n")
             Usage(module)
@@ -12168,6 +12186,9 @@ def main(argv):
                 except ValueError:
                     print("--minMapQ option only accepts integers")
                     sys.exit(1)
+            elif opt == "--version":
+                Version()
+                sys.exit()
             
         if 2 > len(args):
             print("Wrong number of arguments. The mapping file and at least one region definition are needed.\n")
