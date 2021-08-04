@@ -6469,6 +6469,7 @@ def CombineOnMatchingExtensions(scaffold_paths, graph_ext, scaffold_graph, scaf_
             cur_ext = extensions[['apid','aside',f'scaf{s}',f'strand{s}',f'dist{s}']].drop_duplicates()
             cur_ext = cur_ext[((cur_ext[['apid','aside']] == cur_ext[['apid','aside']].shift(1)).all(axis=1) == False) & ((cur_ext[['apid','aside']] == cur_ext[['apid','aside']].shift(-1)).all(axis=1) == False)].copy()
             if len(cur_ext) == 0:
+                con_ext = con_ext[con_ext['len'] > 1].copy()
                 break
             else:
                 con_ext[[f'scaf{s}',f'strand{s}',f'dist{s}']] = con_ext[['apid','aside']].merge(cur_ext, on=['apid','aside'], how='left')[[f'scaf{s}',f'strand{s}',f'dist{s}']].values
