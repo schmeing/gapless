@@ -2,16 +2,16 @@
 
 # Declare functions
 function echo_usage {
-	echo "Usage: bash gapless.sh [OPTIONS] FileLongReads.fq"
-    echo "Improves input assembly with reads in FileLongReads.fq using gapless, minimap2, racon and seqtk"
-    echo "  -h -?                    display this help"
-    echo "  -i [STRING]              input assembly (fasta)"
-    echo "  -j [INT]                 number of threads [4]"
-    echo "  -n [INT]                 number of iterations [5]"
-    echo "  -o [STRING]              output directory (improved assembly is written to gapless.fa in this directory)"
-    echo "  -r                       Restarts at the start iteration instead of incorporating already present files"
-    echo "  -s [INT]                 start iteration (in case previous runs are present) [1]"
-    echo "  -t [STRING]              type of long reads ('pb_clr','pb_hifi','nanopore')"
+	echo "Usage: gapless.sh [OPTIONS] {long_reads}.fq"
+    echo "Improves input assembly with reads in {long_reads}.fq using gapless, minimap2, racon and seqtk"
+    echo "  -h -?                    Display this help and exit"
+    echo "  -i [STRING]              Input assembly (fasta)"
+    echo "  -j [INT]                 Number of threads [4]"
+    echo "  -n [INT]                 Number of iterations [3]"
+    echo "  -o [STRING]              Output directory (improved assembly is written to gapless.fa in this directory) [gapless_run]"
+    echo "  -r                       Restart at the start iteration and overwrite instead of incorporat already present files"
+    echo "  -s [INT]                 Start iteration (Previous runs must be present in output directory) [1]"
+    echo "  -t [STRING]              Type of long reads ('pb_clr','pb_hifi','nanopore')"
 }
 
 # Reading in arguments
@@ -21,7 +21,7 @@ reads=""
 asm=""
 threads=4
 iterations=3
-output="gapless"
+output="gapless_run"
 reset=false
 start=1
 type=""
@@ -164,7 +164,7 @@ do
       env time -v -o pass${i}/timing/minimap2_consensus.txt minimap2 -t $threads -x $mm_map pass${i}/gapless_raw.fa "${org_path}/${reads}" > pass${i}/gapless_consensus.paf 2>pass${i}/logs/minimap2_consensus.log
     fi
     env time -v -o pass${i}/timing/racon.txt racon -t $threads "${org_path}/${reads}" pass${i}/gapless_consensus.paf pass${i}/gapless_raw.fa > pass${i}/gapless.fa 2>pass${i}/logs/racon.log &&\
-    rm -f pass${i}/gapless_reads.paf pass${i}/gapless_raw.fa pass${i}/gapless_split.fa
+    rm -f pass${i}/gapless_consensus.paf pass${i}/gapless_raw.fa pass${i}/gapless_split.fa
     if [ ! -f pass${i}/gapless.fa ]; then
       echo "pipeline crashed: consensus"
       exit 1
