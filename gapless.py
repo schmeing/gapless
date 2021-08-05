@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-from Bio import SeqIO
 
+from Bio import SeqIO
 from datetime import timedelta
 import getopt
 import gzip
@@ -1323,12 +1323,12 @@ def CreateBridges(left_bridge, right_bridge, min_distance_tolerance, rel_distanc
 
     return bridges
 
-def PrepareBridgeMapLen(bridge_maplen, bridges):
-    # Assign mean_dist from bridges to bridge_maplen
-    bridge_maplen = bridge_maplen.merge(bridges[['from','from_side','to','to_side','mean_dist','min_dist','max_dist']].drop_duplicates(), on=['from','from_side','to','to_side'], how='left')
-    bridge_maplen = bridge_maplen[(bridge_maplen['min_dist'] <= bridge_maplen['distance']) & (bridge_maplen['distance'] <= bridge_maplen['max_dist'])].drop(columns=['min_dist','max_dist'])    
+def PrepareBridgeExtLen(bridge_extlen, bridges):
+    # Assign mean_dist from bridges to bridge_extlen
+    bridge_extlen = bridge_extlen.merge(bridges[['from','from_side','to','to_side','mean_dist','min_dist','max_dist']].drop_duplicates(), on=['from','from_side','to','to_side'], how='left')
+    bridge_extlen = bridge_extlen[(bridge_extlen['min_dist'] <= bridge_extlen['distance']) & (bridge_extlen['distance'] <= bridge_extlen['max_dist'])].drop(columns=['min_dist','max_dist'])    
 #
-    return bridge_maplen
+    return bridge_extlen
 
 def MarkOrgScaffoldBridges(bridges, contig_parts, requirement):
     # requirement (-1: org scaffold, 0: unbroken org scaffold)
@@ -1348,7 +1348,7 @@ def CountAlternatives(bridges):
 
     return bridges
 
-def FilterBridges(bridges, bridge_maplen, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, cov_probs, prob_factor, min_mapping_length, contig_parts, prematurity_threshold, pdf=None):
+def FilterBridges(bridges, bridge_extlen, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, cov_probs, prob_factor, min_mapping_length, contig_parts, prematurity_threshold, pdf=None):
     if org_scaffold_trust in ["blind", "full"]:
         bridges = MarkOrgScaffoldBridges(bridges, contig_parts, -1)
         if "blind" == org_scaffold_trust:
@@ -1403,41 +1403,38 @@ def FilterBridges(bridges, bridge_maplen, borderline_removal, min_factor_alterna
     # Remove low quality bridges
     bridges = bridges[bridges['low_q'] == False].copy()
     bridges.drop(columns=['low_q'], inplace=True)
-    
-    # Check for prematurely ending bridges first with mapping length and read length after the gap (extension length)
-    for c in ['maplen','extlen']:
-        # Get longest mapping for every bridge and summarise that for every starting conting end
-        maplen_sum = bridge_maplen.groupby(['from','from_side','to','to_side','mean_dist']).agg({f'from_{c}':'max','from_atend':'max',f'to_{c}':'max','to_atend':'max', 'distance':'size'}).reset_index().rename(columns={'distance':'counts'})
-        maplen_sum = maplen_sum.merge(bridges[['from','from_side','to','to_side','mean_dist']].drop_duplicates(), on=['from','from_side','to','to_side','mean_dist'], how='inner') # Remove already filtered bridges
-        max_maplen = maplen_sum.groupby(['from','from_side']).agg({f'from_{c}':'max', 'from_atend':'min', f'to_{c}':'max', 'to_atend':'min'}).reset_index()
-        if c == 'extlen':
-            maplen_sum[['from_atend','to_atend']] = False
-            max_maplen[['from_atend','to_atend']] = False # Disable this check for the extension length, because we do the extension length check precisely to test bridges that cannot be tested with mapping length due to the contig length limitation
 #
-        # Get probability that they do not end prematurely for all bridges compared to the longest mapping/extension, conflicting bridge (for the bridge side on the same contig (from) and the other side, where contigs can be different (to))
-        for e in ['from','to']:
-            cur_maplen = maplen_sum[['from','from_side','to','to_side','mean_dist',f'{e}_{c}',f'{e}_atend','counts']].merge(max_maplen.loc[max_maplen[f'{e}_atend'] == False, ['from','from_side',f'{e}_{c}']].rename(columns={f'{e}_{c}':f'max_{c}'}), on=['from','from_side'], how='inner') # Bridges where all alternatives reach the end do not need to be handled
-            cur_maplen.rename(columns={f'{e}_{c}':c}, inplace=True)
-            cur_max = cur_maplen.loc[cur_maplen[c] == cur_maplen[f'max_{c}'], ['from','from_side','to','to_side','mean_dist', 'counts']].copy()
-            cur_maplen = cur_maplen[(cur_maplen[f'{e}_atend'] == False) & (cur_maplen[c] < cur_maplen[f'max_{c}'])].drop(columns=[f'{e}_atend',f'max_{c}']) # If the bridge maps till the other end of the contig or has the longest mapping it cannot end prematurely
-            gaplen = bridge_maplen[['from','from_side','to','to_side','mean_dist',f'{e}_{c}',f'{e}_gaplen']].rename(columns={f'{e}_{c}':c,f'{e}_gaplen':'gaplen'}).merge(cur_maplen[['from','from_side','to','to_side','mean_dist',c]].reset_index(), on=['from','from_side','to','to_side','mean_dist',c], how='inner')
-            gaplen = gaplen.groupby(['index'])['gaplen'].max().reset_index()
-            cur_maplen.loc[gaplen['index'].values, 'gaplen'] = gaplen['gaplen'].values
-            cur_maplen.rename(columns={col:f'test_{col}' for col in ['to','to_side','mean_dist','counts']}, inplace=True)
-            cur_maplen = cur_maplen.merge(cur_max, on=['from','from_side'], how='left') # If multiple longest mapping exist test against all of them
-            longer_mappings = cur_maplen[['from','from_side','to','to_side','mean_dist',c,'gaplen']].drop_duplicates().merge(bridge_maplen[['from','from_side','to','to_side','mean_dist',f'{e}_{c}',f'{e}_gaplen']], on=['from','from_side','to','to_side','mean_dist'], how='left')
-            longer_mappings = longer_mappings[longer_mappings[c] + np.maximum(0, longer_mappings['gaplen']-longer_mappings[f'{e}_gaplen']) < longer_mappings[f'{e}_{c}']].groupby(['from','from_side','to','to_side','mean_dist',c,'gaplen']).size().reset_index(name='longer')
-            cur_maplen['longer'] = cur_maplen[['from','from_side','to','to_side','mean_dist',c,'gaplen']].merge(longer_mappings, on=['from','from_side','to','to_side','mean_dist',c,'gaplen'], how='left')['longer'].fillna(0).astype(int)
-            cur_maplen.drop(columns=[c,'gaplen','to','to_side','mean_dist'], inplace=True)
-            cur_maplen['premat_prob'] = GetPrematureStopProb(cur_maplen['test_counts'], cur_maplen['counts'], cur_maplen['longer'])
-            cur_maplen = cur_maplen.groupby(['from','from_side','test_to','test_to_side','test_mean_dist'])['premat_prob'].min().reset_index()  # Since we tested against all longest mappings, take the lowest probability
-            cur_maplen.rename(columns={f'test_{col}':col for col in ['to','to_side','mean_dist']}, inplace=True)
-            bridges[f'same_from_{c}_premat' if e == 'from' else f'diff_from_{c}_premat'] = bridges[['from','from_side','to','to_side','mean_dist']].merge(cur_maplen, on=['from','from_side','to','to_side','mean_dist'], how='left')['premat_prob'].fillna(1.0).values
-            bridges[f'same_to_{c}_premat' if e == 'from' else f'diff_to_{c}_premat'] = bridges[['from','from_side','to','to_side','mean_dist']].merge(cur_maplen.rename(columns={'from':'to','to':'from','from_side':'to_side','to_side':'from_side'}), on=['from','from_side','to','to_side','mean_dist'], how='left')['premat_prob'].fillna(1.0).values
+    # Check for prematurely ending bridges with read length after the gap (extension length)
+    # Start by getting the longest extension for every bridge and summarise that for every starting conting end
+    extlen_sum = bridge_extlen.groupby(['from','from_side','to','to_side','mean_dist']).agg({'from_extlen':'max','to_extlen':'max', 'distance':'size'}).reset_index().rename(columns={'distance':'counts'})
+    extlen_sum = extlen_sum.merge(bridges[['from','from_side','to','to_side','mean_dist']].drop_duplicates(), on=['from','from_side','to','to_side','mean_dist'], how='inner') # Remove already filtered bridges
+    max_extlen = extlen_sum.groupby(['from','from_side']).agg({'from_extlen':'max', 'to_extlen':'max'}).reset_index()
+#
+    # Get probability that they do not end prematurely for all bridges compared to the longest mapping/extension, conflicting bridge (for the bridge side on the same contig (from) and the other side, where contigs can be different (to))
+    for e in ['from','to']:
+        cur_extlen = extlen_sum[['from','from_side','to','to_side','mean_dist',f'{e}_extlen','counts']].merge(max_extlen[['from','from_side',f'{e}_extlen']].rename(columns={f'{e}_extlen':'max_extlen'}), on=['from','from_side'], how='inner') # Bridges where all alternatives reach the end do not need to be handled
+        cur_extlen.rename(columns={f'{e}_extlen':'extlen'}, inplace=True)
+        cur_max = cur_extlen.loc[cur_extlen['extlen'] == cur_extlen['max_extlen'], ['from','from_side','to','to_side','mean_dist', 'counts']].copy()
+        cur_extlen = cur_extlen[cur_extlen['extlen'] < cur_extlen['max_extlen']].drop(columns=['max_extlen']) # If the bridge has the longest mapping it cannot end prematurely
+        gaplen = bridge_extlen[['from','from_side','to','to_side','mean_dist',f'{e}_extlen',f'{e}_gaplen']].rename(columns={f'{e}_extlen':'extlen',f'{e}_gaplen':'gaplen'}).merge(cur_extlen[['from','from_side','to','to_side','mean_dist','extlen']].reset_index(), on=['from','from_side','to','to_side','mean_dist','extlen'], how='inner')
+        gaplen = gaplen.groupby(['index'])['gaplen'].max().reset_index()
+        cur_extlen.loc[gaplen['index'].values, 'gaplen'] = gaplen['gaplen'].values
+        cur_extlen.rename(columns={col:f'test_{col}' for col in ['to','to_side','mean_dist','counts']}, inplace=True)
+        cur_extlen = cur_extlen.merge(cur_max, on=['from','from_side'], how='left') # If multiple longest extensions exist test against all of them
+        longer_extensions = cur_extlen[['from','from_side','to','to_side','mean_dist','extlen','gaplen']].drop_duplicates().merge(bridge_extlen[['from','from_side','to','to_side','mean_dist',f'{e}_extlen',f'{e}_gaplen']], on=['from','from_side','to','to_side','mean_dist'], how='left')
+        longer_extensions = longer_extensions[longer_extensions['extlen'] + np.maximum(0, longer_extensions['gaplen']-longer_extensions[f'{e}_gaplen']) < longer_extensions[f'{e}_extlen']].groupby(['from','from_side','to','to_side','mean_dist','extlen','gaplen']).size().reset_index(name='longer')
+        cur_extlen['longer'] = cur_extlen[['from','from_side','to','to_side','mean_dist','extlen','gaplen']].merge(longer_extensions, on=['from','from_side','to','to_side','mean_dist','extlen','gaplen'], how='left')['longer'].fillna(0).astype(int)
+        cur_extlen.drop(columns=['extlen','gaplen','to','to_side','mean_dist'], inplace=True)
+        cur_extlen['premat_prob'] = GetPrematureStopProb(cur_extlen['test_counts'], cur_extlen['counts'], cur_extlen['longer'])
+        cur_extlen = cur_extlen.groupby(['from','from_side','test_to','test_to_side','test_mean_dist'])['premat_prob'].min().reset_index()  # Since we tested against all longest mappings, take the lowest probability
+        cur_extlen.rename(columns={f'test_{col}':col for col in ['to','to_side','mean_dist']}, inplace=True)
+        bridges[f'same_from_premat' if e == 'from' else f'diff_from_premat'] = bridges[['from','from_side','to','to_side','mean_dist']].merge(cur_extlen, on=['from','from_side','to','to_side','mean_dist'], how='left')['premat_prob'].fillna(1.0).values
+        bridges[f'same_to_premat' if e == 'from' else f'diff_to_premat'] = bridges[['from','from_side','to','to_side','mean_dist']].merge(cur_extlen.rename(columns={'from':'to','to':'from','from_side':'to_side','to_side':'from_side'}), on=['from','from_side','to','to_side','mean_dist'], how='left')['premat_prob'].fillna(1.0).values
 #
     # Remove prematurely ending bridges (if this would remove all bridges from both sides keep the ones with the highest probability)
-    bridges['premat_prob'] = bridges[['same_from_extlen_premat','same_to_extlen_premat','diff_from_extlen_premat','diff_to_extlen_premat','same_from_maplen_premat','same_to_maplen_premat','diff_from_maplen_premat','diff_to_maplen_premat']].min(axis=1)
-    bridges.drop(columns=['same_from_extlen_premat','same_to_extlen_premat','diff_from_extlen_premat','diff_to_extlen_premat','same_from_maplen_premat','same_to_maplen_premat','diff_from_maplen_premat','diff_to_maplen_premat'], inplace=True)
+    premat_cols = ['same_from_premat','same_to_premat','diff_from_premat','diff_to_premat']
+    bridges['premat_prob'] = bridges[premat_cols].min(axis=1)
+    bridges.drop(columns=premat_cols, inplace=True)
     bridges['not_premat'] = bridges['premat_prob'] > prematurity_threshold
     bridges[['max_premat_from','not_premat_from']] = bridges[['from','from_side']].merge(bridges.groupby(['from','from_side']).agg({'premat_prob':'max','not_premat':'sum'}).reset_index(), on=['from','from_side'], how='left')[['premat_prob','not_premat']].values
     bridges[['max_premat_to','not_premat_to']] = bridges[['to','to_side']].merge(bridges.groupby(['to','to_side']).agg({'premat_prob':'max','not_premat':'sum'}).reset_index(), on=['to','to_side'], how='left')[['premat_prob','not_premat']].values
@@ -1494,15 +1491,15 @@ def GetBridges(mappings, borderline_removal, min_factor_alternatives, min_num_re
         cur_bridge['mapq'] = np.where(cur_bridge['to_mapq'] < cur_bridge['from_mapq'], cur_bridge['to_mapq'].astype(int)*1000+cur_bridge['from_mapq'], cur_bridge['from_mapq'].astype(int)*1000+cur_bridge['to_mapq'])
         cur_bridge.drop(columns=['from_mapq','to_mapq'], inplace=True)
         for e in ['from','to']:
-            # Get maplen, gaplen, atend
-            cur_bridge[f'{e}_maplen'] = cur_bridge['con_to'] - cur_bridge['con_from']
+            # Get maplen and gaplen
+            cur_bridge['maplen'] = cur_bridge['con_to'] - cur_bridge['con_from']
             cur_bridge['con_from'] -= contig_parts.loc[cur_bridge[e].values, 'start'].values
             cur_bridge['con_to'] = contig_parts.loc[cur_bridge[e].values, 'end'].values - cur_bridge['con_to']
-            cur_bridge[f'{e}_maplen'] += np.where(cur_bridge[f'{e}_side'] == 'l', cur_bridge['con_from'], cur_bridge['con_to']) # when it start to map later, we do not care, important is how far it maps
+            cur_bridge['maplen'] += np.where(cur_bridge[f'{e}_side'] == 'l', cur_bridge['con_from'], cur_bridge['con_to']) # when it start to map later, we do not care, important is how far it maps
             cur_bridge[f'{e}_gaplen'] = np.where(cur_bridge['distance'] >= 0, cur_bridge['distance']+min_mapping_length, np.maximum(-cur_bridge['distance'], min_mapping_length)) - np.where(cur_bridge[f'{e}_side'] == 'l', cur_bridge['con_from'], cur_bridge['con_to'])
-            cur_bridge[f'{e}_atend'] = np.where(cur_bridge[f'{e}_side'] == 'l', cur_bridge['con_to'], cur_bridge['con_from']) <= max_dist_contig_end
             # Get extlen
-            cur_bridge[f'{e}_extlen'] = np.where((cur_bridge[f'{e}_side'] == 'l') == (cur_bridge['strand'] == '+'), cur_bridge['read_end']-cur_bridge['read_to'], cur_bridge['read_from']-cur_bridge['read_start']) + cur_bridge[f'{e}_maplen']
+            cur_bridge[f'{e}_extlen'] = np.where((cur_bridge[f'{e}_side'] == 'l') == (cur_bridge['strand'] == '+'), cur_bridge['read_end']-cur_bridge['read_to'], cur_bridge['read_from']-cur_bridge['read_start']) + cur_bridge['maplen']
+            cur_bridge.drop(columns=['maplen'], inplace=True)
             # Prepare to side
             if e == 'from':
                 cur_bridge[['con_from','con_to','read_start','read_end','read_from','read_to','strand']] = np.where(('+' if s == 'left' else '-') == mappings[['strand','strand','strand','strand','strand','strand','strand']].values, mappings[['con_from','con_to','read_start','read_end','read_from','read_to','strand']].shift(1, fill_value = -1).values, mappings[['con_from','con_to','read_start','read_end','read_from','read_to','strand']].shift(-1, fill_value = -1).values)[mappings[f'{s}_con'].values >= 0]
@@ -1510,14 +1507,14 @@ def GetBridges(mappings, borderline_removal, min_factor_alternatives, min_num_re
                 cur_bridge.drop(columns=['con_from','con_to','read_start','read_end','read_from','read_to','strand'], inplace=True)
         if s == 'left':
             left_bridge = cur_bridge[['from','from_side','to','to_side','distance','mapq']].copy()
-            bridge_maplen = cur_bridge.drop(columns=['mapq'])
+            bridge_extlen = cur_bridge.drop(columns=['mapq'])
         else:
             right_bridge = cur_bridge[['from','from_side','to','to_side','distance','mapq']].copy()
-            bridge_maplen = pd.concat([bridge_maplen, cur_bridge.drop(columns=['mapq'])], ignore_index=True)
+            bridge_extlen = pd.concat([bridge_extlen, cur_bridge.drop(columns=['mapq'])], ignore_index=True)
 #
     bridges = CreateBridges(left_bridge, right_bridge, min_distance_tolerance, rel_distance_tolerance)
-    bridge_maplen = PrepareBridgeMapLen(bridge_maplen, bridges)
-    bridges = FilterBridges(bridges, bridge_maplen, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, cov_probs, prob_factor, min_mapping_length, contig_parts, prematurity_threshold, pdf)
+    bridge_extlen = PrepareBridgeExtLen(bridge_extlen, bridges)
+    bridges = FilterBridges(bridges, bridge_extlen, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, cov_probs, prob_factor, min_mapping_length, contig_parts, prematurity_threshold, pdf)
 
     return bridges
 
@@ -1781,21 +1778,17 @@ def GetLongRangeConnections(bridges, mappings, contig_parts, max_dist_contig_end
         # Get long_range_connections that are supported by reads
         long_range_connections = long_range_mappings[['conpart','strand','left_con_dist','right_con_dist','left_con','right_con','con_from','con_to','read_start','read_end','read_from','read_to']].copy()
         long_range_connections['conn_id'] = ((long_range_mappings['read_name'] != long_range_mappings['read_name'].shift(1, fill_value='')) | (long_range_mappings['read_start'] != long_range_mappings['read_start'].shift(1, fill_value=-1))).cumsum()
-        # Get maplen and extlen
+        # Get extlen
         long_range_connections['maplen'] = long_range_connections['con_to'] - long_range_connections['con_from']
         long_range_connections['con_from'] -= contig_parts.loc[long_range_connections['conpart'].values, 'start'].values
         long_range_connections['con_to'] = contig_parts.loc[long_range_connections['conpart'].values, 'end'].values - long_range_connections['con_to']
-        long_range_connections['lmaplen'] = long_range_connections['maplen'] + long_range_connections['con_from']
-        long_range_connections['rmaplen'] = long_range_connections['maplen'] + long_range_connections['con_to']
         long_range_connections['lgaplen'] = np.maximum(0, long_range_connections['left_con_dist']) - long_range_connections['con_from']
         long_range_connections['rgaplen'] = np.maximum(0, long_range_connections['right_con_dist']) - long_range_connections['con_to']
-        long_range_connections['ltillend'] = long_range_connections['con_to'] <= max_dist_contig_end
-        long_range_connections['rtillend'] = long_range_connections['con_from'] <= max_dist_contig_end
-        long_range_connections['lextlen'] = np.where(long_range_connections['strand'] == '+', long_range_connections['read_end']-long_range_connections['read_to'], long_range_connections['read_from']-long_range_connections['read_start']) + long_range_connections['lmaplen']
-        long_range_connections['rextlen'] = np.where(long_range_connections['strand'] == '-', long_range_connections['read_end']-long_range_connections['read_to'], long_range_connections['read_from']-long_range_connections['read_start']) + long_range_connections['rmaplen']
+        long_range_connections['lextlen'] = np.where(long_range_connections['strand'] == '+', long_range_connections['read_end']-long_range_connections['read_to'], long_range_connections['read_from']-long_range_connections['read_start']) + (long_range_connections['maplen'] + long_range_connections['con_from'])
+        long_range_connections['rextlen'] = np.where(long_range_connections['strand'] == '-', long_range_connections['read_end']-long_range_connections['read_to'], long_range_connections['read_from']-long_range_connections['read_start']) + (long_range_connections['maplen'] + long_range_connections['con_to'])
         long_range_connections.drop(columns=['con_from','con_to','read_start','read_end','read_from','read_to','maplen'], inplace=True)
-        long_range_connections.loc[long_range_connections['left_con'] < 0, ['lmaplen','lgaplen','lextlen']] = 0
-        long_range_connections.loc[long_range_connections['right_con'] < 0, ['rmaplen','rgaplen','rextlen']] = 0
+        long_range_connections.loc[long_range_connections['left_con'] < 0, ['lgaplen','lextlen']] = 0
+        long_range_connections.loc[long_range_connections['right_con'] < 0, ['rgaplen','rextlen']] = 0
     else:
         long_range_connections = []
 #
@@ -1809,9 +1802,9 @@ def GetLongRangeConnections(bridges, mappings, contig_parts, max_dist_contig_end
             long_range_connections = long_range_connections[remove == False].copy()
             GetConnectionFromTo(long_range_connections)
         selection = long_range_connections['fake_rep'] & (long_range_connections['from_side'] == 'r')
-        long_range_connections.loc[selection.shift(-1, fill_value=False), ['right_con_dist','rmaplen','rgaplen','rtillend','rextlen']] = np.where(long_range_connections.loc[selection, ['to_side','to_side','to_side','to_side','to_side']] == 'l', long_range_connections.loc[selection, ['right_con_dist','rmaplen','rgaplen','rtillend','rextlen']].values, long_range_connections.loc[selection, ['left_con_dist','lmaplen','lgaplen','ltillend','lextlen']]) # Fill in the other side that does not point towards the previous entry
+        long_range_connections.loc[selection.shift(-1, fill_value=False), ['right_con_dist','rgaplen','rextlen']] = np.where(long_range_connections.loc[selection, ['to_side','to_side','to_side']] == 'l', long_range_connections.loc[selection, ['right_con_dist','rgaplen','rextlen']].values, long_range_connections.loc[selection, ['left_con_dist','lgaplen','lextlen']]) # Fill in the other side that does not point towards the previous entry
         selection = long_range_connections['fake_rep'] & (long_range_connections['from_side'] == 'l')
-        long_range_connections.loc[selection.shift(-1, fill_value=False), ['left_con_dist','lmaplen','lgaplen','ltillend','lextlen']] = np.where(long_range_connections.loc[selection, ['to_side','to_side','to_side','to_side','to_side']] == 'l', long_range_connections.loc[selection, ['right_con_dist','rmaplen','rgaplen','rtillend','rextlen']].values, long_range_connections.loc[selection, ['left_con_dist','lmaplen','lgaplen','ltillend','lextlen']]) # Fill in the other side that does not point towards the previous entry
+        long_range_connections.loc[selection.shift(-1, fill_value=False), ['left_con_dist','lgaplen','lextlen']] = np.where(long_range_connections.loc[selection, ['to_side','to_side','to_side']] == 'l', long_range_connections.loc[selection, ['right_con_dist','rgaplen','rextlen']].values, long_range_connections.loc[selection, ['left_con_dist','lgaplen','lextlen']]) # Fill in the other side that does not point towards the previous entry
         long_range_connections = long_range_connections[long_range_connections['fake_rep'] == False].drop(columns = ['left_con','right_con','fake_rep']) # from and to will be updated in the next step, thus we do not need to remove them here
 #
     if len(long_range_connections):
@@ -1858,12 +1851,12 @@ def GetLongRangeConnections(bridges, mappings, contig_parts, max_dist_contig_end
         long_range_connections.drop(columns=['trim'], inplace=True)
 #
     if len(long_range_connections):
-        # Move maplen/extlen from left/right to prev/next
-        long_range_connections.rename(columns={f'{b}{n}':f'{a}{n}' for n in ['maplen','gaplen','tillend','extlen'] for b,a in [['l','p'],['r','n']]}, inplace=True)
-        long_range_connections.loc[long_range_connections['strand'] == '-', [f'{s}{n}' for n in ['maplen','gaplen','tillend','extlen'] for s in ['p','n']]] = long_range_connections.loc[long_range_connections['strand'] == '-', [f'{s}{n}' for n in ['maplen','gaplen','tillend','extlen'] for s in ['n','p']]].values
+        # Move extlen from left/right to prev/next
+        long_range_connections.rename(columns={f'{b}{n}':f'{a}{n}' for n in ['gaplen','extlen'] for b,a in [['l','p'],['r','n']]}, inplace=True)
+        long_range_connections.loc[long_range_connections['strand'] == '-', [f'{s}{n}' for n in ['gaplen','extlen'] for s in ['p','n']]] = long_range_connections.loc[long_range_connections['strand'] == '-', [f'{s}{n}' for n in ['gaplen','extlen'] for s in ['n','p']]].values
         # Make sure that reads look similar independent if they were trimmed or not
-        long_range_connections.loc[long_range_connections['pos'] == 0, ['prev_alt','prev_dist','pmaplen','pgaplen','pextlen']] = 0
-        long_range_connections.loc[long_range_connections['pos'] == long_range_connections['size']-1, ['next_alt','next_dist','nmaplen','ngaplen','nextlen']] = 0
+        long_range_connections.loc[long_range_connections['pos'] == 0, ['prev_alt','prev_dist','pgaplen','pextlen']] = 0
+        long_range_connections.loc[long_range_connections['pos'] == long_range_connections['size']-1, ['next_alt','next_dist','ngaplen','nextlen']] = 0
 #
         # Add all connections also in the reverse direction
         long_range_connections = long_range_connections.loc[np.repeat(long_range_connections.index.values, 2)].copy()
@@ -1873,7 +1866,7 @@ def GetLongRangeConnections(bridges, mappings, contig_parts, max_dist_contig_end
         long_range_connections.loc[long_range_connections['reverse'], 'conn_id'] += 1
         long_range_connections.loc[long_range_connections['reverse'], ['prev_alt','next_alt']] = long_range_connections.loc[long_range_connections['reverse'], ['next_alt','prev_alt']].values
         long_range_connections.loc[long_range_connections['reverse'], ['prev_dist','next_dist']] = long_range_connections.loc[long_range_connections['reverse'], ['next_dist','prev_dist']].values
-        long_range_connections.loc[long_range_connections['reverse'], [f'{s}{n}' for n in ['maplen','gaplen','tillend','extlen'] for s in ['p','n']]] = long_range_connections.loc[long_range_connections['reverse'], [f'{s}{n}' for n in ['maplen','gaplen','tillend','extlen'] for s in ['n','p']]].values
+        long_range_connections.loc[long_range_connections['reverse'], [f'{s}{n}' for n in ['gaplen','extlen'] for s in ['p','n']]] = long_range_connections.loc[long_range_connections['reverse'], [f'{s}{n}' for n in ['gaplen','extlen'] for s in ['n','p']]].values
         long_range_connections.loc[long_range_connections['reverse'], 'pos'] = long_range_connections.loc[long_range_connections['reverse'], 'size'] - long_range_connections.loc[long_range_connections['reverse'], 'pos'] - 1
         long_range_connections.sort_values(['conn_id', 'pos'], inplace=True)
 #
@@ -1893,7 +1886,7 @@ def TransformContigConnectionsToScaffoldConnections(long_range_connections, scaf
     # Group and combine contigs which are all part of the same scaffold (and are following it's order, so are not a repeat)
     long_range_connections['group'] = ( (long_range_connections['conn_id'] != long_range_connections['conn_id'].shift(1)) | (long_range_connections['scaffold'] != long_range_connections['scaffold'].shift(1)) | 
                                         ((long_range_connections['scaf_pos']+1 != long_range_connections['scaf_pos'].shift(1)) & (long_range_connections['scaf_pos']-1 != long_range_connections['scaf_pos'].shift(1))) ).cumsum()
-    long_range_connections = long_range_connections.groupby(['group', 'conn_id', 'conn_code', 'scaffold', 'strand'], sort=False).agg({'prev_alt':'first','next_alt':'last','prev_dist':'first','next_dist':'last','pmaplen':'first','nmaplen':'last','ptillend':'first','ntillend':'last','pgaplen':'first','ngaplen':'last','pextlen':'first','nextlen':'last'}).reset_index().drop(columns=['group'])
+    long_range_connections = long_range_connections.groupby(['group', 'conn_id', 'conn_code', 'scaffold', 'strand'], sort=False).agg({'prev_alt':'first','next_alt':'last','prev_dist':'first','next_dist':'last','pgaplen':'first','ngaplen':'last','pextlen':'first','nextlen':'last'}).reset_index().drop(columns=['group'])
 
     # Get size and pos again
     con_size = long_range_connections.groupby(['conn_id']).size().reset_index(name='size')
@@ -1904,18 +1897,18 @@ def TransformContigConnectionsToScaffoldConnections(long_range_connections, scaf
     return long_range_connections
 
 def SummarizeLongRangeConnections(long_range_connections):
-    # Separate long_range_maplen
-    long_range_maplen = long_range_connections[['conn_code','pos','pmaplen','nmaplen','ptillend','ntillend','pgaplen', 'ngaplen', 'pextlen', 'nextlen']].copy()
+    # Separate long_range_extlen
+    long_range_extlen = long_range_connections[['conn_code','pos','pgaplen', 'ngaplen', 'pextlen', 'nextlen']].copy()
  #
     if len(long_range_connections):
         # Summarize identical long_range_connections (since we already trimmed all contigs without alternative bridges from both sides, we do not need to update conn_id to scaffolds)
         long_range_connections = long_range_connections.groupby(['conn_code','pos','size','scaffold','strand','prev_alt','next_alt','prev_dist','next_dist']).size().reset_index(name='count')
         long_range_connections['conn_id'] = (long_range_connections['conn_code'] != long_range_connections['conn_code'].shift(1)).cumsum()
-        long_range_maplen['conn_id'] = long_range_maplen[['conn_code']].merge(long_range_connections[['conn_code','conn_id']].drop_duplicates(), on='conn_code', how='left')['conn_id'].values
-        long_range_maplen.drop(columns=['conn_code'], inplace=True)
+        long_range_extlen['conn_id'] = long_range_extlen[['conn_code']].merge(long_range_connections[['conn_code','conn_id']].drop_duplicates(), on='conn_code', how='left')['conn_id'].values
+        long_range_extlen.drop(columns=['conn_code'], inplace=True)
         long_range_connections.drop(columns=['conn_code'], inplace=True)
 #
-    return long_range_connections, long_range_maplen
+    return long_range_connections, long_range_extlen
 
 def GetScaffoldLength(scaffold_parts, contig_parts):
     scaf_len = scaffold_parts[['scaffold','conpart','prev_dist']].rename(columns={'prev_dist':'length'})
@@ -1925,7 +1918,7 @@ def GetScaffoldLength(scaffold_parts, contig_parts):
 #
     return scaf_len
 
-def FilterLongRangeConnections(long_range_connections, long_range_maplen, scaffold_parts, contig_parts, cov_probs, prob_factor, min_mapping_length, prematurity_threshold):
+def FilterLongRangeConnections(long_range_connections, long_range_extlen, scaffold_parts, contig_parts, cov_probs, prob_factor, min_mapping_length, prematurity_threshold):
     scaf_len = GetScaffoldLength(scaffold_parts, contig_parts)
     for l in range(3,long_range_connections['size'].max()+1):
         for cfilter in ['prematurity','counts']:
@@ -1939,42 +1932,39 @@ def FilterLongRangeConnections(long_range_connections, long_range_maplen, scaffo
             if cfilter == 'prematurity':
                 cons[['conn_id', 'pos']] = long_range_connections.loc[cons['cindex'].values, ['conn_id', 'pos']].values
                 for s in ['n','p']:
-                    complen = cons.drop(columns=['count']).merge(long_range_maplen[['conn_id','pos',f'{s}maplen',f'{s}tillend',f'{s}gaplen',f'{s}extlen']], on=['conn_id','pos'], how='left')
-                    complen.rename(columns={f'{s}{n}':n for n in ['maplen','tillend','gaplen','extlen']}, inplace=True)
+                    complen = cons.drop(columns=['count']).merge(long_range_extlen[['conn_id','pos',f'{s}gaplen',f'{s}extlen']], on=['conn_id','pos'], how='left')
+                    complen.rename(columns={f'{s}{n}':n for n in ['gaplen','extlen']}, inplace=True)
                     complen.drop(columns=['conn_id','pos'], inplace=True)
                     if s == 'n':
                         gcols = ['scaf1','strand1']+[f'{n}{s}' for s in range(2,l) for n in ['scaf','strand','dist']]
                     else:
                         gcols = ['scaf0','strand0']+[f'{n}{s}' for s in range(1,l-1) for n in ['scaf','strand','dist']]
-                    for c in ['maplen','extlen']:
-                        if c == 'extlen':
-                            complen['tillend'] = False
-                        clen = complen.groupby(mcols).agg({c:'max','tillend':'max','gaplen':'size'}).rename(columns={'gaplen':'counts'}).reset_index()
-                        clen.sort_values(gcols, inplace=True)
-                        maxlen = clen.groupby(gcols, sort=False)[c].agg(['size','max'])
-                        clen['maxlen'] = np.repeat(maxlen['max'].values, maxlen['size'].values)
-                        longest = clen[clen[c] == clen['maxlen']].drop(columns=[c,'tillend'])
-                        longest.rename(columns={'counts':'ncontrol'}, inplace=True)
-                        clen = clen[(clen['maxlen'] > clen[c]) & (clen['tillend'] == False)].copy()
-                        clen.reset_index(drop=True, inplace=True)
-                        clen['gaplen'] = clen[mcols+[c]].merge(complen.groupby(mcols+[c])['gaplen'].max().reset_index(), on=mcols+[c], how='left')['gaplen'].values
-                        longest = longest.merge(clen[gcols+[c,'counts','gaplen']].reset_index().rename(columns={'index':'cindex',c:'tlen','counts':'ntest','gaplen':'tgaplen'}), on=gcols, how='inner')
-                        longer = longest[mcols+['tlen','tgaplen']].drop_duplicates().merge(complen[mcols+[c,'gaplen']], on=mcols, how='left')
-                        longer = longer[longer[c] > longer['tlen'] + np.maximum(0, longer['tgaplen']-longer['gaplen'])].groupby(mcols+['tlen','tgaplen']).size().reset_index(name='longer')
-                        longest['longer'] = longest[mcols+['tlen','tgaplen']].merge(longer, on=mcols+['tlen','tgaplen'], how='left')['longer'].fillna(0).astype(int).values
-                        if np.sum(longest['longer'] > 0):
-                            longest['premat_prob'] = GetPrematureStopProb(longest['ntest'], longest['ncontrol'], longest['longer'])
-                        else:
-                            longest['premat_prob'] = 1.0
-                        tmp = longest.groupby(['cindex'])['premat_prob'].min().reset_index()
-                        clen.loc[tmp['cindex'].values, 'premat_prob'] = tmp['premat_prob'].values
-                        cons[f'{s}premat_{c}'] = cons[mcols].merge(clen[mcols+['premat_prob']], on=mcols, how='left')['premat_prob'].fillna(1.0).values
+                    clen = complen.groupby(mcols).agg({'extlen':'max','gaplen':'size'}).rename(columns={'gaplen':'counts'}).reset_index()
+                    clen.sort_values(gcols, inplace=True)
+                    maxlen = clen.groupby(gcols, sort=False)['extlen'].agg(['size','max'])
+                    clen['maxlen'] = np.repeat(maxlen['max'].values, maxlen['size'].values)
+                    longest = clen[clen['extlen'] == clen['maxlen']].drop(columns=['extlen'])
+                    longest.rename(columns={'counts':'ncontrol'}, inplace=True)
+                    clen = clen[clen['maxlen'] > clen['extlen']].copy()
+                    clen.reset_index(drop=True, inplace=True)
+                    clen['gaplen'] = clen[mcols+['extlen']].merge(complen.groupby(mcols+['extlen'])['gaplen'].max().reset_index(), on=mcols+['extlen'], how='left')['gaplen'].values
+                    longest = longest.merge(clen[gcols+['extlen','counts','gaplen']].reset_index().rename(columns={'index':'cindex','extlen':'tlen','counts':'ntest','gaplen':'tgaplen'}), on=gcols, how='inner')
+                    longer = longest[mcols+['tlen','tgaplen']].drop_duplicates().merge(complen[mcols+['extlen','gaplen']], on=mcols, how='left')
+                    longer = longer[longer['extlen'] > longer['tlen'] + np.maximum(0, longer['tgaplen']-longer['gaplen'])].groupby(mcols+['tlen','tgaplen']).size().reset_index(name='longer')
+                    longest['longer'] = longest[mcols+['tlen','tgaplen']].merge(longer, on=mcols+['tlen','tgaplen'], how='left')['longer'].fillna(0).astype(int).values
+                    if np.sum(longest['longer'] > 0):
+                        longest['premat_prob'] = GetPrematureStopProb(longest['ntest'], longest['ncontrol'], longest['longer'])
+                    else:
+                        longest['premat_prob'] = 1.0
+                    tmp = longest.groupby(['cindex'])['premat_prob'].min().reset_index()
+                    clen.loc[tmp['cindex'].values, 'premat_prob'] = tmp['premat_prob'].values
+                    cons[f'{s}premat_prob'] = cons[mcols].merge(clen[mcols+['premat_prob']], on=mcols, how='left')['premat_prob'].fillna(1.0).values
                     if s == 'n':
                         cons['pos'] += l-1
-                cons['ndel'] = cons[['npremat_maplen','npremat_extlen']].min(axis=1) <= prematurity_threshold
-                cons['pdel'] = cons[['ppremat_maplen','ppremat_extlen']].min(axis=1) <= prematurity_threshold
+                cons['ndel'] = cons['npremat_prob'] <= prematurity_threshold
+                cons['pdel'] = cons['ppremat_prob'] <= prematurity_threshold
                 one_sided_dels = cons.loc[cons['ndel'] != cons['pdel'], mcols+['ndel','pdel']].drop_duplicates()
-                cons = cons[cons['ndel'] & cons['pdel']].drop(columns=['conn_id', 'pos','npremat_maplen','npremat_extlen','ppremat_maplen','ppremat_extlen','ndel','pdel'])
+                cons = cons[cons['ndel'] & cons['pdel']].drop(columns=['conn_id', 'pos','npremat_prob','ppremat_prob','ndel','pdel'])
             else:
                 # Sum counts for identical cons
                 counts = cons.groupby(mcols)['count'].sum().reset_index()
@@ -7215,8 +7205,8 @@ def ScaffoldContigs(contig_parts, bridges, mappings, cov_probs, repeats, prob_fa
     # Build scaffold graph to find unique bridges over scaffolds with alternative connections
     long_range_connections = GetLongRangeConnections(bridges, mappings, contig_parts, max_dist_contig_end)
     long_range_connections = TransformContigConnectionsToScaffoldConnections(long_range_connections, scaffold_parts)
-    long_range_connections, long_range_maplen = SummarizeLongRangeConnections(long_range_connections)
-    long_range_connections = FilterLongRangeConnections(long_range_connections, long_range_maplen, scaffold_parts, contig_parts, cov_probs, prob_factor, min_mapping_length, prematurity_threshold)
+    long_range_connections, long_range_extlen = SummarizeLongRangeConnections(long_range_connections)
+    long_range_connections = FilterLongRangeConnections(long_range_connections, long_range_extlen, scaffold_parts, contig_parts, cov_probs, prob_factor, min_mapping_length, prematurity_threshold)
     scaffold_graph = BuildScaffoldGraph(long_range_connections, scaf_bridges)
     scaffold_graph, trim_repeats = DeduplicateScaffoldsInGraph(scaffold_graph, repeats, scaffold_parts, scaf_bridges)
     scaf_bridges = UpdateScafBridgesAccordingToScaffoldGraph(scaf_bridges, scaffold_graph)
