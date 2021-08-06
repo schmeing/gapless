@@ -19,7 +19,7 @@ from scipy.optimize import minimize
 from scipy.special import erf
 import seaborn as sns
 import sys
-from time import clock
+from time import process_time
 
 def GaplessSplit(fa_file,o_file=False,min_n=False):
     if False == o_file:
@@ -6562,17 +6562,17 @@ def TraverseScaffoldGraph(scaffolds, scaffold_graph, graph_ext, scaf_bridges, or
     for i in range(3):
         n = 1
         while old_nscaf != len(np.unique(scaffold_paths['pid'].values)):
-            time0 = clock()
+            time0 = process_time()
             print(f"Iteration {n}")
             n+=1
              # First Merge then Combine to not accidentially merge a haplotype, where the other haplotype of the paths is not compatible and thus joining wrong paths
             scaffold_paths = MergeHaplotypes(scaffold_paths, graph_ext, scaf_bridges, ploidy)
-            time1 = clock()
+            time1 = process_time()
             print(str(timedelta(seconds=time1-time0)), len(np.unique(scaffold_paths['pid'].values)))
             TestPrint(scaffold_paths)
             old_nscaf = len(np.unique(scaffold_paths['pid'].values))
             scaffold_paths = CombinePathOnUniqueOverlap(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges, ploidy)
-            print(str(timedelta(seconds=clock()-time1)), len(np.unique(scaffold_paths['pid'].values)))
+            print(str(timedelta(seconds=process_time()-time1)), len(np.unique(scaffold_paths['pid'].values)))
             TestPrint(scaffold_paths)
             CheckScaffoldPathsConsistency(scaffold_paths)
             CheckIfScaffoldPathsFollowsValidBridges(scaffold_paths, scaf_bridges, ploidy)
@@ -7984,20 +7984,20 @@ def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
         pdf = PdfPages(stats)
         plt.ioff()
 
-    print( str(timedelta(seconds=clock())), "Reading in original assembly")
+    print( str(timedelta(seconds=process_time())), "Reading in original assembly")
     contigs, contig_ids = ReadContigs(assembly_file)
     result_info = {}
     result_info = GetInputInfo(result_info, contigs)
 #
-    print( str(timedelta(seconds=clock())), "Loading repeats")
+    print( str(timedelta(seconds=process_time())), "Loading repeats")
     repeats = LoadRepeats(repeat_file, contig_ids)
 #
-    print( str(timedelta(seconds=clock())), "Filtering mappings")
+    print( str(timedelta(seconds=process_time())), "Filtering mappings")
     mappings, cov_counts, cov_probs, read_names = ReadMappings(mapping_file, contig_ids, min_mapq, min_mapping_length, keep_all_subreads, alignment_precision, num_read_len_groups, pdf)
     contigs, covered_regions = RemoveUnmappedContigs(contigs, mappings, remove_zero_hit_contigs)
     mappings = BreakReadsAtAdapters(mappings, alignment_precision, keep_all_subreads)
 #
-    print( str(timedelta(seconds=clock())), "Search for possible break points")
+    print( str(timedelta(seconds=process_time())), "Search for possible break points")
     if "blind" == org_scaffold_trust:
         # Do not break contigs
         break_groups, spurious_break_indexes, non_informative_mappings = CallAllBreaksSpurious(mappings, contigs, covered_regions, max_dist_contig_end, min_length_contig_break, min_extension, pdf)
@@ -8012,19 +8012,19 @@ def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     repeats = FindDuplicatedContigPartEnds(repeats, contig_parts, max_dist_contig_end, proportion_duplicated)
     del break_groups, contigs, contig_ids
 #
-    print( str(timedelta(seconds=clock())), "Search for possible bridges")
+    print( str(timedelta(seconds=process_time())), "Search for possible bridges")
     bridges = GetBridges(mappings, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, cov_probs, prob_factor, min_mapping_length, min_distance_tolerance, rel_distance_tolerance, prematurity_threshold, max_dist_contig_end, pdf)
     if min_len_contig_overlap == 0:
         overlap_bridges = []
     else:
         bridges, overlap_bridges = InsertBridgesOnUniqueContigOverlapsWithoutConnections(bridges, repeats, min_len_contig_overlap, min_num_reads)
 #
-    print( str(timedelta(seconds=clock())), "Scaffold the contigs")
+    print( str(timedelta(seconds=process_time())), "Scaffold the contigs")
     scaffold_paths, trim_repeats = ScaffoldContigs(contig_parts, bridges, mappings, cov_probs, repeats, prob_factor, min_mapping_length, max_dist_contig_end, prematurity_threshold, ploidy, max_loop_units)
     scaffold_paths, result_info = RemoveUnconnectedLowlyMappedOrDuplicatedContigs(scaffold_paths, result_info, mappings, contig_parts, cov_probs, repeats, ploidy, lowmap_threshold)
     contig_parts, scaffold_paths, mappings = TrimDuplicatedEnds(contig_parts, scaffold_paths, mappings, repeats, trim_repeats, min_mapping_length, alignment_precision)
 #
-    print( str(timedelta(seconds=clock())), "Fill gaps")
+    print( str(timedelta(seconds=process_time())), "Fill gaps")
     mappings, scaffold_paths, overlap_bridges = MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploidy) # Might break apart scaffolds again, if we cannot find a mapping read for a connection
     result_info = CountResealedBreaks(result_info, scaffold_paths, contig_parts, ploidy)
     scaffold_paths, mappings = FillGapsWithReads(scaffold_paths, mappings, contig_parts, read_names, overlap_bridges, ploidy, max_dist_contig_end, min_extension, min_num_reads, pdf) # Mappings are prepared for scaffold extensions
@@ -8033,12 +8033,12 @@ def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     if pdf:
         pdf.close()
 
-    print( str(timedelta(seconds=clock())), "Writing output")
+    print( str(timedelta(seconds=process_time())), "Writing output")
     mappings.to_csv(f"{prefix}_extensions.csv", index=False)
     scaffold_paths.to_csv(f"{prefix}_scaffold_paths.csv", index=False)
     np.savetxt(f"{prefix}_extending_reads.lst", np.unique(mappings['read_name']), fmt='%s')
 
-    print( str(timedelta(seconds=clock())), "Finished")
+    print( str(timedelta(seconds=process_time())), "Finished")
     PrintStats(result_info)
 
 def GetPloidyFromPaths(scaffold_paths):
@@ -8393,21 +8393,21 @@ def GaplessExtend(all_vs_all_mapping_file, prefix, min_length_contig_break):
         if os.path.exists(f):
             os.remove(f)
     
-    print( str(timedelta(seconds=clock())), "Preparing data from files")
+    print( str(timedelta(seconds=process_time())), "Preparing data from files")
     scaffold_paths = pd.read_csv(prefix+"_scaffold_paths.csv").fillna('')
     ploidy = GetPloidyFromPaths(scaffold_paths)
     mappings = LoadExtensions(prefix, min_extension)
     extensions, hap_merger = LoadReads(all_vs_all_mapping_file, mappings, min_length_contig_break)
     
-    print( str(timedelta(seconds=clock())), "Searching for extensions")
+    print( str(timedelta(seconds=process_time())), "Searching for extensions")
     extensions, new_scaffolds = ClusterExtension(extensions, mappings, min_num_reads, min_scaf_len)
     scaffold_paths, extension_info = ExtendScaffolds(scaffold_paths, extensions, hap_merger, new_scaffolds, mappings, min_num_reads, max_mapping_uncertainty, min_scaf_len, ploidy)
 
-    print( str(timedelta(seconds=clock())), "Writing output")
+    print( str(timedelta(seconds=process_time())), "Writing output")
     scaffold_paths.to_csv(f"{prefix}_extended_scaffold_paths.csv", index=False)
     np.savetxt(f"{prefix}_used_reads.lst", np.unique(pd.concat([scaffold_paths.loc[('read' == scaffold_paths['type']) & ('' != scaffold_paths[f'name{h}']), f'name{h}'] for h in range(ploidy)], ignore_index=True)), fmt='%s')
     
-    print( str(timedelta(seconds=clock())), "Finished")
+    print( str(timedelta(seconds=process_time())), "Finished")
     print( "Extended {} scaffolds (left: {}, right:{}).".format(extension_info['count'], extension_info['left'], extension_info['right']) )
     print( "The extensions ranged from {} to {} bases and had a mean length of {}.".format(extension_info['min'], extension_info['max'], extension_info['mean']) )
     print( "Added {} scaffolds in the gaps with a length ranging from {} to {} bases and a mean of {}.".format(extension_info['new'],extension_info['new_min'], extension_info['new_max'], extension_info['new_mean']) )
@@ -8443,7 +8443,7 @@ def GaplessFinish(assembly_file, read_file, read_format, scaffold_file, output_f
         if os.path.exists(f):
             os.remove(f)
 #
-    print( str(timedelta(seconds=clock())), "Loading scaffold info from: {}".format(scaffold_file))
+    print( str(timedelta(seconds=process_time())), "Loading scaffold info from: {}".format(scaffold_file))
     scaffold_paths = pd.read_csv(scaffold_file).fillna('')
     ploidy = GetPloidyFromPaths(scaffold_paths)
     for i in range(len(haplotypes)):
@@ -8453,13 +8453,13 @@ def GaplessFinish(assembly_file, read_file, read_format, scaffold_file, output_f
             print(f"The highest haplotype in scaffold file is {ploidy-1}, but {haplotypes[i]} was specified")
             sys.exit(1)
 #
-    print( str(timedelta(seconds=clock())), "Loading assembly from: {}".format(assembly_file))
+    print( str(timedelta(seconds=process_time())), "Loading assembly from: {}".format(assembly_file))
     contigs = {}
     with gzip.open(assembly_file, 'rt') if 'gz' == assembly_file.rsplit('.',1)[-1] else open(assembly_file, 'rU') as fin:
         for record in SeqIO.parse(fin, "fasta"):
             contigs[ record.description.split(' ', 1)[0] ] = record.seq
 #
-    print( str(timedelta(seconds=clock())), "Loading reads from: {}".format(read_file))
+    print( str(timedelta(seconds=process_time())), "Loading reads from: {}".format(read_file))
     reads = {}
     if read_format == False:
         lread_file = read_file.lower()
@@ -8476,7 +8476,7 @@ def GaplessFinish(assembly_file, read_file, read_format, scaffold_file, output_f
         outpaths['meta'] = ((outpaths['scaf'] != outpaths['scaf'].shift(1)) & (outpaths['sdist_left'] < 0)).cumsum()
         # Select the paths based on haplotype
         if hap < 0:
-            print( str(timedelta(seconds=clock())), "Writing mixed assembly to: {}".format(outfile))
+            print( str(timedelta(seconds=process_time())), "Writing mixed assembly to: {}".format(outfile))
             outpaths['bubble'] = ((outpaths[[f'phase{h}' for h in range(1,ploidy)]] < 0).all(axis=1) | (outpaths['scaf'] != outpaths['scaf'].shift(1))).cumsum()
             for h in range(ploidy):
                 outpaths[f'len{h}'] = outpaths[f'end{h}']-outpaths[f'start{h}']
@@ -8565,7 +8565,7 @@ def GaplessFinish(assembly_file, read_file, read_format, scaffold_file, output_f
             outpaths = pd.concat([outpaths[['meta','hap','alt','scaf','pos','type','name','start','end','strand','sdist_right']]] + alternatives, ignore_index=True).sort_values(['meta','alt','pos'])
             outpaths['meta'] = np.repeat("scaffold", len(outpaths)) + outpaths['meta'].astype(str) + np.where(outpaths['hap'] == 0, "", "_hap" + str(h) + "_alt" + outpaths['alt'].astype('str'))
         else:
-            print( str(timedelta(seconds=clock())), "Writing haplotype {} of assembly to: {}".format(hap,outfile))
+            print( str(timedelta(seconds=process_time())), "Writing haplotype {} of assembly to: {}".format(hap,outfile))
             outpaths['meta'] = np.repeat("scaffold", len(outpaths)) + outpaths['meta'].astype(str)
             outpaths.rename(columns={'name0':'name','start0':'start','end0':'end','strand0':'strand'}, inplace=True)
             if hap > 0:
@@ -8617,7 +8617,7 @@ def GaplessFinish(assembly_file, read_file, read_format, scaffold_file, output_f
             fout.write(''.join(seq))
             fout.write('\n')
         
-        print( str(timedelta(seconds=clock())), "Finished" )
+        print( str(timedelta(seconds=process_time())), "Finished" )
 
 def GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length, keep_all_subreads, alignment_precision, min_length_contig_break, max_dist_contig_end):
     mappings = ReadPaf(mapping_file)
