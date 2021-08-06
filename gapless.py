@@ -300,7 +300,7 @@ def LoadRepeats(repeat_file, contig_ids):
 
 def GetThresholdsFromReadLenDist(mappings, num_read_len_groups):
     # Get read length distribution
-    read_len_dist = mappings[['q_name','q_len']].drop_duplicates()
+    read_len_dist = mappings[['q_id','q_len']].drop_duplicates()
     read_len_dist = read_len_dist['q_len'].sort_values().values
 
     return read_len_dist[[len(read_len_dist)//num_read_len_groups*i for i in range(1,num_read_len_groups)]]
@@ -363,17 +363,17 @@ def GetCoverageProbabilities(cov_counts, pdf):
 
     return cov_probs
 
-def GetBestSubreads(mappings, alignment_precision):
+def GetBestSubreads(mappings, read_names, alignment_precision):
     # Identify groups of subread mappings (of which only one is required)
-    mappings['subread'] = [ re.sub(r'^(.*?/.*?)/.+', r'\1', qname) for qname in mappings['q_name'].values ]
+    mappings['subread'] = [ re.sub(r'^(.*?/.*?)/.+', r'\1', qname) for qname in read_names.loc[mappings['q_id'].values, 'read_name'].values ]
     mappings.sort_values(['subread','t_name','t_start','t_end'], inplace=True)
     mappings['group'] = (( (mappings['subread'] != mappings['subread'].shift(1, fill_value="")) | (mappings['t_name'] != mappings['t_name'].shift(1, fill_value="")) | ((mappings['t_start']-mappings['t_start'].shift(1, fill_value=0) > alignment_precision) & (np.abs(mappings['t_end'] - mappings['t_end'].shift(1, fill_value=0)) > alignment_precision)) )).cumsum()
     
     # Keep only the best subread (over all mappings)
     mappings.sort_values(['group','mapq','matches'], ascending=[True,False,False], inplace=True)
     mappings['pos'] = mappings.groupby(['group'], sort=False).cumcount()
-    mappings.sort_values(['q_name'], inplace=True)
-    tmp = mappings.groupby(['q_name'], sort=False)['pos'].agg(['size','max','mean'])
+    mappings.sort_values(['q_id'], inplace=True)
+    tmp = mappings.groupby(['q_id'], sort=False)['pos'].agg(['size','max','mean'])
     mappings['max_pos'] = np.repeat(tmp['max'].values, tmp['size'].values)
     mappings['mean_pos'] = np.repeat(tmp['mean'].values, tmp['size'].values)
     mappings.sort_values(['group','max_pos','mean_pos'], inplace=True)
@@ -383,11 +383,19 @@ def GetBestSubreads(mappings, alignment_precision):
     
     return mappings
 
-def ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, alignment_precision, num_read_len_groups, pdf):
+def ReadMappings(mapping_file, contig_ids, min_mapq, min_mapping_length, keep_all_subreads, alignment_precision, num_read_len_groups, pdf):
     mappings = ReadPaf(mapping_file)
     if len(mappings) == 0:
         raise RuntimeError("Read mapping file empty.")
 
+    # Assign ids instead of read names
+    read_names = mappings[['q_name']].drop_duplicates()
+    read_names.reset_index(drop=True, inplace=True)
+    mappings['q_name'] = mappings[['q_name']].merge(read_names.reset_index(), on='q_name', how='left')['index'].values
+    mappings.rename(columns={'q_name':'q_id'}, inplace=True)
+    read_names.rename(columns={'q_name':'read_name'}, inplace=True)
+
+    # Extract coverage
     length_thresholds = GetThresholdsFromReadLenDist(mappings, num_read_len_groups)
     cov_counts = GetBinnedCoverage(mappings, length_thresholds)
     cov_probs = GetCoverageProbabilities(cov_counts, pdf)
@@ -396,11 +404,12 @@ def ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, alignmen
     # Filter low mapping qualities
     if pdf:
         PlotHist(pdf, "Mapping quality", "# Mappings", mappings['mapq'], threshold=min_mapq, logy=True)
-    mappings = mappings[min_mapq <= mappings['mapq']].copy()
+        PlotHist(pdf, "Mapping length", "# Mappings", mappings['t_end'] - mappings['t_start'], threshold=min_mapping_length, logy=True)
+    mappings = mappings[(min_mapq <= mappings['mapq']) & (min_mapping_length <= mappings['t_end'] - mappings['t_start'])].copy()
 
     # Remove all but the best subread
     if not keep_all_subreads:
-        mappings = GetBestSubreads(mappings, alignment_precision)
+        mappings = GetBestSubreads(mappings, read_names, alignment_precision)
 
     cov_counts = cov_counts.merge(GetBinnedCoverage(mappings, length_thresholds), on=['bin_size','t_name','bin'], how='outer').fillna(0)
     cov_counts['count'] = cov_counts['count'].astype(np.int64)
@@ -408,7 +417,7 @@ def ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, alignmen
     mappings['t_id'] = itemgetter(*mappings['t_name'])(contig_ids)
     cov_counts['t_id'] = itemgetter(*cov_counts['t_name'])(contig_ids)
 
-    return mappings, cov_counts, cov_probs
+    return mappings, cov_counts, cov_probs, read_names
 
 def RemoveUnmappedContigs(contigs, mappings, remove_zero_hit_contigs):
     # Schedule contigs for removal that don't have any high quality reads mapping to it
@@ -437,15 +446,15 @@ def RemoveUnmappedContigs(contigs, mappings, remove_zero_hit_contigs):
 
 def BreakReadsAtAdapters(mappings, adapter_signal_max_dist, keep_all_subreads):
     # Sort mappings by starting position and provide information on next/previous mapping (if from same read)
-    mappings.sort_values(['q_name','q_start'], inplace=True)
+    mappings.sort_values(['q_id','q_start'], inplace=True)
     
     mappings['next_con'] = mappings['t_id'].shift(-1, fill_value=-1)
-    mappings.loc[mappings['q_name'].shift(-1, fill_value='') != mappings['q_name'], 'next_con'] = -1
+    mappings.loc[mappings['q_id'].shift(-1, fill_value='') != mappings['q_id'], 'next_con'] = -1
     mappings['next_strand'] = mappings['strand'].shift(-1, fill_value='')
     mappings.loc[-1 == mappings['next_con'], 'next_strand'] = ''
     
     mappings['prev_con'] = mappings['t_id'].shift(1, fill_value=-1)
-    mappings.loc[mappings['q_name'].shift(1, fill_value='') != mappings['q_name'], 'prev_con'] = -1
+    mappings.loc[mappings['q_id'].shift(1, fill_value='') != mappings['q_id'], 'prev_con'] = -1
     mappings['prev_strand'] = mappings['strand'].shift(1, fill_value='')
     mappings.loc[-1 == mappings['prev_con'], 'prev_strand'] = ''
     
@@ -469,13 +478,13 @@ def BreakReadsAtAdapters(mappings, adapter_signal_max_dist, keep_all_subreads):
         mappings.loc[adapter, 'next_con'] = -1
         mappings.loc[adapter, 'next_strand'] = ''
         mappings.loc[adapter, 'read_end'] = mappings.loc[adapter, 'q_end'] # If the adapter was missed it's probably a bad part of the read, so better ignore it and don't use it for extensions
-        mappings['read_end'] = mappings.loc[::-1, ['q_name','read_end']].groupby('q_name', sort=False).cummin()[::-1]
+        mappings['read_end'] = mappings.loc[::-1, ['q_id','read_end']].groupby('q_id', sort=False).cummin()[::-1]
     
         adapter = adapter.shift(1, fill_value=False)
         mappings.loc[adapter, 'prev_con'] = -1
         mappings.loc[adapter, 'prev_strand'] = ''
         mappings.loc[adapter, 'read_start'] = mappings.loc[adapter, 'q_start'] # If the adapter was missed it's probably a bad part of the read, so better ignore it and don't use it for extensions
-        mappings['read_start'] = mappings[['q_name','read_start']].groupby('q_name', sort=False).cummax()
+        mappings['read_start'] = mappings[['q_id','read_start']].groupby('q_id', sort=False).cummax()
 
     return mappings
 
@@ -524,7 +533,7 @@ def GetBrokenMappings(mappings, covered_regions, max_dist_contig_end, min_length
 
 def GetNonInformativeMappings(mappings, contigs, min_extension, break_groups, pot_breaks):
     # All reads that are not extending contigs enough and do not have multiple mappings are non informative (except they overlap breaks)
-    non_informative_mappings = mappings[(min_extension > mappings['q_start']) & (min_extension > mappings['q_len']-mappings['q_end']) & (mappings['q_name'].shift(1, fill_value='') != mappings['q_name']) & (mappings['q_name'].shift(-1, fill_value='') != mappings['q_name'])].index
+    non_informative_mappings = mappings[(min_extension > mappings['q_start']) & (min_extension > mappings['q_len']-mappings['q_end']) & (mappings['q_id'].shift(1, fill_value='') != mappings['q_id']) & (mappings['q_id'].shift(-1, fill_value='') != mappings['q_id'])].index
     non_informative_mappings = np.setdiff1d(non_informative_mappings,pot_breaks['map_index'].values) # Remove breaking reads
     non_informative_mappings = mappings.loc[non_informative_mappings, ['t_id', 't_start', 't_end']]
 
@@ -550,7 +559,7 @@ def CallAllBreaksSpurious(mappings, contigs, covered_regions, max_dist_contig_en
     pot_breaks = GetBrokenMappings(mappings, covered_regions, max_dist_contig_end, min_length_contig_break, pdf)
 
     break_groups = []
-    spurious_break_indexes = pot_breaks[['map_index','q_name','read_side','q_start','q_end']].drop_duplicates()
+    spurious_break_indexes = pot_breaks[['map_index','q_id','read_side','q_start','q_end']].drop_duplicates()
     non_informative_mappings = GetNonInformativeMappings(mappings, contigs, min_extension, break_groups, pot_breaks)
 
     return break_groups, spurious_break_indexes, non_informative_mappings
@@ -564,7 +573,7 @@ def CalculateReadExtensionAfterMappingEnd(cur_mappings):
     return cur_mappings
 
 def PreparePotBreakPoints(pot_breaks, max_break_point_distance, min_mapping_length, min_num_reads):
-    break_points = pot_breaks[['contig_id','side','position','mapq','map_len','map_index','q_start','read_start','q_end','read_end','strand']].copy()
+    break_points = pot_breaks[['contig_id','side','position','mapq','map_len','map_index','q_start','read_start','q_end','read_end','strand','q_id']].copy()
     break_points['connected'] = 0 <= pot_breaks['con']
     break_points = CalculateReadExtensionAfterMappingEnd(break_points)
     break_points['ext_len'] = np.where(break_points['side'] == 'l', break_points['q_left'], break_points['q_right']) + break_points['map_len']
@@ -584,15 +593,14 @@ def PreparePotBreakPoints(pot_breaks, max_break_point_distance, min_mapping_leng
 
 def CountBreakSupport(break_points, max_break_point_distance, min_num_reads):
     if len(break_points):
-        # Check how many reads support a break_point with breaks within +- max_break_point_distance
+        # Store read_ids corresponding to each break index
+        read_ids = break_points[['q_id','mapq','connected']].copy()
+        # Find all breaks within +- max_break_point_distance
         break_points['ito'] = break_points['bindex']
         break_points.rename(columns={'bindex':'ifrom'}, inplace=True)
-        break_points['support'] = 1
-        break_points['con_supp'] = break_points['connected'].astype(int)
-        break_points = break_points.groupby(['contig_id','position','mapq']).agg({'ifrom':['min'], 'ito':['max'], 'support':['sum'], 'con_supp':['sum']}).droplevel(1, axis=1).reset_index()
+        break_points = break_points.groupby(['contig_id','position']).agg({'ifrom':'min', 'ito':'max'}).reset_index()
         break_points.sort_values(['ifrom'], inplace=True)
         break_points[['ifrom_org','ito_org']] = break_points[['ifrom','ito']].values
-        break_supp = []
         for direction in [+1,-1]:
             s = direction
             while True:
@@ -604,24 +612,30 @@ def CountBreakSupport(break_points, max_break_point_distance, min_num_reads):
                 else:
                     break_points.loc[break_points['position'] < break_points['supp_pos']-max_break_point_distance, 'supp_pos'] = -1
                     break_points['ito'] = np.where(break_points['supp_pos'] == -1, break_points['ito'], break_points['ito_org'].shift(s, fill_value=-1))
-                tmp_breaks = break_points[(break_points['supp_pos'] != -1)].drop(columns=['ifrom','ito','ifrom_org','ito_org']) # If we are at the same position we would multicount the values, when we do a cumsum later
-                if len(tmp_breaks):
-                    break_supp.append(tmp_breaks[(tmp_breaks['supp_pos'] != tmp_breaks['position'])].copy())
+                if np.sum(break_points['supp_pos'] != -1):
                     s += direction
                 else:
                     break
         break_points.drop(columns=['supp_pos','ifrom_org','ito_org'], inplace=True)
-        break_supp = pd.concat(break_supp, ignore_index=True).drop_duplicates() # Drop duplicates removes duplicated support with same supporting position and supported position that arrises due to the same position being multiple times in break_points with different mapq
-        break_supp['position'] = break_supp['supp_pos'] # Switch 'position' and 'supp_pos' so that 'position' is the one of the supported break
-        break_supp.drop(columns=['supp_pos'], inplace=True)
-        break_supp = pd.concat([break_supp, break_points[['contig_id','position','mapq','support','con_supp']]], ignore_index=True)
-        break_supp = break_supp.groupby(['contig_id','position','mapq']).sum().reset_index()
-        break_supp[['ifrom','ito']] = break_supp[['contig_id','position']].merge(break_points[['contig_id','position','ifrom','ito']].drop_duplicates(), on=['contig_id','position'], how='left')[['ifrom','ito']].values
-        break_points = break_supp
-        break_points.sort_values(['contig_id','position','mapq'], ascending=[True,True,False], inplace=True)
+        # Count support and connected support for each mapping quality
+        break_supp = break_points[['ifrom','ito']].drop_duplicates()
+        break_supp = break_supp.loc[np.repeat(break_supp.index.values, break_supp['ito']-break_supp['ifrom']+1)].copy()
+        break_supp['bindex'] = break_supp.groupby(['ifrom','ito'], sort=False).cumcount() + break_supp['ifrom']
+        break_supp[['q_id','mapq','connected']] = read_ids.loc[break_supp['bindex'].values].values
+        break_supp.drop(columns='bindex', inplace=True)
+        break_supp.sort_values(['ifrom','ito','q_id','mapq'], inplace=True)
+        break_con_supp = break_supp[break_supp['connected']].groupby(['ifrom','ito','q_id'], sort=False)['mapq'].last().reset_index() # Take the highest mapping quality for every read (so that we count only one support for it)
+        break_supp = break_supp.groupby(['ifrom','ito','q_id'], sort=False)['mapq'].last().reset_index() # Take the highest mapping quality for every read (so that we count only one support for it)
+        break_con_supp = break_con_supp.groupby(['ifrom','ito','mapq']).size().reset_index(name='con_supp')
+        break_supp = break_supp.groupby(['ifrom','ito','mapq']).size().reset_index(name='support')
+        break_supp['con_supp'] = break_supp[['ifrom','ito','mapq']].merge(break_con_supp, on=['ifrom','ito','mapq'], how='left')['con_supp'].fillna(0).astype(int).values
         # Add support from higher mapping qualities to lower mapping qualities
-        break_points['support'] = break_points.groupby(['contig_id','position'])['support'].cumsum()
-        break_points['con_supp'] = break_points.groupby(['contig_id','position'])['con_supp'].cumsum()
+        break_supp.sort_values(['ifrom','ito','mapq'], ascending=[True,True,False], inplace=True)
+        break_supp['support'] = break_supp.groupby(['ifrom','ito'])['support'].cumsum()
+        break_supp['con_supp'] = break_supp.groupby(['ifrom','ito'])['con_supp'].cumsum()
+        # Add support to break_points
+        break_points = break_points.merge(break_supp, on=['ifrom','ito'], how='left')
+        break_points.sort_values(['contig_id','position','mapq'], ascending=[True,True,False], inplace=True)
         # Require a support of at least min_num_reads at some mapping quality level
         max_support = break_points.groupby(['contig_id','position'], sort=False)['support'].agg(['max','size'])
         break_points = break_points[ np.repeat(max_support['max'].values, max_support['size'].values) >= min_num_reads].copy()
@@ -855,8 +869,8 @@ def FindBreakPoints(mappings, contigs, covered_regions, max_dist_contig_end, min
                                                         ((pot_breaks['position'].values > breaks['pos'].values + np.where((pot_breaks['side'] == 'l'), 1, -1)*min_mapping_length) & (pot_breaks['con_pos'].values > breaks['pos'].values + np.where((pot_breaks['side'] == 'l'), -1, 1)*min_mapping_length)) )
 #
         # A read is only correct in between two valid breaks/contig ends if all breaks in that region connect to another position inside that region (or has no breaks at all if allow_same_contig_breaks==False)
-        pot_breaks.sort_values(['q_name','q_start','q_end','read_pos'], inplace=True)
-        pot_breaks['group_id'] = ( (pot_breaks['q_name'] != pot_breaks['q_name'].shift(1)) | (pot_breaks['read_start'] != pot_breaks['read_start'].shift(1)) |
+        pot_breaks.sort_values(['q_id','q_start','q_end','read_pos'], inplace=True)
+        pot_breaks['group_id'] = ( (pot_breaks['q_id'] != pot_breaks['q_id'].shift(1)) | (pot_breaks['read_start'] != pot_breaks['read_start'].shift(1)) |
                                    (pot_breaks['contig_id'] != pot_breaks['contig_id'].shift(1)) |
                                    (pot_breaks['keep'] & (pot_breaks['read_pos'] == pot_breaks['q_start'])) |
                                    (pot_breaks['keep'] & (pot_breaks['read_pos'] == pot_breaks['q_end'])).shift(1, fill_value=False) ).cumsum()
@@ -866,10 +880,10 @@ def FindBreakPoints(mappings, contigs, covered_regions, max_dist_contig_end, min
         pot_breaks['keep'] = np.isin(pot_breaks['group_id'], self_con)
 #
         # Mappings not belonging to accepted breaks or connecting to itself are spurious
-        spurious_break_indexes = pot_breaks.loc[pot_breaks['keep'] == False, ['map_index','q_name','read_side','q_start','q_end']].drop_duplicates()
+        spurious_break_indexes = pot_breaks.loc[pot_breaks['keep'] == False, ['map_index','q_id','read_side','q_start','q_end']].drop_duplicates()
     else:
         # We don't have breaks, so all are spurious
-        spurious_break_indexes = pot_breaks[['map_index','q_name','read_side','q_start','q_end']].drop_duplicates()
+        spurious_break_indexes = pot_breaks[['map_index','q_id','read_side','q_start','q_end']].drop_duplicates()
 #
     non_informative_mappings = GetNonInformativeMappings(mappings, contigs, min_extension, break_groups, pot_breaks)
 #
@@ -1017,13 +1031,13 @@ def UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length, max_
     mappings.loc[(mappings['con_to'] < mappings['t_end']) & (mappings['strand'] == '-'), 'read_from'] = np.round(multi_maps['q_start'] + (multi_maps['q_end']-multi_maps['q_start'])/(multi_maps['t_end']-multi_maps['t_start'])*(multi_maps['t_end']-multi_maps['con_to'])).astype(int)
 #
     mappings['matches'] = np.round(mappings['matches']/(mappings['t_end']-mappings['t_start'])*(mappings['con_to']-mappings['con_from'])).astype(int) # Rough estimate use with care!
-    mappings.sort_values(['q_name','read_start','read_from','read_to'], inplace=True)
+    mappings.sort_values(['q_id','read_start','read_from','read_to'], inplace=True)
     mappings.reset_index(inplace=True, drop=True)
 #
     # Update connections
-    mappings['next_con'] = np.where((mappings['q_name'].shift(-1, fill_value='') != mappings['q_name']) | (mappings['read_start'].shift(-1, fill_value=-1) != mappings['read_start']), -1, mappings['conpart'].shift(-1, fill_value=-1))
+    mappings['next_con'] = np.where((mappings['q_id'].shift(-1, fill_value='') != mappings['q_id']) | (mappings['read_start'].shift(-1, fill_value=-1) != mappings['read_start']), -1, mappings['conpart'].shift(-1, fill_value=-1))
     mappings['next_strand'] = np.where(-1 == mappings['next_con'], '', mappings['strand'].shift(-1, fill_value=''))
-    mappings['prev_con'] = np.where((mappings['q_name'].shift(1, fill_value='') != mappings['q_name']) | (mappings['read_start'].shift(1, fill_value=-1) != mappings['read_start']), -1, mappings['conpart'].shift(1, fill_value=-1))
+    mappings['prev_con'] = np.where((mappings['q_id'].shift(1, fill_value='') != mappings['q_id']) | (mappings['read_start'].shift(1, fill_value=-1) != mappings['read_start']), -1, mappings['conpart'].shift(1, fill_value=-1))
     mappings['prev_strand'] = np.where(-1 == mappings['prev_con'], '', mappings['strand'].shift(1, fill_value=''))
 #
     mappings['left_con'] = np.where('+' == mappings['strand'], mappings['prev_con'], mappings['next_con'])
@@ -1065,12 +1079,12 @@ def UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length, max_
     mappings.loc[-1 == mappings['right_con'], 'right_con_dist'] = 0
 #
     # Select the columns we still need
-    mappings.rename(columns={'q_name':'read_name'}, inplace=True)
-    mappings = mappings.loc[remove == False, ['read_name', 'read_start', 'read_end', 'read_from', 'read_to', 'strand', 'conpart', 'con_from', 'con_to', 'left_con', 'left_con_side', 'left_con_dist', 'right_con', 'right_con_side', 'right_con_dist', 'mapq', 'matches']]
+    mappings.rename(columns={'q_id':'read_id'}, inplace=True)
+    mappings = mappings.loc[remove == False, ['read_id', 'read_start', 'read_end', 'read_from', 'read_to', 'strand', 'conpart', 'con_from', 'con_to', 'left_con', 'left_con_side', 'left_con_dist', 'right_con', 'right_con_side', 'right_con_dist', 'mapq', 'matches']]
 #
     # Count how many mappings each read has
     mappings['num_mappings'] = 1
-    num_mappings = mappings.groupby(['read_name','read_start'], sort=False)['num_mappings'].size().values
+    num_mappings = mappings.groupby(['read_id','read_start'], sort=False)['num_mappings'].size().values
     mappings['num_mappings'] = np.repeat(num_mappings, num_mappings)
 
     return mappings
@@ -1580,14 +1594,14 @@ def GetLongRangeConnections(bridges, mappings, contig_parts, max_dist_contig_end
     long_range_mappings = mappings[mappings['num_mappings']>=3].copy()
     if len(long_range_mappings):
         alternative_connections = bridges.loc[(bridges['from_alt'] > 1) | (bridges['to_alt'] > 1), ['from','from_side']].rename(columns={'from':'conpart','from_side':'side'}).drop_duplicates()
-        interesting_reads = long_range_mappings[['read_name','read_start','conpart','right_con','left_con']].merge(alternative_connections, on=['conpart'], how='inner')
+        interesting_reads = long_range_mappings[['read_id','read_start','conpart','right_con','left_con']].merge(alternative_connections, on=['conpart'], how='inner')
         interesting_reads = interesting_reads[ ((interesting_reads['side'] == 'r') & (interesting_reads['right_con'] >= 0)) | ((interesting_reads['side'] == 'l') & (interesting_reads['left_con'] >= 0)) ].copy() # Only keep reads that have a connection in the interesting direction
-        long_range_mappings = long_range_mappings.merge(interesting_reads[['read_name','read_start']].drop_duplicates(), on=['read_name','read_start'], how='inner')
+        long_range_mappings = long_range_mappings.merge(interesting_reads[['read_id','read_start']].drop_duplicates(), on=['read_id','read_start'], how='inner')
 #
     if len(long_range_mappings):
         # Get long_range_connections that are supported by reads
         long_range_connections = long_range_mappings[['conpart','strand','left_con_dist','right_con_dist','left_con','right_con','con_from','con_to','read_start','read_end','read_from','read_to']].copy()
-        long_range_connections['conn_id'] = ((long_range_mappings['read_name'] != long_range_mappings['read_name'].shift(1, fill_value='')) | (long_range_mappings['read_start'] != long_range_mappings['read_start'].shift(1, fill_value=-1))).cumsum()
+        long_range_connections['conn_id'] = ((long_range_mappings['read_id'] != long_range_mappings['read_id'].shift(1, fill_value='')) | (long_range_mappings['read_start'] != long_range_mappings['read_start'].shift(1, fill_value=-1))).cumsum()
         # Get extlen
         long_range_connections['maplen'] = long_range_connections['con_to'] - long_range_connections['con_from']
         long_range_connections['con_from'] -= contig_parts.loc[long_range_connections['conpart'].values, 'start'].values
@@ -7234,17 +7248,17 @@ def BasicMappingToScaffolds(mappings, all_scafs):
     mappings = mappings[(mappings['main'] == False) | (mappings['lcon'] >= 0) | (mappings['rcon'] >= 0)].drop(columns=['main']) # Remove alternative haplotypes, where both sides, but not the contig itself, are distinct from the main path and the read does not reach either side
     # Check that we do not have another haplotype with a longer scaffold supported by the read
     mappings['nconns'] = (mappings[['lpos','rpos']] >= 0).sum(axis=1)
-    mappings.sort_values(['read_name','read_start','read_pos','scaf','pos','lhap','rhap'], inplace=True)
-    mappings = mappings[ ( (mappings[['read_name','read_start','read_pos','scaf','pos']] != mappings[['read_name','read_start','read_pos','scaf','pos']].shift(1)).any(axis=1) | (mappings['nconns'] >= mappings['nconns'].shift(1)) ) &
-                         ( (mappings[['read_name','read_start','read_pos','scaf','pos']] != mappings[['read_name','read_start','read_pos','scaf','pos']].shift(-1)).any(axis=1) | (mappings['nconns'] >= mappings['nconns'].shift(-1)) ) ].copy()
+    mappings.sort_values(['read_id','read_start','read_pos','scaf','pos','lhap','rhap'], inplace=True)
+    mappings = mappings[ ( (mappings[['read_id','read_start','read_pos','scaf','pos']] != mappings[['read_id','read_start','read_pos','scaf','pos']].shift(1)).any(axis=1) | (mappings['nconns'] >= mappings['nconns'].shift(1)) ) &
+                         ( (mappings[['read_id','read_start','read_pos','scaf','pos']] != mappings[['read_id','read_start','read_pos','scaf','pos']].shift(-1)).any(axis=1) | (mappings['nconns'] >= mappings['nconns'].shift(-1)) ) ].copy()
     mappings.drop(columns=['nconns'], inplace=True)
 #
     # Assign groups to separate parts of a read mapping to two separate (maybe overlapping) locations on the scaffold
-    mappings['group'] = ( (mappings['read_name'] != mappings['read_name'].shift(1)) | (mappings['read_start'] != mappings['read_start'].shift(1)) | (mappings['read_pos'] != mappings['read_pos'].shift(1)+1) | # We do not follow the read
+    mappings['group'] = ( (mappings['read_id'] != mappings['read_id'].shift(1)) | (mappings['read_start'] != mappings['read_start'].shift(1)) | (mappings['read_pos'] != mappings['read_pos'].shift(1)+1) | # We do not follow the read
                           (mappings['scaf'] != mappings['scaf'].shift(1)) | (np.where(mappings['strand'] == '-', mappings['rpos'], mappings['lpos']) != mappings['pos'].shift(1)) | # We do not follow the scaffold
                           np.where(mappings['strand'] == '-', mappings['rhap'] != mappings['lhap'].shift(1), mappings['lhap'] != mappings['rhap'].shift(1)) ) # We do not follow the haplotype
-    mappings['unigroup'] = ( mappings['group'] | ((mappings['read_name'] == mappings['read_name'].shift(2)) & (mappings['read_pos'] == mappings['read_pos'].shift(2)+1)) | 
-                                                 ((mappings['read_name'] == mappings['read_name'].shift(-1)) & (mappings['read_pos'] == mappings['read_pos'].shift(-1))) ).cumsum() # We have more than one option (thus while we want to group them if everything is correct, we do not want to propagate errors through those branchings, because the other side might correctly continue along another branch)
+    mappings['unigroup'] = ( mappings['group'] | ((mappings['read_id'] == mappings['read_id'].shift(2)) & (mappings['read_pos'] == mappings['read_pos'].shift(2)+1)) | 
+                                                 ((mappings['read_id'] == mappings['read_id'].shift(-1)) & (mappings['read_pos'] == mappings['read_pos'].shift(-1))) ).cumsum() # We have more than one option (thus while we want to group them if everything is correct, we do not want to propagate errors through those branchings, because the other side might correctly continue along another branch)
     mappings['group'] = mappings['group'].cumsum()
     # Remove mappings, where reads do not continue, allthough they should
     old_len = 0
@@ -7252,7 +7266,7 @@ def BasicMappingToScaffolds(mappings, all_scafs):
         old_len = len(mappings)
         for d, d2 in zip(['l','r'],['r','l']):
             mappings['check_pos'] = mappings['read_pos'] + np.where(mappings['strand'] == '+', -1, 1) * (1 if d == 'l' else -1)
-            invalid = mappings.loc[(mappings[f'{d}con'] >= 0) & (mappings[f'{d}pos'] >= 0), ['read_name','read_start','check_pos','scaf',f'{d}pos',f'{d}hap','unigroup']].merge(mappings[['read_name','read_start','read_pos','scaf','pos',f'{d2}hap']].rename(columns={'read_pos':'check_pos','pos':f'{d}pos',f'{d2}hap':f'{d}hap'}), on=['read_name','read_start','check_pos','scaf',f'{d}pos',f'{d}hap'], how='left', indicator=True)[['unigroup','_merge']]
+            invalid = mappings.loc[(mappings[f'{d}con'] >= 0) & (mappings[f'{d}pos'] >= 0), ['read_id','read_start','check_pos','scaf',f'{d}pos',f'{d}hap','unigroup']].merge(mappings[['read_id','read_start','read_pos','scaf','pos',f'{d2}hap']].rename(columns={'read_pos':'check_pos','pos':f'{d}pos',f'{d2}hap':f'{d}hap'}), on=['read_id','read_start','check_pos','scaf',f'{d}pos',f'{d}hap'], how='left', indicator=True)[['unigroup','_merge']]
             invalid = np.unique(invalid.loc[invalid['_merge'] == "left_only", 'unigroup'].values)
             mappings = mappings[np.isin(mappings['unigroup'], invalid) == False].copy()
     mappings.drop(columns=['unigroup'], inplace=True)
@@ -7260,7 +7274,7 @@ def BasicMappingToScaffolds(mappings, all_scafs):
     groups = []
     for d, d2 in zip(['l','r'],['r','l']):
         mappings['check_pos'] = mappings['read_pos'] + np.where(mappings['strand'] == '+', -1, 1) * (1 if d == 'l' else -1)
-        new_groups = mappings[['read_name','read_start','check_pos','scaf',f'{d}pos',f'{d}hap','group']].merge(mappings[['read_name','read_start','read_pos','scaf','pos',f'{d2}hap','group']].rename(columns={'read_pos':'check_pos','pos':f'{d}pos',f'{d2}hap':f'{d}hap','group':f'{d}group'}), on=['read_name','read_start','check_pos','scaf',f'{d}pos',f'{d}hap'], how='inner')[['group',f'{d}group']] # We can have multiple matches here, when haplotypes split, we will handle that later
+        new_groups = mappings[['read_id','read_start','check_pos','scaf',f'{d}pos',f'{d}hap','group']].merge(mappings[['read_id','read_start','read_pos','scaf','pos',f'{d2}hap','group']].rename(columns={'read_pos':'check_pos','pos':f'{d}pos',f'{d2}hap':f'{d}hap','group':f'{d}group'}), on=['read_id','read_start','check_pos','scaf',f'{d}pos',f'{d}hap'], how='inner')[['group',f'{d}group']] # We can have multiple matches here, when haplotypes split, we will handle that later
         new_groups = new_groups[new_groups['group'] != new_groups[f'{d}group']].drop_duplicates()
         if len(groups) == 0:
             groups = new_groups
@@ -7358,7 +7372,7 @@ def BasicMappingToScaffolds(mappings, all_scafs):
 
 def MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploidy):
     # Preserve some information on the neighbouring mappings that we need later
-    mappings['read_pos'] = mappings.groupby(['read_name','read_start'], sort=False).cumcount()
+    mappings['read_pos'] = mappings.groupby(['read_id','read_start'], sort=False).cumcount()
     mappings[['lmapq','lmatches']] = mappings[['mapq','matches']].shift(1, fill_value=-1).values
     tmp =  mappings[['mapq','matches']].shift(-1, fill_value=-1)
     mappings['rmapq'] = np.where(mappings['strand'] == '+', tmp['mapq'].values, mappings['lmapq'].values)
@@ -7381,8 +7395,8 @@ def MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploi
         conn_cov['cov'] = conn_cov['cov'].fillna(0).astype(int)
 #
         # Remove reads, where they map to multiple locations (keep them separately, so that we can restore them if it does leave a connection between contigs without reads)
-        dups_maps = mappings[['read_name','read_start','read_pos','scaf','pos']].drop_duplicates().groupby(['read_name','read_start','read_pos'], sort=False).size().reset_index(name='count')
-        mcols = ['read_name','read_start','read_pos']
+        dups_maps = mappings[['read_id','read_start','read_pos','scaf','pos']].drop_duplicates().groupby(['read_id','read_start','read_pos'], sort=False).size().reset_index(name='count')
+        mcols = ['read_id','read_start','read_pos']
         mappings['count'] = mappings[mcols].merge(dups_maps, on=mcols, how='left')['count'].values
         dups_maps = mappings[['group','count']].groupby(['group'])['count'].min().reset_index(name='gcount')
         mappings.rename(columns={'count':'gcount'}, inplace=True)
@@ -7425,23 +7439,23 @@ def MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploi
 #                sel = (h == unsupp_conns['hap']) & (unsupp_conns[f'con{h}'] >= 0)
 #                unsupp_conns.loc[sel, 'rcon'] = unsupp_conns.loc[sel, f'con{h}'] 
 #            unsupp_conns.drop(columns=[f'con{h}' for h in range(1,ploidy)], inplace=True)
-#            lreads = unsupp_conns[['lcon']].reset_index().merge(org_mappings[['conpart','read_name']].rename(columns={'conpart':'lcon'}), on=['lcon'], how='inner')
-#            rreads = unsupp_conns[['rcon']].reset_index().merge(org_mappings[['conpart','read_name']].rename(columns={'conpart':'rcon'}), on=['rcon'], how='inner')
-#            supp_reads = lreads.drop(columns=['lcon']).merge(rreads.drop(columns=['rcon']), on=['index','read_name'], how='inner')[['read_name']].drop_duplicates()
+#            lreads = unsupp_conns[['lcon']].reset_index().merge(org_mappings[['conpart','read_id']].rename(columns={'conpart':'lcon'}), on=['lcon'], how='inner')
+#            rreads = unsupp_conns[['rcon']].reset_index().merge(org_mappings[['conpart','read_id']].rename(columns={'conpart':'rcon'}), on=['rcon'], how='inner')
+#            supp_reads = lreads.drop(columns=['lcon']).merge(rreads.drop(columns=['rcon']), on=['index','read_id'], how='inner')[['read_id']].drop_duplicates()
 #            # Remove reads that already have a valid mapping to scaffold_paths
-#            supp_reads = supp_reads.loc[supp_reads.merge(mappings[['read_name']].drop_duplicates(), on=['read_name'], how='left', indicator=True)['_merge'].values == "left_only", :]
-#            supp_reads = supp_reads.loc[supp_reads.merge(dups_maps[['read_name']].drop_duplicates(), on=['read_name'], how='left', indicator=True)['_merge'].values == "left_only", :]
-#            supp_reads = supp_reads.merge(org_mappings, on=['read_name'], how='inner')
-#            supp_reads.sort_values(['read_name','read_start','read_pos'], inplace=True)
+#            supp_reads = supp_reads.loc[supp_reads.merge(mappings[['read_id']].drop_duplicates(), on=['read_id'], how='left', indicator=True)['_merge'].values == "left_only", :]
+#            supp_reads = supp_reads.loc[supp_reads.merge(dups_maps[['read_id']].drop_duplicates(), on=['read_id'], how='left', indicator=True)['_merge'].values == "left_only", :]
+#            supp_reads = supp_reads.merge(org_mappings, on=['read_id'], how='inner')
+#            supp_reads.sort_values(['read_id','read_start','read_pos'], inplace=True)
 #            # Remove the unsupported connections from all_scafs and try mapping supp_reads again
 #            all_scafs.loc[all_scafs[['scaf','pos','rhap']].merge(unsupp_conns[['scaf','lpos','hap']].rename(columns={'lpos':'pos','hap':'rhap'}), on=['scaf','pos','rhap'], how='left', indicator=True)['_merge'].values == "both", ['rpos','rcon','rstrand','rdist','rdmin','rdmax']] = [-1,-1,'',0,-int(sys.maxsize*0.99),int(sys.maxsize)*0.99]
 #            all_scafs.loc[all_scafs[['scaf','pos','lhap']].merge(unsupp_conns[['scaf','rpos','hap']].rename(columns={'rpos':'pos','hap':'lhap'}), on=['scaf','pos','lhap'], how='left', indicator=True)['_merge'].values == "both", ['lpos','lcon','lstrand','ldist','ldmin','ldmax']] = [-1,-1,'',0,-int(sys.maxsize*0.99),int(sys.maxsize)*0.99]
 #            supp_reads = BasicMappingToScaffolds(supp_reads, all_scafs)
 #            # Only keep supp_reads that still map to both sides of a the unsupported connection
-#            lreads = unsupp_conns[['lcon']].reset_index().merge(supp_reads[['conpart','read_name']].rename(columns={'conpart':'lcon'}), on=['lcon'], how='inner')
-#            rreads = unsupp_conns[['rcon']].reset_index().merge(supp_reads[['conpart','read_name']].rename(columns={'conpart':'rcon'}), on=['rcon'], how='inner')
-#            supp_reads = lreads.drop(columns=['lcon']).merge(rreads.drop(columns=['rcon']), on=['index','read_name'], how='inner')[['read_name']].drop_duplicates().merge(supp_reads, on=['read_name'], how='inner')
-#            supp_reads.sort_values(['read_name','read_start','read_pos'], inplace=True)
+#            lreads = unsupp_conns[['lcon']].reset_index().merge(supp_reads[['conpart','read_id']].rename(columns={'conpart':'lcon'}), on=['lcon'], how='inner')
+#            rreads = unsupp_conns[['rcon']].reset_index().merge(supp_reads[['conpart','read_id']].rename(columns={'conpart':'rcon'}), on=['rcon'], how='inner')
+#            supp_reads = lreads.drop(columns=['lcon']).merge(rreads.drop(columns=['rcon']), on=['index','read_id'], how='inner')[['read_id']].drop_duplicates().merge(supp_reads, on=['read_id'], how='inner')
+#            supp_reads.sort_values(['read_id','read_start','read_pos'], inplace=True)
             # Remove supp_reads, where read_pos have been filtered out between both sides of the unsupported connection
             
             # supp_reads[supp_reads['scaf'] == 214].drop(columns=['read_start','read_end','read_from','read_to','con_from','con_to','matches','lmatches','rmatches'])
@@ -7474,7 +7488,7 @@ def MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploi
         dups_maps.loc[dups_maps['rcon'] < 0, 'rci'] = -1
         dups_maps = dups_maps.loc[(dups_maps['lci'] >= 0) | (dups_maps['rci'] >= 0), :]
         # Duplicate entries that have a left and a right connection that can only be filled with a duplicated read
-        dups_maps.sort_values(['read_name','read_start','group','read_pos','scaf','pos','lhap','rhap'], inplace=True)
+        dups_maps.sort_values(['read_id','read_start','group','read_pos','scaf','pos','lhap','rhap'], inplace=True)
         dups_maps.reset_index(inplace=True)
         dups_maps = dups_maps.loc[np.repeat(dups_maps.index.values, (dups_maps['lci'] >= 0).values.astype(int) + (dups_maps['rci'] >= 0).values.astype(int))].reset_index(drop=True)
         dups_maps.loc[dups_maps['index'] == dups_maps['index'].shift(1), 'lci'] = -1
@@ -7495,15 +7509,15 @@ def MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploi
         # In rare cases a read can map on the forward and reverse strand, chose one of those arbitrarily
         dups_maps['ci'] = dups_maps[['lci','rci']].max(axis=1) # Only one is != -1 at this point
         dups_maps.drop(columns=['lci','rci'], inplace=True)
-        dups_maps.sort_values(['read_name','read_start','group','ci'], inplace=True)
-        tmp = dups_maps.groupby(['read_name','read_start','group','ci'], sort=False).size().reset_index(name='mappings')
+        dups_maps.sort_values(['read_id','read_start','group','ci'], inplace=True)
+        tmp = dups_maps.groupby(['read_id','read_start','group','ci'], sort=False).size().reset_index(name='mappings')
         if np.sum(tmp['mappings'] != 2):
             print("Error: A connection between two mappings of a read has more or less than two mappings associated.")
             print(tmp[tmp['mappings'] != 2])
-        tmp = tmp.drop(columns=['mappings']).groupby(['read_name','read_start','ci'], sort=False).first().reset_index() # Take here the group with the lower id to resolve the strand conflict
-        dups_maps = dups_maps.merge(tmp, on=['read_name','read_start','group','ci'], how='inner')
+        tmp = tmp.drop(columns=['mappings']).groupby(['read_id','read_start','ci'], sort=False).first().reset_index() # Take here the group with the lower id to resolve the strand conflict
+        dups_maps = dups_maps.merge(tmp, on=['read_id','read_start','group','ci'], how='inner')
         # Trim the length of the duplicated reads, such taht we do not use them for extending
-        tmp = dups_maps.groupby(['read_name','read_start','group','ci'], sort=False).agg({'read_from':['min'], 'read_to':['max']})
+        tmp = dups_maps.groupby(['read_id','read_start','group','ci'], sort=False).agg({'read_from':['min'], 'read_to':['max']})
         dups_maps['read_start'] = np.repeat( tmp['read_from','min'].values, 2 )
         dups_maps['read_end'] = np.repeat( tmp['read_to','max'].values, 2 )
         # Assing a map id to uniquely identify the individual mapping groups
@@ -7511,10 +7525,10 @@ def MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploi
         dups_maps['mapid'] = ((dups_maps['group'] != dups_maps['group'].shift(1)) | (dups_maps['ci'] != dups_maps['ci'].shift(1))).cumsum() + mappings['mapid'].max()
         dups_maps.drop(columns=['group','ci'], inplace=True)
         # Update read positions
-        dups_maps.sort_values(['read_name','read_start','mapid','read_pos'], inplace=True)
-        dups_maps['read_pos'] = dups_maps.groupby(['read_name','read_start','mapid'], sort=False).cumcount()
+        dups_maps.sort_values(['read_id','read_start','mapid','read_pos'], inplace=True)
+        dups_maps['read_pos'] = dups_maps.groupby(['read_id','read_start','mapid'], sort=False).cumcount()
         # Merge unique and duplicated mappings
-        mappings = pd.concat([mappings, dups_maps], ignore_index=True).sort_values(['read_name','read_start','mapid','read_pos'], ignore_index=True)
+        mappings = pd.concat([mappings, dups_maps], ignore_index=True).sort_values(['read_id','read_start','mapid','read_pos'], ignore_index=True)
         mappings['mapid'] = (mappings['mapid'] != mappings['mapid'].shift(1)).cumsum()-1
 #
         # Break connections where they are not supported by reads even with multi mapping reads and after fixing attemps(should never happen, so give a warning)
@@ -7558,7 +7572,7 @@ def MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploi
     mappings.loc[(mappings['rpos'] >= 0) | (mappings['rcon'] < 0), [f'con{h}' for h in range(ploidy)]] = -1
     # Check if the read continues at the beginning of the scaffold
     mappings['check_pos'] = mappings['read_pos'] + np.where(mappings['strand'] == '+', 1, -1)
-    mappings['rmapid'] = mappings[['read_name','read_start','scaf','strand','check_pos']].merge(mappings.loc[mappings['pos'] == 0, ['read_name','read_start','scaf','strand','read_pos','mapid']].rename(columns={'read_pos':'check_pos'}).drop_duplicates(), on=['read_name','read_start','scaf','strand','check_pos'], how='left')['mapid'].values
+    mappings['rmapid'] = mappings[['read_id','read_start','scaf','strand','check_pos']].merge(mappings.loc[mappings['pos'] == 0, ['read_id','read_start','scaf','strand','read_pos','mapid']].rename(columns={'read_pos':'check_pos'}).drop_duplicates(), on=['read_id','read_start','scaf','strand','check_pos'], how='left')['mapid'].values
     mappings.loc[np.isnan(mappings['rmapid']), [f'con{h}' for h in range(ploidy)]] = -1
     mappings['rmapid'] = mappings['rmapid'].fillna(-1).astype(int)
     mappings.drop(columns=['check_pos'], inplace=True)
@@ -7608,7 +7622,7 @@ def MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploi
         mappings.loc[mappings['circular'] == False, 'rmapid'] = mappings.loc[mappings['circular'] == False, 'mapid']
         mappings.drop(columns=[f'con{h}' for h in range(ploidy)] + [f'rmdist{h}' for h in range(ploidy)] + ['hap','rmdist','circular','nhap'], inplace=True)
         mappings['check_pos'] = mappings['read_pos'] + np.where(mappings['strand'] == '+', 1, -1)
-        mappings[['circular','nhap']] = mappings[['read_name','read_start','read_pos','scaf','pos','strand','conpart','lcon','ldist','mapid']].merge(mappings.loc[mappings['rpos'] == 0, ['read_name','read_start','scaf','strand','check_pos','rpos','conpart','rcon','rdist','rmapid','pos','rhap']].rename(columns={'check_pos':'read_pos','rpos':'pos','conpart':'lcon','rcon':'conpart','rdist':'ldist','rmapid':'mapid','pos':'circular'}), on=['read_name','read_start','read_pos','scaf','pos','strand','conpart','lcon','ldist','mapid'], how='left')[['circular','rhap']].values
+        mappings[['circular','nhap']] = mappings[['read_id','read_start','read_pos','scaf','pos','strand','conpart','lcon','ldist','mapid']].merge(mappings.loc[mappings['rpos'] == 0, ['read_id','read_start','scaf','strand','check_pos','rpos','conpart','rcon','rdist','rmapid','pos','rhap']].rename(columns={'check_pos':'read_pos','rpos':'pos','conpart':'lcon','rcon':'conpart','rdist':'ldist','rmapid':'mapid','pos':'circular'}), on=['read_id','read_start','read_pos','scaf','pos','strand','conpart','lcon','ldist','mapid'], how='left')[['circular','rhap']].values
         mappings.loc[np.isnan(mappings['circular']) == False, ['lpos','lhap']] = mappings.loc[np.isnan(mappings['circular']) == False, ['circular','nhap']].astype(int).values
         mappings.drop(columns=['check_pos','circular','nhap'], inplace=True)
 #
@@ -7668,7 +7682,7 @@ def CountResealedBreaks(result_info, scaffold_paths, contig_parts, ploidy):
     return result_info
 
 def FindBestReadsToFillGaps(mappings, overlap_bridges):
-    possible_reads = mappings.loc[(mappings['rcon'] >= 0) & (mappings['rpos'] >= 0), ['scaf','pos','rhap','rpos','read_pos','read_name','read_start','read_from','read_to','strand','rdist','mapq','rmapq','matches','rmatches','con_from','con_to','rmapid']].sort_values(['scaf','pos','rhap'])
+    possible_reads = mappings.loc[(mappings['rcon'] >= 0) & (mappings['rpos'] >= 0), ['scaf','pos','rhap','rpos','read_pos','read_id','read_start','read_from','read_to','strand','rdist','mapq','rmapq','matches','rmatches','con_from','con_to','rmapid']].sort_values(['scaf','pos','rhap'])
 #
     # First take the one with the highest mapping qualities on both sides
     possible_reads['cmapq'] = np.minimum(possible_reads['mapq'], possible_reads['rmapq'])*1000 + np.maximum(possible_reads['mapq'], possible_reads['rmapq'])
@@ -7705,13 +7719,13 @@ def FindBestReadsToFillGaps(mappings, overlap_bridges):
 #
     # Get the mapping information for the other side of the gap
     possible_reads['read_pos'] += np.where(possible_reads['strand'] == '+', 1, -1)
-    possible_reads[['rcon_from','rcon_to']] = possible_reads[['read_name','read_start','read_pos','scaf','pos','rpos','rmapid']].merge(mappings[['read_name','read_start','read_pos','scaf','pos','lpos','con_from','con_to','mapid']].rename(columns={'pos':'rpos','lpos':'pos','con_from':'rcon_from','con_to':'rcon_to','mapid':'rmapid'}), on=['read_name','read_start','read_pos','scaf','pos','rpos','rmapid'], how='left')[['rcon_from','rcon_to']].astype(int).values
+    possible_reads[['rcon_from','rcon_to']] = possible_reads[['read_id','read_start','read_pos','scaf','pos','rpos','rmapid']].merge(mappings[['read_id','read_start','read_pos','scaf','pos','lpos','con_from','con_to','mapid']].rename(columns={'pos':'rpos','lpos':'pos','con_from':'rcon_from','con_to':'rcon_to','mapid':'rmapid'}), on=['read_id','read_start','read_pos','scaf','pos','rpos','rmapid'], how='left')[['rcon_from','rcon_to']].astype(int).values
     possible_reads.drop(columns=['read_pos','read_start','rmapid'], inplace=True)
 #
     # Add overlap_bridges as pseudo reads
     if len(overlap_bridges):
         pseudo_reads = overlap_bridges[['scaf','lpos','hap','rpos','q_start','q_end','t_start','t_end']].rename(columns={'lpos':'pos','hap':'rhap','q_start':'con_from','q_end':'con_to','t_start':'rcon_from','t_end':'rcon_to'})
-        pseudo_reads['read_name'] = np.repeat("__overlap_bridge__", len(pseudo_reads)).astype(np.object) + (np.arange(len(pseudo_reads))+1).astype(str)
+        pseudo_reads['read_id'] = mappings['read_id'].max() + 1 + np.arange(len(pseudo_reads))
         pseudo_reads['read_from'] = 0
         pseudo_reads['read_to'] = 0
         pseudo_reads['strand'] = '+'
@@ -7720,12 +7734,14 @@ def FindBestReadsToFillGaps(mappings, overlap_bridges):
 #
     return possible_reads
 
-def StoreReadAndContingInformationInScaffoldPaths(scaffold_paths, contig_parts, possible_reads, ploidy):
+def StoreReadAndContingInformationInScaffoldPaths(scaffold_paths, contig_parts, possible_reads, read_names, ploidy):
     for h in range(ploidy):
         # Insert contig information
         scaffold_paths = scaffold_paths.merge(contig_parts[['name','start','end']].reset_index().rename(columns={'index':f'con{h}','name':f'name{h}','start':f'start{h}','end':f'end{h}'}), on=[f'con{h}'], how='left')
         # Insert read information
-        scaffold_paths = scaffold_paths.merge(possible_reads.loc[possible_reads['rhap'] == h, ['scaf','pos','read_name','read_from','read_to','strand','con_from','con_to']].rename(columns={'read_name':f'read_name{h}','read_from':f'read_from{h}','read_to':f'read_to{h}','strand':f'read_strand{h}','con_from':f'con_from{h}','con_to':f'con_to{h}'}), on=['scaf','pos'], how='left')
+        scaffold_paths = scaffold_paths.merge(possible_reads.loc[possible_reads['rhap'] == h, ['scaf','pos','read_id','read_from','read_to','strand','con_from','con_to']].rename(columns={'read_id':f'read_name{h}','read_from':f'read_from{h}','read_to':f'read_to{h}','strand':f'read_strand{h}','con_from':f'con_from{h}','con_to':f'con_to{h}'}), on=['scaf','pos'], how='left')
+        scaffold_paths.loc[scaffold_paths[f'read_to{h}'] > 0, f'read_name{h}'] = read_names.loc[ scaffold_paths.loc[scaffold_paths[f'read_to{h}'] > 0, f'read_name{h}'].values, 'read_name' ].values # Convert read id back into the name
+        scaffold_paths.loc[scaffold_paths[f'read_to{h}'] == 0, f'read_name{h}'] = "__pseudo_read__"
         scaffold_paths = scaffold_paths.merge(possible_reads.loc[possible_reads['rhap'] == h, ['scaf','rpos','rcon_from','rcon_to']].rename(columns={'rpos':'pos','rcon_from':f'rcon_from{h}','rcon_to':f'rcon_to{h}'}), on=['scaf','pos'], how='left')
     # Split into contig and read part and apply information
     scaffold_paths = scaffold_paths.loc[np.repeat(scaffold_paths.index.values, 1+(scaffold_paths[[f'read_name{h}' for h in range(ploidy)]].isnull().all(axis=1) == False) )].reset_index()
@@ -7850,7 +7866,7 @@ def RemoveNonExtendingMappings(mappings, contig_parts, max_dist_contig_end, min_
     mappings['unmap_ext'] = np.maximum(0,np.where(mappings['side'] == 'l', mappings['ldist'], mappings['rdist'])-mappings['trim'])
     no_connection = np.where(mappings['side'] == 'l', mappings['lcon'], mappings['rcon']) < 0
     mappings.loc[no_connection, 'unmap_ext'] = mappings.loc[no_connection, 'ext']
-    mappings = mappings[['scaf','side','hap','ext','trim','unmap_ext','read_name','read_start','read_end','read_from','read_to','strand','mapq','matches']].copy()
+    mappings = mappings[['scaf','side','hap','ext','trim','unmap_ext','read_id','read_start','read_end','read_from','read_to','strand','mapq','matches']].copy()
     # Only keep extension, when there are enough of them
     mappings.sort_values(['scaf','side','hap'], inplace=True)
     count = mappings.groupby(['scaf','side','hap'], sort=False).size().values
@@ -7858,10 +7874,12 @@ def RemoveNonExtendingMappings(mappings, contig_parts, max_dist_contig_end, min_
 #
     return mappings
 
-def FillGapsWithReads(scaffold_paths, mappings, contig_parts, overlap_bridges, ploidy, max_dist_contig_end, min_extension, min_num_reads, pdf):
+def FillGapsWithReads(scaffold_paths, mappings, contig_parts, read_names, overlap_bridges, ploidy, max_dist_contig_end, min_extension, min_num_reads, pdf):
     possible_reads = FindBestReadsToFillGaps(mappings, overlap_bridges)
-    scaffold_paths = StoreReadAndContingInformationInScaffoldPaths(scaffold_paths, contig_parts, possible_reads, ploidy)
+    scaffold_paths = StoreReadAndContingInformationInScaffoldPaths(scaffold_paths, contig_parts, possible_reads, read_names, ploidy)
     mappings = RemoveNonExtendingMappings(mappings, contig_parts, max_dist_contig_end, min_extension, min_num_reads, pdf)
+    mappings['read_id'] = read_names.loc[ mappings['read_id'].values, 'read_name' ].values
+    mappings.rename(columns={'read_id':'read_name'}, inplace=True)
 #
     return scaffold_paths, mappings
 
@@ -7975,7 +7993,7 @@ def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     repeats = LoadRepeats(repeat_file, contig_ids)
 #
     print( str(timedelta(seconds=clock())), "Filtering mappings")
-    mappings, cov_counts, cov_probs = ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, alignment_precision, num_read_len_groups, pdf)
+    mappings, cov_counts, cov_probs, read_names = ReadMappings(mapping_file, contig_ids, min_mapq, min_mapping_length, keep_all_subreads, alignment_precision, num_read_len_groups, pdf)
     contigs, covered_regions = RemoveUnmappedContigs(contigs, mappings, remove_zero_hit_contigs)
     mappings = BreakReadsAtAdapters(mappings, alignment_precision, keep_all_subreads)
 #
@@ -8009,7 +8027,7 @@ def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     print( str(timedelta(seconds=clock())), "Fill gaps")
     mappings, scaffold_paths, overlap_bridges = MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploidy) # Might break apart scaffolds again, if we cannot find a mapping read for a connection
     result_info = CountResealedBreaks(result_info, scaffold_paths, contig_parts, ploidy)
-    scaffold_paths, mappings = FillGapsWithReads(scaffold_paths, mappings, contig_parts, overlap_bridges, ploidy, max_dist_contig_end, min_extension, min_num_reads, pdf) # Mappings are prepared for scaffold extensions
+    scaffold_paths, mappings = FillGapsWithReads(scaffold_paths, mappings, contig_parts, read_names, overlap_bridges, ploidy, max_dist_contig_end, min_extension, min_num_reads, pdf) # Mappings are prepared for scaffold extensions
     result_info = GetOutputInfo(result_info, scaffold_paths)
 #
     if pdf:
