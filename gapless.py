@@ -570,16 +570,17 @@ def PreparePotBreakPoints(pot_breaks, max_break_point_distance, min_mapping_leng
     break_points['ext_len'] = np.where(break_points['side'] == 'l', break_points['q_left'], break_points['q_right']) + break_points['map_len']
     break_points.drop(columns=['q_start','q_end','strand','read_start','read_end','q_left','q_right'], inplace=True)
     break_points = break_points[ break_points['map_len'] >= min_mapping_length+max_break_point_distance ].copy() # require half the mapping length for breaks as we will later require for continuously mapping reads that veto breaks, since breaking reads only map on one side
+    break_points.drop(columns=['map_len'], inplace=True)
     break_points.sort_values(['contig_id','position','mapq'], ascending=[True,True,False], inplace=True)
     if min_num_reads > 1:
         # Require at least one supporting break within +- max_break_point_distance
         break_points = break_points[ ((break_points['contig_id'] == break_points['contig_id'].shift(-1, fill_value=-1)) & (break_points['position']+max_break_point_distance >= break_points['position'].shift(-1, fill_value=-1))) | ((break_points['contig_id'] == break_points['contig_id'].shift(1, fill_value=-1)) & (break_points['position']-max_break_point_distance <= break_points['position'].shift(1, fill_value=-1))) ].copy()
     break_points.reset_index(drop=True,inplace=True)
     break_points['bindex'] = break_points.index.values
-    bp_map_len = break_points.drop(columns=['connected','mapq'])
-    break_points.drop(columns=['map_len','map_index','ext_len'], inplace=True)
+    bp_ext_len = break_points.drop(columns=['connected','mapq'])
+    break_points.drop(columns=['map_index','ext_len'], inplace=True)
 #
-    return break_points, bp_map_len
+    return break_points, bp_ext_len
 
 def CountBreakSupport(break_points, max_break_point_distance, min_num_reads):
     if len(break_points):
@@ -655,7 +656,7 @@ def GetConProb(cov_probs, req_length, counts):
 
     return NormCDFCapped(probs['counts'],probs['mu'], probs['sigma'])
 
-def CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_map_len, cov_probs, covered_regions, max_dist_contig_end, max_break_point_distance, min_mapping_length, min_num_reads, min_length_contig_break, prob_factor, merge_block_length, prematurity_threshold):
+def CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_ext_len, cov_probs, covered_regions, max_dist_contig_end, max_break_point_distance, min_mapping_length, min_num_reads, min_length_contig_break, prob_factor, merge_block_length, prematurity_threshold):
     if len(break_points):
         # Check how many reads veto a break (continuously map over the break region position +- (min_mapping_length+max_break_point_distance))
         break_pos = break_points[['contig_id','position']].drop_duplicates()
@@ -670,7 +671,7 @@ def CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_map_len, cov_
         tmp_mappings['merge_block'] = tmp_mappings.reset_index().groupby(['index']).cumcount().values + tmp_mappings['t_start']//merge_block_length
         tmp_mappings.rename(columns={'t_id':'contig_id'}, inplace=True)
         break_list = []
-        veto_map_len = []
+        veto_ext_len = []
         for n in range(break_pos['num'].max()+1):
             tmp_breaks = break_pos[break_pos['num'] == n]
             tmp_mappings = tmp_mappings[np.isin(tmp_mappings['contig_id'],tmp_breaks['contig_id'].values)].copy()
@@ -679,7 +680,7 @@ def CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_map_len, cov_
             tmp_breaks = tmp_breaks[(tmp_breaks['t_start']+min_mapping_length+max_break_point_distance <= tmp_breaks['position']) &
                                     (tmp_breaks['t_end']-min_mapping_length-max_break_point_distance >= tmp_breaks['position'])].copy()
             break_list.append( tmp_breaks.groupby(['contig_id','position','mapq']).size().reset_index(name='vetos') )
-            veto_map_len.append( tmp_breaks.groupby(['contig_id','position']).agg({'t_start':'min', 't_end':'max', 'q_left':'min', 'q_right':'max', 'mapq':'size'}).reset_index().rename(columns={'mapq':'count'}) )
+            veto_ext_len.append( tmp_breaks.groupby(['contig_id','position']).agg({'q_left':'min', 'q_right':'max', 'mapq':'size'}).reset_index().rename(columns={'mapq':'count'}) )
         break_points = break_points.merge(pd.concat(break_list, ignore_index=True), on=['contig_id','position','mapq'], how='outer').fillna(0)
         break_points.sort_values(['contig_id','position','mapq'], ascending=[True,True,False], inplace=True)
         break_points.reset_index(inplace=True, drop=True)
@@ -688,53 +689,47 @@ def CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_map_len, cov_
         break_points[['ifrom','ito']] = break_points[['contig_id','position']].merge(break_points.groupby(['contig_id','position'])[['ifrom','ito']].max().astype(int).reset_index(), on=['contig_id','position'], how='left')[['ifrom','ito']].values
 #
         # Find vetos that potentially have premature stops
-        veto_map_len = pd.concat(veto_map_len, ignore_index=True)
-        veto_map_len['t_len'] = veto_map_len[['contig_id']].merge(pot_breaks[['contig_id','t_len']].drop_duplicates(), on=['contig_id'], how='left')['t_len'].values
+        veto_ext_len = pd.concat(veto_ext_len, ignore_index=True)
         cov_reg = covered_regions.groupby(['con_id']).agg({'from':'min','to':'max'}).reset_index().rename(columns={'con_id':'contig_id'})
-        veto_map_len.loc[veto_map_len['t_start'] - veto_map_len[['contig_id']].merge(cov_reg, on=['contig_id'], how='left')['from'].values <= max_dist_contig_end, 't_start'] = 0 # Disable the sides that are within max_dist_contig_end from and end, so that they are not considered a premature stop
-        veto_map_len['t_end'] = np.where(veto_map_len['t_end'] < veto_map_len[['contig_id']].merge(cov_reg, on=['contig_id'], how='left')['to'].values - max_dist_contig_end, veto_map_len['t_end'], veto_map_len['t_len'])
-        veto_map_len[['ifrom','ito']] = veto_map_len[['contig_id','position']].merge(break_points.groupby(['contig_id','position'])[['ifrom','ito']].max().reset_index(), on=['contig_id','position'], how='left')[['ifrom','ito']].values
-        if len(veto_map_len):
+        veto_ext_len[['ifrom','ito']] = veto_ext_len[['contig_id','position']].merge(break_points.groupby(['contig_id','position'])[['ifrom','ito']].max().reset_index(), on=['contig_id','position'], how='left')[['ifrom','ito']].values
+        if len(veto_ext_len):
             # Get start and end of breaking reads
-            break_map_len = veto_map_len[['ifrom','ito']].drop_duplicates()
-            break_map_len = break_map_len.loc[np.repeat(break_map_len.index.values, break_map_len['ito'].values-break_map_len['ifrom'].values+1)].reset_index(drop=True)
-            break_map_len['bindex'] = break_map_len.groupby(['ifrom','ito']).cumcount() + break_map_len['ifrom']
-            break_map_len = break_map_len.merge(bp_map_len, on=['bindex'], how='left')
-            break_map_len['bstart'] = break_map_len['position'] - np.where(break_map_len['side'] == 'l', break_map_len['map_len'], 0)
-            break_map_len['bend'] = break_map_len['position'] + np.where(break_map_len['side'] == 'r', break_map_len['map_len'], 0)
-            break_map_len['bstart2'] = break_map_len['position'] - np.where(break_map_len['side'] == 'l', break_map_len['ext_len'], 0)
-            break_map_len['bend2'] = break_map_len['position'] + np.where(break_map_len['side'] == 'r', break_map_len['ext_len'], 0)
-            break_map_len = break_map_len[['ifrom','ito','bstart','bend','bstart2','bend2','side']].copy()
-            # Only keep break positions where the breaks map longer than the veto
-            veto_map_len[['bstart','bend','bstart2','bend2']] = veto_map_len[['ifrom','ito']].merge(break_map_len.groupby(['ifrom','ito']).agg({'bstart':'min', 'bend':'max', 'bstart2':'min', 'bend2':'max'}).reset_index(), on=['ifrom','ito'], how='left')[['bstart','bend','bstart2','bend2']].values
-            veto_map_len = veto_map_len[(veto_map_len['bstart'] < veto_map_len['t_start']) | (veto_map_len['t_end'] < veto_map_len['bend']) | (veto_map_len['bstart2'] < veto_map_len['q_left']) | (veto_map_len['q_right'] < veto_map_len['bend2'])].copy()
-        if len(veto_map_len):
+            break_ext_len = veto_ext_len[['ifrom','ito']].drop_duplicates()
+            break_ext_len = break_ext_len.loc[np.repeat(break_ext_len.index.values, break_ext_len['ito'].values-break_ext_len['ifrom'].values+1)].reset_index(drop=True)
+            break_ext_len['bindex'] = break_ext_len.groupby(['ifrom','ito']).cumcount() + break_ext_len['ifrom']
+            break_ext_len = break_ext_len.merge(bp_ext_len, on=['bindex'], how='left')
+            break_ext_len['bstart'] = break_ext_len['position'] - np.where(break_ext_len['side'] == 'l', break_ext_len['ext_len'], 0)
+            break_ext_len['bend'] = break_ext_len['position'] + np.where(break_ext_len['side'] == 'r', break_ext_len['ext_len'], 0)
+            break_ext_len = break_ext_len[['ifrom','ito','bstart','bend','side']].copy()
+            # Only check veto positions where the break map longer than the break
+            veto_ext_len[['bstart','bend']] = veto_ext_len[['ifrom','ito']].merge(break_ext_len.groupby(['ifrom','ito']).agg({'bstart':'min', 'bend':'max'}).reset_index(), on=['ifrom','ito'], how='left')[['bstart','bend']].values
+            veto_ext_len = veto_ext_len[(veto_ext_len['bstart'] < veto_ext_len['q_left']) | (veto_ext_len['q_right'] < veto_ext_len['bend'])].copy()
+        if len(veto_ext_len):
             # Count how many breaks are longer than the vetos and check if this is likely due to chance
-            break_map_len = veto_map_len[['contig_id','position','t_start','t_end','q_left','q_right','ifrom','ito']].merge(break_map_len, on=['ifrom','ito'], how='left')
-            break_map_len['longer'] = np.where(break_map_len['side'] == 'r', break_map_len['bend'] > break_map_len['t_end'], break_map_len['t_start'] > break_map_len['bstart'])
-            break_map_len['longer2'] = np.where(break_map_len['side'] == 'r', break_map_len['bend2'] > break_map_len['q_right'], break_map_len['q_left'] > break_map_len['bstart2'])
+            break_ext_len = veto_ext_len[['contig_id','position','q_left','q_right','ifrom','ito']].merge(break_ext_len, on=['ifrom','ito'], how='left')
+            break_ext_len['longer'] = np.where(break_ext_len['side'] == 'r', break_ext_len['bend'] > break_ext_len['q_right'], break_ext_len['q_left'] > break_ext_len['bstart'])
             for s in ['l','r']:
-                veto_map_len[[f'{s}bcount',f'{s}blonger',f'{s}blonger2']] = veto_map_len[['contig_id','position']].merge(break_map_len[break_map_len['side'] == s].groupby(['contig_id','position']).agg({'side':'size','longer':'sum','longer2':'sum'}).reset_index(), on=['contig_id','position'], how='left')[['side','longer','longer2']].fillna(0).astype(int).values
-                veto_map_len.loc[veto_map_len[f'{s}bcount'] < min_num_reads, [f'{s}blonger',f'{s}blonger2']] = 0 # Filter out cases that not exceed min_num_reads
-            veto_map_len = veto_map_len[veto_map_len[['lblonger','lblonger2','rblonger','rblonger2']].sum(axis=1) > 0].copy()
-        if len(veto_map_len):
+                veto_ext_len[[f'{s}bcount',f'{s}blonger']] = veto_ext_len[['contig_id','position']].merge(break_ext_len[break_ext_len['side'] == s].groupby(['contig_id','position']).agg({'side':'size','longer':'sum'}).reset_index(), on=['contig_id','position'], how='left')[['side','longer']].fillna(0).astype(int).values
+                veto_ext_len.loc[veto_ext_len[f'{s}bcount'] < min_num_reads, [f'{s}blonger']] = 0 # Filter out cases that not exceed min_num_reads
+            veto_ext_len = veto_ext_len[veto_ext_len[['lblonger','rblonger']].sum(axis=1) > 0].copy()
+        if len(veto_ext_len):
             for s in ['l','r']:
-                veto_map_len[f'{s}broken_veto_prob'] = GetPrematureStopProb(veto_map_len['count'].values, veto_map_len[f'{s}bcount'].values, np.maximum(veto_map_len[f'{s}blonger'].values, veto_map_len[f'{s}blonger2'].values))
-            veto_map_len = veto_map_len[np.minimum(veto_map_len['lbroken_veto_prob'], veto_map_len['rbroken_veto_prob']) <= prematurity_threshold].copy()
-        if len(veto_map_len) == 0:
+                veto_ext_len[f'{s}broken_veto_prob'] = GetPrematureStopProb(veto_ext_len['count'].values, veto_ext_len[f'{s}bcount'].values, veto_ext_len[f'{s}blonger'].values)
+            veto_ext_len = veto_ext_len[np.minimum(veto_ext_len['lbroken_veto_prob'], veto_ext_len['rbroken_veto_prob']) <= prematurity_threshold].copy()
+        if len(veto_ext_len) == 0:
             break_points[['lg_broken_veto','rg_broken_veto']] = -1
         else:
-            # Assign prematurely stopping vetos into groups to use the other breaks as a filter to avoid a flood of break points
+            # Assign prematurely stopping vetos into groups to use the other breaks as a filter in the count comparison to avoid a flood of break points
             for s in ['l','r']:
-                veto_map_len[f'{s}g_broken_veto'] = veto_map_len[f'{s}broken_veto_prob'] <= prematurity_threshold
-                sort_val = 't_start' if s == 'l' else 't_end'
-                veto_map_len.sort_values(['contig_id', f'{s}g_broken_veto', sort_val], inplace=True)
-                veto_map_len[f'{s}g_broken_veto'] = ( (veto_map_len['contig_id'] != veto_map_len['contig_id'].shift(1)) |
-                                                      (veto_map_len[sort_val] > veto_map_len[sort_val].shift(1) + max_break_point_distance) |
-                                                      (veto_map_len[f'{s}g_broken_veto'] != veto_map_len[f'{s}g_broken_veto'].shift(1)) ).cumsum()
-                veto_map_len.loc[veto_map_len[f'{s}broken_veto_prob'] > prematurity_threshold, f'{s}g_broken_veto'] = -1
-            veto_map_len.sort_values(['contig_id', 'position'], inplace=True)
-            break_points[['lg_broken_veto','rg_broken_veto']] = break_points[['contig_id', 'position']].merge(veto_map_len[['contig_id', 'position','lg_broken_veto','rg_broken_veto']], on=['contig_id', 'position'], how='left')[['lg_broken_veto','rg_broken_veto']].fillna(-1).astype(int).values
+                veto_ext_len[f'{s}g_broken_veto'] = veto_ext_len[f'{s}broken_veto_prob'] <= prematurity_threshold
+                sort_val = 'q_left' if s == 'l' else 'q_right'
+                veto_ext_len.sort_values(['contig_id', f'{s}g_broken_veto', sort_val], inplace=True)
+                veto_ext_len[f'{s}g_broken_veto'] = ( (veto_ext_len['contig_id'] != veto_ext_len['contig_id'].shift(1)) |
+                                                      (veto_ext_len[sort_val] > veto_ext_len[sort_val].shift(1) + max_break_point_distance) |
+                                                      (veto_ext_len[f'{s}g_broken_veto'] != veto_ext_len[f'{s}g_broken_veto'].shift(1)) ).cumsum()
+                veto_ext_len.loc[veto_ext_len[f'{s}broken_veto_prob'] > prematurity_threshold, f'{s}g_broken_veto'] = -1
+            veto_ext_len.sort_values(['contig_id', 'position'], inplace=True)
+            break_points[['lg_broken_veto','rg_broken_veto']] = break_points[['contig_id', 'position']].merge(veto_ext_len[['contig_id', 'position','lg_broken_veto','rg_broken_veto']], on=['contig_id', 'position'], how='left')[['lg_broken_veto','rg_broken_veto']].fillna(-1).astype(int).values
 #
         # Remove breaks where the vetos (or other breakpoints for broken vetos) are much more likely than the breaks
         break_points['break_prob'] = GetConProb(cov_probs, min_mapping_length+max_break_point_distance+min_length_contig_break, break_points['support'])
@@ -761,7 +756,7 @@ def CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_map_len, cov_
         break_pos = break_pos.loc[np.repeat(break_pos.index.values, break_pos['ito']-break_pos['ifrom']+1)].reset_index()
         break_pos['bindex'] = break_pos.groupby('index', sort=False).cumcount() + break_pos['ifrom']
         break_pos.drop(columns=['index'], inplace=True)
-        break_pos[['map_index','side']] = break_pos[['bindex']].merge(bp_map_len[['bindex','map_index','side']], on=['bindex'], how='left')[['map_index','side']].values
+        break_pos[['map_index','side']] = break_pos[['bindex']].merge(bp_ext_len[['bindex','map_index','side']], on=['bindex'], how='left')[['map_index','side']].values
         map_cols = ['strand','mapq','con','con_strand','con_pos','con_dist']
         break_pos[map_cols] = break_pos[['map_index','side']].merge(pot_breaks[['map_index','side']+map_cols], on=['map_index','side'], how='left')[map_cols].values
         break_pos['strand_switch'] = break_pos['strand'] != break_pos['con_strand']
@@ -812,7 +807,7 @@ def FindBreakPoints(mappings, contigs, covered_regions, max_dist_contig_end, min
             PlotHist(pdf, "Loose end length", "# Ends", loose_reads_ends_length, threshold=min_length_contig_break, logx=True)
 
     pot_breaks = GetBrokenMappings(mappings, covered_regions, max_dist_contig_end, min_length_contig_break, pdf)
-    break_points, bp_map_len = PreparePotBreakPoints(pot_breaks, max_break_point_distance, min_mapping_length, min_num_reads)
+    break_points, bp_ext_len = PreparePotBreakPoints(pot_breaks, max_break_point_distance, min_mapping_length, min_num_reads)
     
     if pdf:
         break_point_dist = (break_points['position'] - break_points['position'].shift(1, fill_value=0))[break_points['contig_id'] == break_points['contig_id'].shift(1, fill_value=-1)]
@@ -822,7 +817,7 @@ def FindBreakPoints(mappings, contigs, covered_regions, max_dist_contig_end, min
             PlotHist(pdf, "Break point distance", "# Break point pairs", break_point_dist, threshold=max_break_point_distance, logx=True )
 
     break_points = CountBreakSupport(break_points, max_break_point_distance, min_num_reads)
-    break_points, unconnected_break_points = CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_map_len, cov_probs, covered_regions, max_dist_contig_end, max_break_point_distance, min_mapping_length, min_num_reads, min_length_contig_break, prob_factor, merge_block_length, prematurity_threshold)
+    break_points, unconnected_break_points = CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_ext_len, cov_probs, covered_regions, max_dist_contig_end, max_break_point_distance, min_mapping_length, min_num_reads, min_length_contig_break, prob_factor, merge_block_length, prematurity_threshold)
 
     if len(break_points):
         # Cluster break_points into groups, so that groups have a maximum length of 2*max_break_point_distance
@@ -905,35 +900,6 @@ def FindBreakPoints(mappings, contigs, covered_regions, max_dist_contig_end, min
 
     return break_groups, spurious_break_indexes, non_informative_mappings, unconnected_break_points
 
-def SplitReadsAtSpuriousBreakIndexes(mappings, spurious_break_indexes):
-    if len(spurious_break_indexes):
-        # Handle multiple breaks in the same read one after another
-        split_reads = spurious_break_indexes[['q_name','read_side','q_start','q_end']].sort_values(['q_name','q_start'])
-        split_reads.drop_duplicates(inplace=True)
-        split_reads.rename(columns={'read_side':'split_side','q_start':'split_start','q_end':'split_end'}, inplace=True)
-        split_reads['bcount'] = split_reads.groupby(['q_name'], sort=False).cumcount()
-        split_reads = split_reads.merge(mappings[['q_name']].drop_duplicates(), on=['q_name'], how='inner')
-        for b in range(split_reads['bcount'].max()+1):
-            # Split reads at split_pos
-            mappings[['split_side','split_start','split_end']] = mappings[['q_name']].merge(split_reads.loc[split_reads['bcount'] == b, ['q_name','split_side','split_start','split_end']], on=['q_name'], how='left')[['split_side','split_start','split_end']].values
-            cur = ((mappings['split_side'] == 'l') & (mappings['q_start'] < mappings['split_start'])) | ((mappings['split_side'] == 'r') & (mappings['q_end'] <= mappings['split_end']))
-            if np.sum(cur):
-                mappings.loc[cur, 'read_end'] = np.minimum(mappings.loc[cur, 'read_end'].values, mappings.loc[cur, 'split_end'].astype(int).values)
-            cur = ((mappings['split_side'] == 'l') & (mappings['q_start'] >= mappings['split_start'])) | ((mappings['split_side'] == 'r') & (mappings['q_end'] > mappings['split_end']))
-            if np.sum(cur):
-                mappings.loc[cur, 'read_start'] = np.maximum(mappings.loc[cur, 'read_start'].values, mappings.loc[cur, 'split_start'].astype(int).values)
-            # Make sure mappings do not reach over read start/end
-            splitted = mappings.loc[np.isnan(mappings['split_start']) == False, ['q_name','q_start','q_end','read_start','read_end']].groupby(['q_name','read_start','read_end']).agg({'q_start':['min'],'q_end':['max']}).droplevel(axis=1,level=1).reset_index()
-            splitted = splitted[(splitted['read_start'] > splitted['q_start']) | (splitted['read_end'] < splitted['q_end'])].rename(columns={'q_start':'new_start','q_end':'new_end'})
-            splitted['new_start'] = np.minimum(splitted['new_start'], splitted['read_start'])
-            splitted['new_end'] = np.maximum(splitted['new_end'], splitted['read_end'])
-            mappings[['new_start','new_end']] = mappings[['q_name','read_start','read_end']].merge(splitted, on=['q_name','read_start','read_end'], how='left')[['new_start','new_end']].values
-            mappings.loc[np.isnan(mappings['new_start']) == False, 'read_start'] =  mappings.loc[np.isnan(mappings['new_start']) == False, 'new_start'].astype(int)
-            mappings.loc[np.isnan(mappings['new_end']) == False, 'read_end'] =  mappings.loc[np.isnan(mappings['new_end']) == False, 'new_end'].astype(int)
-        mappings.drop(columns=['split_side','split_start','split_end','new_start','new_end'], inplace=True)
-#
-    return mappings
-
 def GetContigParts(contigs, break_groups, covered_regions, remove_short_contigs, remove_zero_hit_contigs, min_mapping_length, alignment_precision, pdf):
     # Create a dataframe with the contigs being split into parts and contigs scheduled for removal not included
     if 0 == len(break_groups):
@@ -946,17 +912,7 @@ def GetContigParts(contigs, break_groups, covered_regions, remove_short_contigs,
         contigs['parts'] += 1
 
     contigs.loc[contigs['remove'], 'parts'] = 0
-    
-#   if pdf:
-#        category = np.array(["deleted no coverage"]*len(contigs))
-#        category[:] = "used"
-#        category[ contigs['parts']>1 ] = "split"
-#        category[ contigs['repeat_mask_right'] == 0 ] = "masked"
-#        category[ (contigs['repeat_mask_right'] == 0) & contigs['remove'] ] = "deleted duplicate"
-#        category[ (contigs['repeat_mask_right'] > 0) & contigs['remove'] ] = "deleted no coverage"
 
-#        PlotHist(pdf, "Original contig length", "# Contigs", contigs['length'], category=category, catname="type", logx=True)
-        
     contig_parts = pd.DataFrame({'contig':np.repeat(np.arange(len(contigs)), contigs['parts']), 'part':1, 'start':0})
     contig_parts['part'] = contig_parts.groupby('contig').cumsum()['part']-1
     if len(break_groups):
@@ -989,7 +945,7 @@ def GetContigParts(contigs, break_groups, covered_regions, remove_short_contigs,
     contigs['first_part'] = -1
     contigs.loc[contigs['parts']>0, 'first_part'] = contig_parts[contig_parts['part']==0].index
     contigs['last_part'] = contigs['first_part'] + contigs['parts'] - 1
-    
+
     # Assign scaffold info from contigs to contig_parts
     contig_parts['org_dist_left'] = -1
     tmp_contigs = contigs[(contigs['parts']>0) & (contigs['parts'].shift(1, fill_value=-1)>0)]
@@ -997,7 +953,7 @@ def GetContigParts(contigs, break_groups, covered_regions, remove_short_contigs,
     contig_parts['org_dist_right'] = -1
     tmp_contigs = contigs[(contigs['parts']>0) & (contigs['parts'].shift(-1, fill_value=-1)>0)]
     contig_parts.iloc[tmp_contigs['last_part'].values, contig_parts.columns.get_loc('org_dist_right')] = tmp_contigs['org_dist_right'].values
-    
+
     # Rescue scaffolds broken by removed contigs
     tmp_contigs = contigs[(contigs['parts']==0) & (contigs['org_dist_right'] != -1) & (contigs['org_dist_left'] != -1)].copy()
     tmp_contigs.reset_index(inplace=True)
@@ -1012,25 +968,10 @@ def GetContigParts(contigs, break_groups, covered_regions, remove_short_contigs,
     tmp_contigs = tmp_contigs[(tmp_contigs['from_part'] >= 0) & (tmp_contigs['to_part'] >= 0)].copy()
     contig_parts.iloc[tmp_contigs['from_part'], contig_parts.columns.get_loc('org_dist_right')] = tmp_contigs['len'].values
     contig_parts.iloc[tmp_contigs['to_part'], contig_parts.columns.get_loc('org_dist_left')] = tmp_contigs['len'].values
-    
+
     # Insert the break info as 0-length gaps
     contig_parts.loc[contig_parts['part'] > 0, 'org_dist_left'] = 0
     contig_parts.loc[contig_parts['part'].shift(-1, fill_value=0) > 0, 'org_dist_right'] = 0
-    
-    # Assign repeat connections
-#    contig_parts['rep_con_left'] = -1
-#    contig_parts['rep_con_side_left'] = ''
-#    contig_parts['rep_con_right'] = -1
-#    contig_parts['rep_con_side_right'] = ''
-#    tmp_contigs = contigs[(contigs['parts']>0)]
-#    contig_parts.iloc[tmp_contigs['first_part'].values, contig_parts.columns.get_loc('rep_con_left')] = np.where(tmp_contigs['rep_con_side_left'] == 'l',
-#                                                          contigs.iloc[tmp_contigs['rep_con_left'].values, contigs.columns.get_loc('first_part')].values,
-#                                                          contigs.iloc[tmp_contigs['rep_con_left'].values, contigs.columns.get_loc('last_part')].values)
-#    contig_parts.iloc[tmp_contigs['first_part'].values, contig_parts.columns.get_loc('rep_con_side_left')] = tmp_contigs['rep_con_side_left'].values
-#    contig_parts.iloc[tmp_contigs['last_part'].values, contig_parts.columns.get_loc('rep_con_right')] = np.where(tmp_contigs['rep_con_side_right'] == 'l',
-#                                                          contigs.iloc[tmp_contigs['rep_con_right'].values, contigs.columns.get_loc('first_part')].values,
-#                                                          contigs.iloc[tmp_contigs['rep_con_right'].values, contigs.columns.get_loc('last_part')].values)
-#    contig_parts.iloc[tmp_contigs['last_part'].values, contig_parts.columns.get_loc('rep_con_side_right')] = tmp_contigs['rep_con_side_right'].values
 
     return contig_parts, contigs
 
@@ -1134,138 +1075,7 @@ def UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length, max_
 
     return mappings
 
-def MaskRepeatEnds(contigs, repeat_file, contig_ids, max_repeat_extension, min_len_repeat_connection, repeat_len_factor_unique, remove_duplicated_contigs, pdf):
-    # Read in minimap 2 repeat table (.paf)
-    repeat_table = ReadPaf(repeat_file)
-    
-    repeat_table = repeat_table[(repeat_table['q_name'] != repeat_table['t_name']) | (repeat_table['q_start'] != repeat_table['t_start'])].copy()  # Ignore repeats on same contig and same position
-     
-    if pdf and len(repeat_table):
-        tmp_dist = np.minimum(repeat_table['q_start'], repeat_table['q_len']-repeat_table['q_end']) # Repeat distance to contig end
-        PlotHist(pdf, "Repeat distance to contig end", "# Repeat mappings", tmp_dist, logx=True, threshold=max_repeat_extension)
-        if np.sum(tmp_dist < 10*max_repeat_extension):
-            PlotHist(pdf, "Repeat distance to contig end", "# Repeat mappings", np.extract(tmp_dist < 10*max_repeat_extension, tmp_dist), threshold=max_repeat_extension)
 
-    # We can do everything on query as all mappings are also reversed in the table
-    # Check if the repeat belongs to a contig end
-    repeat_table['left_repeat'] = repeat_table['q_start'] <= max_repeat_extension
-    repeat_table['right_repeat'] = repeat_table['q_len'] - repeat_table['q_end'] <= max_repeat_extension
-    
-    repeat_table['q_id'] = itemgetter(*repeat_table['q_name'])(contig_ids)
-    repeat_table['t_id'] = itemgetter(*repeat_table['t_name'])(contig_ids)
-    
-    contigs['repeat_mask_left'] = int(0)
-    contigs['repeat_mask_right'] = contigs['length']
-    contigs['remove'] = False
-    
-    # Complete duplicate -> Schedule for removal
-    # If the target is also a complete duplicate, keep the longer one or at same length decide by name
-    complete_repeats = np.unique(repeat_table.loc[repeat_table['left_repeat'] & repeat_table['right_repeat'] &
-             ((repeat_table['t_start'] > max_repeat_extension) |
-              (repeat_table['q_len'] - repeat_table['q_end'] > max_repeat_extension) |
-              (repeat_table['t_len'] > repeat_table['q_len']) |
-              ((repeat_table['t_len'] == repeat_table['q_len']) & (repeat_table['t_name'] < repeat_table['q_name']))), 'q_id'])
-    if remove_duplicated_contigs:
-        contigs.iloc[complete_repeats, contigs.columns.get_loc('remove')] = True
-    
-    ## Handle complete repeats, complexity contigs and tandem repeats
-    # Remove the complete_repeats from the repeat table, as the repeat won't exist anymore after the removal of the contigs (sp we don't want to count those contigs for repeats in other contigs)
-    repeat_table = repeat_table[np.logical_not(np.isin(repeat_table['q_id'], complete_repeats)) & np.logical_not(np.isin(repeat_table['t_id'], complete_repeats))].copy()
-    
-    # Add low complexity contigs and tandem repeats to complete_repeats, where you get a similar sequence when shifting the frame a bit
-    # We want to keep them as they are no duplications but don't do anything with them afterwards, because the mappings cannot be anchored and are therefore likely at the wrong place
-    # The idea is to run gapless multiple times until another contig with a proper anchor is extended enough to overlap this contig and then it is removed as a duplicate
-    complete_repeats = np.unique(np.concatenate([ complete_repeats, np.unique(repeat_table.loc[repeat_table['left_repeat'] & repeat_table['right_repeat'] & (repeat_table['q_id'] == repeat_table['t_id']), 'q_id'])]))
-    # Mask the whole read, so mappings to it will be ignored, as we remove it anyways
-    contigs.iloc[complete_repeats, contigs.columns.get_loc('repeat_mask_right')] = 0
-    contigs.iloc[complete_repeats, contigs.columns.get_loc('repeat_mask_left')] = contigs.iloc[complete_repeats, contigs.columns.get_loc('length')]
-    
-    # Remove the low complexity contigs and tandem repeats from the repeat table
-    repeat_table = repeat_table[np.logical_not(repeat_table['left_repeat'] & repeat_table['right_repeat'])].copy()
-    
-    ## Check for repeat connections
-    con_search = repeat_table[repeat_table['left_repeat'] | repeat_table['right_repeat']].copy()
-    con_search['rep_len'] = con_search['q_end'] - con_search['q_start']
-    con_search['con_left'] = con_search['t_start'] <= max_repeat_extension
-    con_search['con_right'] = con_search['t_len'] - con_search['t_end'] <= max_repeat_extension
-    
-    # Only keep longest for one type of connection to not undermine the validity of a repeat connection with a repeat between the same contigs
-    con_search.sort_values(['q_id','left_repeat','right_repeat','t_id','con_left','con_right','rep_len'], inplace=True)
-    con_search = con_search.groupby(['q_id','left_repeat','right_repeat','t_id','con_left','con_right'], sort=False).last().reset_index()
-    
-    # Get second longest repeats to potentially veto repeat connections
-    con_search.sort_values(['q_id','left_repeat','right_repeat','rep_len'], inplace=True)
-    con_search['longest'] = (con_search['q_id'] != con_search['q_id'].shift(-1, fill_value=-1)) | (con_search['left_repeat'] != con_search['left_repeat'].shift(-1, fill_value=-1))
-    second_longest = con_search[con_search['longest']==False].groupby(['q_id','left_repeat','right_repeat'], sort=False)['rep_len'].last().reset_index(name="len_second")
-    
-    # Get potential repeat connections
-    con_search = con_search.loc[con_search['longest'] & (con_search['con_left'] | con_search['con_right']) & (con_search['q_id'] != con_search['t_id']), ['q_id','left_repeat','right_repeat','t_id','con_left','con_right','rep_len','strand']].copy()
-    con_search = con_search[np.logical_not(con_search['con_left'] & con_search['con_right'])].copy() # Remove complete duplicates
-    con_search = con_search[(con_search['left_repeat'] != con_search['con_left']) & (con_search['strand'] == '+') | (con_search['left_repeat'] == con_search['con_left']) & (con_search['strand'] == '-')].copy() # Strand must match a connection
-    
-    # Apply filter
-    if len(con_search):
-        con_search = con_search.merge(second_longest, on=['q_id','left_repeat','right_repeat'], how='left').fillna(0)
-        con_search['accepted'] = (con_search['rep_len'] >= min_len_repeat_connection) & (con_search['len_second']*repeat_len_factor_unique < con_search['rep_len'])
-        if pdf:
-            PlotHist(pdf, "Connection length", "# Potential repeat connections", con_search['rep_len'], logx=True, threshold=min_len_repeat_connection)
-            if np.sum(con_search['rep_len'] < 10*min_len_repeat_connection):
-                PlotHist(pdf, "Connection length", "# Potential repeat connections", np.extract(con_search['rep_len'] < 10*min_len_repeat_connection, con_search['rep_len']), threshold=min_len_repeat_connection)
-            PlotXY(pdf, "Longest repeat connection", "Second longest connection", con_search['rep_len'], con_search['len_second'], category=np.where(con_search['accepted'], "accepted", "declined"))
-            #PlotXY(pdf, "Longest repeat connection", "Second longest connection", con_search['rep_len'], con_search['len_second'], category=con_search['accepted'], logx=True)
-        con_search = con_search[con_search['accepted']].copy()
-        
-        # Check that partner sides also survived all filters
-        con_search = con_search[(con_search.merge(con_search, left_on=['t_id','con_left','con_right'], right_on=['q_id','left_repeat','right_repeat'], how='left', indicator=True)['_merge'] == "both").values].copy()
-    
-    # Store repeat connections
-    contigs['rep_con_left'] = -1
-    contigs['rep_con_side_left'] = ''
-    contigs['rep_con_right'] = -1
-    contigs['rep_con_side_right'] = ''
-    if len(con_search):
-        contigs.iloc[con_search.loc[con_search['left_repeat'], 'q_id'], contigs.columns.get_loc('rep_con_left')] = con_search.loc[con_search['left_repeat'], 't_id'].values
-        contigs.iloc[con_search.loc[con_search['left_repeat'], 'q_id'], contigs.columns.get_loc('rep_con_side_left')] = np.where(con_search.loc[con_search['left_repeat'], 'con_left'].values, 'l', 'r')
-        contigs.iloc[con_search.loc[con_search['right_repeat'], 'q_id'], contigs.columns.get_loc('rep_con_right')] = con_search.loc[con_search['right_repeat'], 't_id'].values
-        contigs.iloc[con_search.loc[con_search['right_repeat'], 'q_id'], contigs.columns.get_loc('rep_con_side_right')] = np.where(con_search.loc[con_search['right_repeat'], 'con_left'].values, 'l', 'r')
-
-    ## Mask repeat ends
-    # Keep only repeat positions and sort repeats by contig and start position to merge everything that is closer than max_repeat_extension
-    repeat_table = repeat_table[['q_id','q_len','q_start','q_end']].copy()
-    repeat_table.sort_values(['q_id','q_start','q_end'], inplace=True)
-    repeat_table['group'] = (repeat_table['q_id'] != repeat_table['q_id'].shift(1, fill_value=-1)) | (repeat_table['q_start'] > repeat_table['q_end'].shift(1, fill_value=-1) + max_repeat_extension)
-    while np.sum(repeat_table['group']) < len(repeat_table):
-        repeat_table['group'] = repeat_table['group'].cumsum()
-        repeat_table = repeat_table.groupby('group').agg(['min','max']).reset_index()[[('q_id','min'),('q_len','min'),('q_start','min'),('q_end','max')]].copy()
-        repeat_table.columns = repeat_table.columns.droplevel(-1)
-        repeat_table['group'] = (repeat_table['q_id'] != repeat_table['q_id'].shift(1, fill_value=-1)) | (repeat_table['q_start'] > repeat_table['q_end'].shift(1, fill_value=-1) + max_repeat_extension)
-    
-    # Mask contig ends with repeats
-    repeat_table['left_repeat'] = repeat_table['q_start'] <= max_repeat_extension
-    mask = repeat_table[repeat_table['left_repeat']].groupby('q_id')['q_end'].max().reset_index()
-    contigs.iloc[mask['q_id'].values, contigs.columns.get_loc('repeat_mask_left')] = mask['q_end'].values
-    repeat_table['right_repeat'] = repeat_table['q_len'] - repeat_table['q_end'] <= max_repeat_extension
-    mask = repeat_table[repeat_table['right_repeat']].groupby('q_id')['q_start'].max().reset_index()
-    contigs.iloc[mask['q_id'].values, contigs.columns.get_loc('repeat_mask_right')] = mask['q_start'].values
-
-    # If we had a full repeat after the combination mask it completely (but don't remove it, same strategy as for low complexity contigs and tandem repeats)
-    contigs.loc[contigs['repeat_mask_left'] > contigs['repeat_mask_right'], 'repeat_mask_left'] = contigs.loc[contigs['repeat_mask_left'] > contigs['repeat_mask_right'], 'length']
-    contigs.loc[contigs['repeat_mask_left'] > contigs['repeat_mask_right'], 'repeat_mask_right'] = 0
-    
-    # Only keep center repeats (repeats not at the contig ends)
-    repeat_table = repeat_table.loc[np.logical_not(repeat_table['left_repeat'] | repeat_table['right_repeat']), ['q_id','q_start','q_end']].copy()
-    repeat_table.rename(columns={'q_id':'con_id', 'q_start':'start', 'q_end':'end'}, inplace=True)
-
-    if pdf:
-        masked = ((contigs.loc[contigs['remove'] == False, 'repeat_mask_left']+contigs.loc[contigs['remove'] == False, 'length']-contigs.loc[contigs['remove'] == False, 'repeat_mask_right'])/contigs.loc[contigs['remove'] == False, 'length']).values*100
-        masked[masked > 100] = 100 # Fully masked the way it's done would be 200, which does not make sense
-        category = np.log10(contigs.loc[contigs['remove'] == False, 'length']).values.astype(int)
-        category = [''.join(['>',a," bases"]) for a in np.power(10,category).astype(str)]
-
-        if len(masked):
-            PlotHist(pdf, "% of bases masked", "# Contigs", masked, category=category, catname='length', logy=True)
-
-    return contigs, repeat_table
 
 def FindDuplicatedContigPartEnds(repeats, contig_parts, max_dist_contig_end, proportion_duplicated):
     repeat_ends = repeats.copy()
@@ -2274,203 +2084,208 @@ def DisconnectRepeatedContigsWithConnectionsOnBothSides(scaffold_graph, scaf_rep
         dup_graph.append(scaffold_graph[np.isin(scaffold_graph[f'scaf{s}'], dup_scafs) & (scaffold_graph['length'] > s+1)].reset_index().rename(columns={'index':'sindex'}))
         dup_graph[-1]['dup'] = s
     dup_graph = RemoveEmptyColumns(pd.concat(dup_graph, ignore_index=True))
-    dup_graph.sort_values(['sindex','dup'], inplace=True)
-    # Only keep the longest entries (on both sides) for each dup
-    shortened_graph = dup_graph[dup_graph['dup'] > 1].drop(columns=['sindex','from','from_side','dist1','dup'])
-    shortened_graph.drop_duplicates(inplace=True)
-    shortened_graph.rename(columns={f'{n}{s}':f'{n}{s-1}' for s in range(1,dup_graph['length'].max()) for n in ['scaf','strand','dist']}, inplace=True) # Use dup_graph['length'].max() instead of shortened_graph here to get all columns in case we removed the longest entries
-    shortened_graph['length'] -= 1
-    shortened_graph.rename(columns={'scaf0':'from','strand0':'from_side'}, inplace=True)
-    shortened_graph['from_side'] = np.where(shortened_graph['from_side'] == '+', 'r', 'l')
-    dup_graph = dup_graph[dup_graph[shortened_graph.columns].merge(shortened_graph, on=list(shortened_graph.columns), how='left', indicator=True)['_merge'].values == "left_only"].copy()
-    # Create possible alternatives to dup_graph by replacing the duplicated scaffold with the alternative
-    for s in np.unique(dup_graph['dup']):
-        dup_graph.loc[dup_graph['dup'] == s, 'dscaf'] = dup_graph.loc[dup_graph['dup'] == s, f'scaf{s}']
-    dup_graph['dscaf'] = dup_graph['dscaf'].astype(int)
-    dup_graph = dup_graph.merge(scaf_reps[(scaf_reps['scaffold'] != scaf_reps['t_con']) | (scaf_reps['strand'] == '-')].rename(columns={'scaffold':'dscaf','strand':'repstrand'}), on=['dscaf'], how='inner')
-    alt_graph = []
-    for s in np.unique(dup_graph['dup']):
-        # Get alternatives that replace a single scaffold
-        cur = dup_graph[dup_graph['dup'] == s].rename(columns={'from':'scaf0','from_side':'strand0'})
-        cur['strand0'] = np.where(cur['strand0'] == 'r', '+', '-')
-        cur[f'scaf{s}'] = cur['t_con']
-        cur.loc[cur['repstrand'] == '-', f'strand{s}'] = np.where(cur.loc[cur['repstrand'] == '-', f'strand{s}'] == '+', '-', '+')
-        cur.drop(columns=['repstrand'], inplace=True)
-        rpot = cur[cur['length'] > s+2].copy() # Store the change to apply potential extensions of the replaced scaffold to the right later
-        lpot = []
-        cur, lpot, alt_graph = ApplyDistancesToDuplicationAlternative(cur, lpot, alt_graph, scaf_bridges, s)
-        # Extend the replacement to the right
-        rpot[['dscaf2','t_start2','t_end2']] = rpot[['dscaf','t_start','t_end']].values
-        while len(rpot):
-            # Check if the scaffold to the right is also a duplicate of t_con
-            rpot['dscaf3'] = rpot[f'scaf{s+1}']
-            rpot = rpot.merge(scaf_reps.drop(columns=['strand']).rename(columns={'scaffold':'dscaf3','t_start':'t_start3','t_end':'t_end3'}), on=['dscaf3','t_con'], how='inner')
-            # Check that the order of duplications matches the one in the graph
-            if len(rpot):
-                rpot = rpot[ np.where(rpot[f'strand{s}'] == '+', (rpot['t_start2'] < rpot['t_start3']) & (rpot['t_end2'] < rpot['t_end3']), (rpot['t_start2'] > rpot['t_start3']) & (rpot['t_end2'] > rpot['t_end3']) ) |
-                            ( (rpot['t_start2'] == rpot['t_start3']) & (rpot['t_end2'] == rpot['t_end3']) & (rpot['dscaf2'] + np.where(rpot[f'strand{s}'] == '+', 1, -1) == rpot['dscaf3']) ) ].drop(columns=['dscaf2','t_start2','t_end2'])
-                rpot.rename(columns={'dscaf3':'dscaf2','t_start3':'t_start2','t_end3':'t_end2'}, inplace=True)
-            if len(rpot):
-                # Extend the replacement by removing the additional scaffold
-                rpot.drop(columns=[f'scaf{s+1}',f'strand{s+1}',f'dist{s+1}'], inplace=True)
-                rpot = RemoveEmptyColumns(rpot)
-                rpot.rename(columns={f'{n}{s2}':f'{n}{s2-1}' for s2 in range(s+2, rpot['length'].max()) for n in ['scaf','strand','dist']}, inplace=True)
-                rpot['length'] -= 1
-                # Add the distances, which is specific for this extension and not relevant for further extensions
-                cur = rpot.drop(columns=['dscaf2','t_start2','t_end2'])
-                cur, lpot, alt_graph = ApplyDistancesToDuplicationAlternative(cur, lpot, alt_graph, scaf_bridges, s)
-                # Prepare next iteration
-                rpot = rpot[rpot['length'] > s+2].copy()
-        # Extend the replacement to the left
-        lpot = pd.concat(lpot, ignore_index=True)
-        for e in range(s-1,0,-1):
-            # Check if the scaffold to the left is also a duplicate of t_con
-            lpot['dscaf2'] = lpot[f'scaf{e}']
-            lpot = lpot.merge(scaf_reps.drop(columns=['strand']).rename(columns={'scaffold':'dscaf2','t_start':'t_start2','t_end':'t_end2'}), on=['dscaf2','t_con'], how='inner')
-            # Check that the order of duplications matches the one in the graph
-            if len(lpot):
-                lpot = lpot[ np.where(lpot[f'strand{e+1}'] == '+', (lpot['t_start'] > lpot['t_start2']) & (lpot['t_end'] > lpot['t_end2']), (lpot['t_start'] < lpot['t_start2']) & (lpot['t_end'] < lpot['t_end2']) ) |
-                            ( (lpot['t_start'] == lpot['t_start2']) & (lpot['t_end'] == lpot['t_end2']) & (lpot['dscaf'] == lpot['dscaf2'] + np.where(lpot[f'strand{e+1}'] == '+', 1, -1)) ) ].drop(columns=['dscaf','t_start','t_end'])
-                lpot.rename(columns={'dscaf2':'dscaf','t_start2':'t_start','t_end2':'t_end'}, inplace=True)
-            if len(lpot):
-                # Extend the replacement by removing the additional scaffold
-                lpot.drop(columns=[f'scaf{e}',f'strand{e}',f'dist{e}'], inplace=True)
-                lpot = RemoveEmptyColumns(lpot)
-                lpot.rename(columns={f'{n}{s2}':f'{n}{s2-1}' for s2 in range(e+1, lpot['length'].max()) for n in ['scaf','strand','dist']}, inplace=True)
-                lpot['length'] -= 1
-                # Add the distances, which is specific for this extension and not relevant for further extensions
-                cur = lpot.drop(columns=['t_con','dscaf','t_start','t_end'])
-                cur[f'side{e-1}'] = np.where(cur[f'strand{e-1}'] == '+', 'r', 'l')
-                cur[f'side{e}'] = np.where(cur[f'strand{e}'] == '+', 'l', 'r')
-                cur = cur.merge(scaf_bridges[['from','from_side','to','to_side','mean_dist']].rename(columns={'from':f'scaf{e-1}','from_side':f'side{e-1}','to':f'scaf{e}','to_side':f'side{e}'}), on=[f'scaf{e-1}',f'side{e-1}',f'scaf{e}',f'side{e}'], how='inner')
-                cur[f'dist{e}'] = cur['mean_dist']
-                alt_graph.append( cur.drop(columns=[f'side{e-1}',f'side{e}','mean_dist']) )
-            else:
-                break
-    alt_graph = pd.concat(alt_graph, ignore_index=True)
-    alt_graph.drop_duplicates(inplace=True)
-    alt_graph.rename(columns={'scaf0':'from','strand0':'from_side'}, inplace=True)
-    alt_graph['from_side'] = np.where(alt_graph['from_side'] == '+', 'r', 'l')
+    if len(dup_graph):
+        dup_graph.sort_values(['sindex','dup'], inplace=True)
+        # Only keep the longest entries (on both sides) for each dup
+        shortened_graph = dup_graph[dup_graph['dup'] > 1].drop(columns=['sindex','from','from_side','dist1','dup'])
+        if len(shortened_graph):
+            shortened_graph.drop_duplicates(inplace=True)
+            shortened_graph.rename(columns={f'{n}{s}':f'{n}{s-1}' for s in range(1,dup_graph['length'].max()) for n in ['scaf','strand','dist']}, inplace=True) # Use dup_graph['length'].max() instead of shortened_graph here to get all columns in case we removed the longest entries
+            shortened_graph['length'] -= 1
+            shortened_graph.rename(columns={'scaf0':'from','strand0':'from_side'}, inplace=True)
+            shortened_graph['from_side'] = np.where(shortened_graph['from_side'] == '+', 'r', 'l')
+            dup_graph = dup_graph[dup_graph[shortened_graph.columns].merge(shortened_graph, on=list(shortened_graph.columns), how='left', indicator=True)['_merge'].values == "left_only"].copy()
+        # Create possible alternatives to dup_graph by replacing the duplicated scaffold with the alternative
+        for s in np.unique(dup_graph['dup']):
+            dup_graph.loc[dup_graph['dup'] == s, 'dscaf'] = dup_graph.loc[dup_graph['dup'] == s, f'scaf{s}']
+        dup_graph['dscaf'] = dup_graph['dscaf'].astype(int)
+        dup_graph = dup_graph.merge(scaf_reps[(scaf_reps['scaffold'] != scaf_reps['t_con']) | (scaf_reps['strand'] == '-')].rename(columns={'scaffold':'dscaf','strand':'repstrand'}), on=['dscaf'], how='inner')
+        alt_graph = []
+        for s in np.unique(dup_graph['dup']):
+            # Get alternatives that replace a single scaffold
+            cur = dup_graph[dup_graph['dup'] == s].rename(columns={'from':'scaf0','from_side':'strand0'})
+            cur['strand0'] = np.where(cur['strand0'] == 'r', '+', '-')
+            cur[f'scaf{s}'] = cur['t_con']
+            cur.loc[cur['repstrand'] == '-', f'strand{s}'] = np.where(cur.loc[cur['repstrand'] == '-', f'strand{s}'] == '+', '-', '+')
+            cur.drop(columns=['repstrand'], inplace=True)
+            rpot = cur[cur['length'] > s+2].copy() # Store the change to apply potential extensions of the replaced scaffold to the right later
+            lpot = []
+            cur, lpot, alt_graph = ApplyDistancesToDuplicationAlternative(cur, lpot, alt_graph, scaf_bridges, s)
+            # Extend the replacement to the right
+            rpot[['dscaf2','t_start2','t_end2']] = rpot[['dscaf','t_start','t_end']].values
+            while len(rpot):
+                # Check if the scaffold to the right is also a duplicate of t_con
+                rpot['dscaf3'] = rpot[f'scaf{s+1}']
+                rpot = rpot.merge(scaf_reps.drop(columns=['strand']).rename(columns={'scaffold':'dscaf3','t_start':'t_start3','t_end':'t_end3'}), on=['dscaf3','t_con'], how='inner')
+                # Check that the order of duplications matches the one in the graph
+                if len(rpot):
+                    rpot = rpot[ np.where(rpot[f'strand{s}'] == '+', (rpot['t_start2'] < rpot['t_start3']) & (rpot['t_end2'] < rpot['t_end3']), (rpot['t_start2'] > rpot['t_start3']) & (rpot['t_end2'] > rpot['t_end3']) ) |
+                                ( (rpot['t_start2'] == rpot['t_start3']) & (rpot['t_end2'] == rpot['t_end3']) & (rpot['dscaf2'] + np.where(rpot[f'strand{s}'] == '+', 1, -1) == rpot['dscaf3']) ) ].drop(columns=['dscaf2','t_start2','t_end2'])
+                    rpot.rename(columns={'dscaf3':'dscaf2','t_start3':'t_start2','t_end3':'t_end2'}, inplace=True)
+                if len(rpot):
+                    # Extend the replacement by removing the additional scaffold
+                    rpot.drop(columns=[f'scaf{s+1}',f'strand{s+1}',f'dist{s+1}'], inplace=True)
+                    rpot = RemoveEmptyColumns(rpot)
+                    rpot.rename(columns={f'{n}{s2}':f'{n}{s2-1}' for s2 in range(s+2, rpot['length'].max()) for n in ['scaf','strand','dist']}, inplace=True)
+                    rpot['length'] -= 1
+                    # Add the distances, which is specific for this extension and not relevant for further extensions
+                    cur = rpot.drop(columns=['dscaf2','t_start2','t_end2'])
+                    cur, lpot, alt_graph = ApplyDistancesToDuplicationAlternative(cur, lpot, alt_graph, scaf_bridges, s)
+                    # Prepare next iteration
+                    rpot = rpot[rpot['length'] > s+2].copy()
+            # Extend the replacement to the left
+            lpot = pd.concat(lpot, ignore_index=True)
+            for e in range(s-1,0,-1):
+                # Check if the scaffold to the left is also a duplicate of t_con
+                lpot['dscaf2'] = lpot[f'scaf{e}']
+                lpot = lpot.merge(scaf_reps.drop(columns=['strand']).rename(columns={'scaffold':'dscaf2','t_start':'t_start2','t_end':'t_end2'}), on=['dscaf2','t_con'], how='inner')
+                # Check that the order of duplications matches the one in the graph
+                if len(lpot):
+                    lpot = lpot[ np.where(lpot[f'strand{e+1}'] == '+', (lpot['t_start'] > lpot['t_start2']) & (lpot['t_end'] > lpot['t_end2']), (lpot['t_start'] < lpot['t_start2']) & (lpot['t_end'] < lpot['t_end2']) ) |
+                                ( (lpot['t_start'] == lpot['t_start2']) & (lpot['t_end'] == lpot['t_end2']) & (lpot['dscaf'] == lpot['dscaf2'] + np.where(lpot[f'strand{e+1}'] == '+', 1, -1)) ) ].drop(columns=['dscaf','t_start','t_end'])
+                    lpot.rename(columns={'dscaf2':'dscaf','t_start2':'t_start','t_end2':'t_end'}, inplace=True)
+                if len(lpot):
+                    # Extend the replacement by removing the additional scaffold
+                    lpot.drop(columns=[f'scaf{e}',f'strand{e}',f'dist{e}'], inplace=True)
+                    lpot = RemoveEmptyColumns(lpot)
+                    lpot.rename(columns={f'{n}{s2}':f'{n}{s2-1}' for s2 in range(e+1, lpot['length'].max()) for n in ['scaf','strand','dist']}, inplace=True)
+                    lpot['length'] -= 1
+                    # Add the distances, which is specific for this extension and not relevant for further extensions
+                    cur = lpot.drop(columns=['t_con','dscaf','t_start','t_end'])
+                    cur[f'side{e-1}'] = np.where(cur[f'strand{e-1}'] == '+', 'r', 'l')
+                    cur[f'side{e}'] = np.where(cur[f'strand{e}'] == '+', 'l', 'r')
+                    cur = cur.merge(scaf_bridges[['from','from_side','to','to_side','mean_dist']].rename(columns={'from':f'scaf{e-1}','from_side':f'side{e-1}','to':f'scaf{e}','to_side':f'side{e}'}), on=[f'scaf{e-1}',f'side{e-1}',f'scaf{e}',f'side{e}'], how='inner')
+                    cur[f'dist{e}'] = cur['mean_dist']
+                    alt_graph.append( cur.drop(columns=[f'side{e-1}',f'side{e}','mean_dist']) )
+                else:
+                    break
+        alt_graph = pd.concat(alt_graph, ignore_index=True)
+        alt_graph.drop_duplicates(inplace=True)
+        alt_graph.rename(columns={'scaf0':'from','strand0':'from_side'}, inplace=True)
+        alt_graph['from_side'] = np.where(alt_graph['from_side'] == '+', 'r', 'l')
     # Get the entries in alt_graph that exist in scaffold_graph
     found_dup = []
-    for l in np.unique(alt_graph['length'].values):
-        mcols = ['from','from_side']+[f'{n}{s}' for s in range(1,l) for n in ['scaf','strand','dist']]
-        found_dup.append( alt_graph.loc[alt_graph['length'] == l, ['sindex']+mcols].merge(scaffold_graph[mcols].reset_index().rename(columns={'index':'tindex'}), on=mcols, how='inner').drop(columns=mcols) )
-    found_dup = pd.concat(found_dup, ignore_index=True)
-    found_dup.drop_duplicates(inplace=True)
-    # Find groups of scaffold_graph entries that must be removed together to keep scaffold_graph consistent (Start by making both directions identical by going into the perspective from dscaf)
-    dup_groups = dup_graph.drop(columns=['t_start','t_end'])
-    dup_groups.rename(columns={'from':'scaf0','from_side':'strand0'}, inplace=True)
-    dup_groups['strand0'] = np.where(dup_groups['strand0'] == 'r', '+', '-')
-    dup_groups['llen'] = dup_groups['dup']+1
-    dup_groups['rlen'] = dup_groups['length'] - dup_groups['dup']
-    for d in np.unique(dup_groups['dup'].values):
-        cur = dup_groups['dup'] == d
-        dup_groups.loc[cur & (dup_groups[f'strand{d}'] == '-'), ['llen','rlen']] = dup_groups.loc[cur & (dup_groups[f'strand{d}'] == '-'), ['rlen','llen']].values
-        # Go from d to lower s
-        for s in range(d-1,-1,-1):
-            # Positive strand
-            cur2 = cur & (dup_groups[f'strand{d}'] == '+')
-            if np.sum(cur2):
-                dup_groups.loc[cur2, [f'lscaf{d-s}',f'lstrand{d-s}',f'ldist{d-s}']] = dup_groups.loc[cur2, [f'scaf{s}',f'strand{s}',f'dist{s+1}']].values
-                dup_groups.loc[cur2, f'lstrand{d-s}'] = np.where(dup_groups.loc[cur2, f'lstrand{d-s}'] == '+', '-', '+')
-            # Negative strand
-            cur2 = cur & (dup_groups[f'strand{d}'] == '-')
-            if np.sum(cur2):
-                dup_groups.loc[cur2, [f'rscaf{d-s}',f'rstrand{d-s}',f'rdist{d-s}']] = dup_groups.loc[cur2, [f'scaf{s}',f'strand{s}',f'dist{s+1}']].values
-                dup_groups.loc[cur2, f'rstrand{d-s}'] = np.where(dup_groups.loc[cur2, f'rstrand{d-s}'] == '+', '-', '+')
-        # Go from d to higher s
-        for s in range(d+1,dup_groups.loc[cur, 'length'].max()):
-            cur2 = cur & (dup_groups['length'] > s)
-            # Positive strand
-            cur3 = cur2 & (dup_groups[f'strand{d}'] == '+')
-            if np.sum(cur3):
-                dup_groups.loc[cur3, [f'rscaf{s-d}',f'rstrand{s-d}',f'rdist{s-d}']] = dup_groups.loc[cur3, [f'scaf{s}',f'strand{s}',f'dist{s}']].values
-            # Negative strand
-            cur3 = cur2 & (dup_groups[f'strand{d}'] == '-')
-            if np.sum(cur3):
-                dup_groups.loc[cur3, [f'lscaf{s-d}',f'lstrand{s-d}',f'ldist{s-d}']] = dup_groups.loc[cur3, [f'scaf{s}',f'strand{s}',f'dist{s}']].values
-    dup_groups = dup_groups[['sindex','dscaf','repstrand','t_con','llen','rlen']+[col for col in [f'{o}{n}{s}' for s in range(1,dup_groups['length'].max()) for o in ['l','r'] for n in ['scaf','strand','dist']] if col in dup_groups.columns]].copy()
-    dup_groups.sort_values([col for col in dup_groups.columns if col not in ['sindex','llen','rlen']], inplace=True)
-    dup_groups[['llen','rlen']] = dup_groups[['llen','rlen']].astype(int).values
-    # Now group together the overlapping entries
-    dup_combs = []
-    for o in ['l','r']:
-        for l in np.unique(dup_groups[f'{o}len']):
-            mcols = ['dscaf','repstrand','t_con']+[f'{o}{n}{s}' for s in range(1,l) for n in ['scaf','strand','dist']]
-            dcomb = dup_groups.loc[dup_groups[f'{o}len'] == l, mcols+['sindex']].rename(columns={'sindex':'sindex1'}).merge(dup_groups[mcols+['sindex']].rename(columns={'sindex':'sindex2'}), on=mcols, how='inner').drop(columns=mcols)
-            dup_combs.append(dcomb.copy())
-            dup_combs.append(dcomb.rename(columns={'sindex1':'sindex2','sindex2':'sindex1'}))
-    dup_combs = pd.concat(dup_combs, ignore_index=True).drop_duplicates()
-    dup_combs = dup_combs[dup_combs['sindex1'] != dup_combs['sindex2']].copy()
-    # Filter found_dup, where not all required dup_combs are found
-    old_len = 0
-    while old_len != len(found_dup):
-        old_len = len(found_dup)
-        dup_combs['del'] = np.isin(dup_combs['sindex2'], found_dup['sindex'].values)
-        accepted = dup_combs.groupby(['sindex1'])['del'].min().reset_index()
-        accepted = accepted[accepted['del']].copy()
-        found_dup = found_dup[np.isin(found_dup['sindex'], accepted['sindex1'].values)].copy()
-    dup_combs.drop(columns=['del'], inplace=True)
-    # Remove indexes where the target index is definitely not removed and indexes grouping with them
-    remindex = np.unique(found_dup.loc[np.isin(found_dup['tindex'], found_dup['sindex'].values) == False, 'sindex'].values)
-    remindex = AddConnectedIndexes(remindex, dup_combs)
-    found_dup = found_dup[(np.isin(found_dup['sindex'], remindex) == False) & (np.isin(found_dup['tindex'], remindex) == False)].copy()
-    # Remove indexes with the lower counts at the diverging side
-    found_dup['len'] = np.minimum(scaffold_graph.loc[found_dup['sindex'].values, 'length'].values, scaffold_graph.loc[found_dup['tindex'].values, 'length'].values)-1
-    scaffold_graph.rename(columns={'from':'scaf0','from_side':'strand0'}, inplace=True)
-    scaffold_graph['strand0'] = np.where(scaffold_graph['strand0'] == 'r', '+', '-')
-    for s in range(1,found_dup['len'].max()):
-        cur = (found_dup['len'] > s) & (scaffold_graph.loc[found_dup['sindex'].values, [f'scaf{s}',f'strand{s}']].values != scaffold_graph.loc[found_dup['tindex'].values, [f'scaf{s}',f'strand{s}']].values).any(axis=1)
+    if len(dup_graph):
+        for l in np.unique(alt_graph['length'].values):
+            mcols = ['from','from_side']+[f'{n}{s}' for s in range(1,l) for n in ['scaf','strand','dist']]
+            found_dup.append( alt_graph.loc[alt_graph['length'] == l, ['sindex']+mcols].merge(scaffold_graph[mcols].reset_index().rename(columns={'index':'tindex'}), on=mcols, how='inner').drop(columns=mcols) )
+    if len(found_dup):
+        found_dup = pd.concat(found_dup, ignore_index=True)
+        found_dup.drop_duplicates(inplace=True)
+        # Find groups of scaffold_graph entries that must be removed together to keep scaffold_graph consistent (Start by making both directions identical by going into the perspective from dscaf)
+        dup_groups = dup_graph.drop(columns=['t_start','t_end'])
+        dup_groups.rename(columns={'from':'scaf0','from_side':'strand0'}, inplace=True)
+        dup_groups['strand0'] = np.where(dup_groups['strand0'] == 'r', '+', '-')
+        dup_groups['llen'] = dup_groups['dup']+1
+        dup_groups['rlen'] = dup_groups['length'] - dup_groups['dup']
+        for d in np.unique(dup_groups['dup'].values):
+            cur = dup_groups['dup'] == d
+            dup_groups.loc[cur & (dup_groups[f'strand{d}'] == '-'), ['llen','rlen']] = dup_groups.loc[cur & (dup_groups[f'strand{d}'] == '-'), ['rlen','llen']].values
+            # Go from d to lower s
+            for s in range(d-1,-1,-1):
+                # Positive strand
+                cur2 = cur & (dup_groups[f'strand{d}'] == '+')
+                if np.sum(cur2):
+                    dup_groups.loc[cur2, [f'lscaf{d-s}',f'lstrand{d-s}',f'ldist{d-s}']] = dup_groups.loc[cur2, [f'scaf{s}',f'strand{s}',f'dist{s+1}']].values
+                    dup_groups.loc[cur2, f'lstrand{d-s}'] = np.where(dup_groups.loc[cur2, f'lstrand{d-s}'] == '+', '-', '+')
+                # Negative strand
+                cur2 = cur & (dup_groups[f'strand{d}'] == '-')
+                if np.sum(cur2):
+                    dup_groups.loc[cur2, [f'rscaf{d-s}',f'rstrand{d-s}',f'rdist{d-s}']] = dup_groups.loc[cur2, [f'scaf{s}',f'strand{s}',f'dist{s+1}']].values
+                    dup_groups.loc[cur2, f'rstrand{d-s}'] = np.where(dup_groups.loc[cur2, f'rstrand{d-s}'] == '+', '-', '+')
+            # Go from d to higher s
+            for s in range(d+1,dup_groups.loc[cur, 'length'].max()):
+                cur2 = cur & (dup_groups['length'] > s)
+                # Positive strand
+                cur3 = cur2 & (dup_groups[f'strand{d}'] == '+')
+                if np.sum(cur3):
+                    dup_groups.loc[cur3, [f'rscaf{s-d}',f'rstrand{s-d}',f'rdist{s-d}']] = dup_groups.loc[cur3, [f'scaf{s}',f'strand{s}',f'dist{s}']].values
+                # Negative strand
+                cur3 = cur2 & (dup_groups[f'strand{d}'] == '-')
+                if np.sum(cur3):
+                    dup_groups.loc[cur3, [f'lscaf{s-d}',f'lstrand{s-d}',f'ldist{s-d}']] = dup_groups.loc[cur3, [f'scaf{s}',f'strand{s}',f'dist{s}']].values
+        dup_groups = dup_groups[['sindex','dscaf','repstrand','t_con','llen','rlen']+[col for col in [f'{o}{n}{s}' for s in range(1,dup_groups['length'].max()) for o in ['l','r'] for n in ['scaf','strand','dist']] if col in dup_groups.columns]].copy()
+        dup_groups.sort_values([col for col in dup_groups.columns if col not in ['sindex','llen','rlen']], inplace=True)
+        dup_groups[['llen','rlen']] = dup_groups[['llen','rlen']].astype(int).values
+        # Now group together the overlapping entries
+        dup_combs = []
+        for o in ['l','r']:
+            for l in np.unique(dup_groups[f'{o}len']):
+                mcols = ['dscaf','repstrand','t_con']+[f'{o}{n}{s}' for s in range(1,l) for n in ['scaf','strand','dist']]
+                dcomb = dup_groups.loc[dup_groups[f'{o}len'] == l, mcols+['sindex']].rename(columns={'sindex':'sindex1'}).merge(dup_groups[mcols+['sindex']].rename(columns={'sindex':'sindex2'}), on=mcols, how='inner').drop(columns=mcols)
+                dup_combs.append(dcomb.copy())
+                dup_combs.append(dcomb.rename(columns={'sindex1':'sindex2','sindex2':'sindex1'}))
+        dup_combs = pd.concat(dup_combs, ignore_index=True).drop_duplicates()
+        dup_combs = dup_combs[dup_combs['sindex1'] != dup_combs['sindex2']].copy()
+        # Filter found_dup, where not all required dup_combs are found
+        old_len = 0
+        while old_len != len(found_dup):
+            old_len = len(found_dup)
+            dup_combs['del'] = np.isin(dup_combs['sindex2'], found_dup['sindex'].values)
+            accepted = dup_combs.groupby(['sindex1'])['del'].min().reset_index()
+            accepted = accepted[accepted['del']].copy()
+            found_dup = found_dup[np.isin(found_dup['sindex'], accepted['sindex1'].values)].copy()
+        dup_combs.drop(columns=['del'], inplace=True)
+    if len(found_dup):
+        # Remove indexes where the target index is definitely not removed and indexes grouping with them
+        remindex = np.unique(found_dup.loc[np.isin(found_dup['tindex'], found_dup['sindex'].values) == False, 'sindex'].values)
+        remindex = AddConnectedIndexes(remindex, dup_combs)
+        found_dup = found_dup[(np.isin(found_dup['sindex'], remindex) == False) & (np.isin(found_dup['tindex'], remindex) == False)].copy()
+        # Remove indexes with the lower counts at the diverging side
+        found_dup['len'] = np.minimum(scaffold_graph.loc[found_dup['sindex'].values, 'length'].values, scaffold_graph.loc[found_dup['tindex'].values, 'length'].values)-1
+        scaffold_graph.rename(columns={'from':'scaf0','from_side':'strand0'}, inplace=True)
+        scaffold_graph['strand0'] = np.where(scaffold_graph['strand0'] == 'r', '+', '-')
+        for s in range(1,found_dup['len'].max()):
+            cur = (found_dup['len'] > s) & (scaffold_graph.loc[found_dup['sindex'].values, [f'scaf{s}',f'strand{s}']].values != scaffold_graph.loc[found_dup['tindex'].values, [f'scaf{s}',f'strand{s}']].values).any(axis=1)
+            for q in ['s','t']:
+                for o in ['l','r']:
+                    if o == 'l':
+                        bridge = scaffold_graph.loc[found_dup.loc[cur, f'{q}index'].values, [f'scaf{s-1}',f'strand{s-1}',f'scaf{s}',f'strand{s}',f'dist{s}']].rename(columns={f'scaf{s-1}':'from',f'strand{s-1}':'from_side',f'scaf{s}':'to',f'strand{s}':'to_side',f'dist{s}':'mean_dist'})
+                    else:
+                        bridge = scaffold_graph.loc[found_dup.loc[cur, f'{q}index'].values, [f'scaf{s}',f'strand{s}',f'scaf{s+1}',f'strand{s+1}',f'dist{s+1}']].rename(columns={f'scaf{s}':'from',f'strand{s}':'from_side',f'scaf{s+1}':'to',f'strand{s+1}':'to_side',f'dist{s+1}':'mean_dist'})
+                    bridge['from_side'] = np.where(bridge['from_side'] == '+', 'r', 'l')
+                    bridge['to_side'] = np.where(bridge['to_side'] == '+', 'l', 'r')
+                    bridge['bcount'] = bridge.merge(scaf_bridges[['from','from_side','to','to_side','mean_dist','bcount']], on=['from','from_side','to','to_side','mean_dist'], how='left')['bcount'].values
+                    found_dup.loc[cur, f'{o}{q}count'] = bridge['bcount'].values
+        scaffold_graph.rename(columns={'scaf0':'from','strand0':'from_side'}, inplace=True)
+        scaffold_graph['from_side'] = np.where(scaffold_graph['from_side'] == '+', 'r', 'l')
         for q in ['s','t']:
-            for o in ['l','r']:
-                if o == 'l':
-                    bridge = scaffold_graph.loc[found_dup.loc[cur, f'{q}index'].values, [f'scaf{s-1}',f'strand{s-1}',f'scaf{s}',f'strand{s}',f'dist{s}']].rename(columns={f'scaf{s-1}':'from',f'strand{s-1}':'from_side',f'scaf{s}':'to',f'strand{s}':'to_side',f'dist{s}':'mean_dist'})
-                else:
-                    bridge = scaffold_graph.loc[found_dup.loc[cur, f'{q}index'].values, [f'scaf{s}',f'strand{s}',f'scaf{s+1}',f'strand{s+1}',f'dist{s+1}']].rename(columns={f'scaf{s}':'from',f'strand{s}':'from_side',f'scaf{s+1}':'to',f'strand{s+1}':'to_side',f'dist{s+1}':'mean_dist'})
-                bridge['from_side'] = np.where(bridge['from_side'] == '+', 'r', 'l')
-                bridge['to_side'] = np.where(bridge['to_side'] == '+', 'l', 'r')
-                bridge['bcount'] = bridge.merge(scaf_bridges[['from','from_side','to','to_side','mean_dist','bcount']], on=['from','from_side','to','to_side','mean_dist'], how='left')['bcount'].values
-                found_dup.loc[cur, f'{o}{q}count'] = bridge['bcount'].values
-    scaffold_graph.rename(columns={'scaf0':'from','strand0':'from_side'}, inplace=True)
-    scaffold_graph['from_side'] = np.where(scaffold_graph['from_side'] == '+', 'r', 'l')
-    for q in ['s','t']:
-        found_dup[f'min{q}count'] = np.minimum(found_dup[f'l{q}count'], found_dup[f'r{q}count'])
-        found_dup[f'max{q}count'] = np.maximum(found_dup[f'l{q}count'], found_dup[f'r{q}count'])
-    remindex2 = np.unique(found_dup.loc[(found_dup['minscount'] < found_dup['mintcount']) | ((found_dup['minscount'] == found_dup['mintcount']) & (found_dup['maxscount'] < found_dup['maxtcount'])), 'sindex'])
-    found_dup.drop(columns=['len','lscount','rscount','ltcount','rtcount','minscount','maxscount','mintcount','maxtcount'], inplace=True)
-    remindex2 = AddConnectedIndexes(remindex2, dup_combs)
-    remdups = found_dup[np.isin(found_dup['sindex'], remindex2)].copy()
-    remdups = remdups[np.isin(remdups['tindex'], remindex2) == False].copy()
-    remindex2 = np.unique(remdups['sindex'].values)
-    remindex = np.concatenate([remindex, remindex2])
-    found_dup = found_dup[(np.isin(found_dup['sindex'], remindex2) == False) & (np.isin(found_dup['tindex'], remindex2) == False)].copy()
-    # In case of a tie remove arbitrarily the group, where the lowest index is the highest
-    dcomb = dup_combs[np.isin(dup_combs['sindex1'], found_dup['sindex'].values) & np.isin(dup_combs['sindex2'], found_dup['sindex'].values)].copy()
-    dcomb['group'] = np.minimum(dcomb['sindex1'], dcomb['sindex2'])
-    while True:
-        min_group = pd.concat([dcomb[['sindex1','group']].rename(columns={'sindex1':'sindex'}), dcomb[['sindex2','group']].rename(columns={'sindex2':'sindex'})], ignore_index=True).groupby(['sindex'])['group'].min().reset_index()
-        dcomb['mingroup'] = np.minimum(dcomb[['sindex1']].rename(columns={'sindex1':'sindex'}).merge(min_group, on='sindex', how='left')['group'].values, dcomb[['sindex2']].rename(columns={'sindex2':'sindex'}).merge(min_group, on='sindex', how='left')['group'].values)
-        if np.sum(dcomb['group'] != dcomb['mingroup']):
-            dcomb['group'] = dcomb['mingroup']
-        else:
-            break
-    found_dup['sgroup'] = found_dup[['sindex']].merge(min_group, on=['sindex'], how='left')['group'].values
-    found_dup['tgroup'] = found_dup[['tindex']].rename(columns={'tindex':'sindex'}).merge(min_group, on=['sindex'], how='left')['group'].values
-    remindex2 = np.unique(found_dup.loc[found_dup['sgroup'] > found_dup['tgroup'], 'sindex'])
-    remindex = np.concatenate([remindex, remindex2])
-    # Apply the removal and reconstruct entries, where we removed too much
-    scaffold_graph = DeleteIndexInScaffoldGraph(scaffold_graph, remindex, True)
-    for l in range(scaffold_graph['length'].max(), 2, -1):
-        cur = scaffold_graph.loc[scaffold_graph['length'] == l].drop(columns=['from','from_side','dist1'])
-        cur = RemoveEmptyColumns(cur)
-        cur.rename(columns={f'{n}{s}':f'{n}{s-1}' for s in range(1,l) for n in ['scaf','strand','dist']}, inplace=True)
-        cur.rename(columns={'scaf0':'from','strand0':'from_side'}, inplace=True)
-        cur['from_side'] = np.where(cur['from_side'] == '+', 'r', 'l')
-        cur[['scaf1','dist1']] = cur[['scaf1','dist1']].astype(int)
-        cur['length'] -= 1
-        scaffold_graph = pd.concat([scaffold_graph, cur], ignore_index=True)
-        scaffold_graph = RemoveRedundantEntriesInScaffoldGraph(scaffold_graph)
+            found_dup[f'min{q}count'] = np.minimum(found_dup[f'l{q}count'], found_dup[f'r{q}count'])
+            found_dup[f'max{q}count'] = np.maximum(found_dup[f'l{q}count'], found_dup[f'r{q}count'])
+        remindex2 = np.unique(found_dup.loc[(found_dup['minscount'] < found_dup['mintcount']) | ((found_dup['minscount'] == found_dup['mintcount']) & (found_dup['maxscount'] < found_dup['maxtcount'])), 'sindex'])
+        found_dup.drop(columns=['len','lscount','rscount','ltcount','rtcount','minscount','maxscount','mintcount','maxtcount'], inplace=True)
+        remindex2 = AddConnectedIndexes(remindex2, dup_combs)
+        remdups = found_dup[np.isin(found_dup['sindex'], remindex2)].copy()
+        remdups = remdups[np.isin(remdups['tindex'], remindex2) == False].copy()
+        remindex2 = np.unique(remdups['sindex'].values)
+        remindex = np.concatenate([remindex, remindex2])
+        found_dup = found_dup[(np.isin(found_dup['sindex'], remindex2) == False) & (np.isin(found_dup['tindex'], remindex2) == False)].copy()
+        # In case of a tie remove arbitrarily the group, where the lowest index is the highest
+        dcomb = dup_combs[np.isin(dup_combs['sindex1'], found_dup['sindex'].values) & np.isin(dup_combs['sindex2'], found_dup['sindex'].values)].copy()
+        dcomb['group'] = np.minimum(dcomb['sindex1'], dcomb['sindex2'])
+        while True:
+            min_group = pd.concat([dcomb[['sindex1','group']].rename(columns={'sindex1':'sindex'}), dcomb[['sindex2','group']].rename(columns={'sindex2':'sindex'})], ignore_index=True).groupby(['sindex'])['group'].min().reset_index()
+            dcomb['mingroup'] = np.minimum(dcomb[['sindex1']].rename(columns={'sindex1':'sindex'}).merge(min_group, on='sindex', how='left')['group'].values, dcomb[['sindex2']].rename(columns={'sindex2':'sindex'}).merge(min_group, on='sindex', how='left')['group'].values)
+            if np.sum(dcomb['group'] != dcomb['mingroup']):
+                dcomb['group'] = dcomb['mingroup']
+            else:
+                break
+        found_dup['sgroup'] = found_dup[['sindex']].merge(min_group, on=['sindex'], how='left')['group'].values
+        found_dup['tgroup'] = found_dup[['tindex']].rename(columns={'tindex':'sindex'}).merge(min_group, on=['sindex'], how='left')['group'].values
+        remindex2 = np.unique(found_dup.loc[found_dup['sgroup'] > found_dup['tgroup'], 'sindex'])
+        remindex = np.concatenate([remindex, remindex2])
+        # Apply the removal and reconstruct entries, where we removed too much
+        scaffold_graph = DeleteIndexInScaffoldGraph(scaffold_graph, remindex, True)
+        for l in range(scaffold_graph['length'].max(), 2, -1):
+            cur = scaffold_graph.loc[scaffold_graph['length'] == l].drop(columns=['from','from_side','dist1'])
+            cur = RemoveEmptyColumns(cur)
+            cur.rename(columns={f'{n}{s}':f'{n}{s-1}' for s in range(1,l) for n in ['scaf','strand','dist']}, inplace=True)
+            cur.rename(columns={'scaf0':'from','strand0':'from_side'}, inplace=True)
+            cur['from_side'] = np.where(cur['from_side'] == '+', 'r', 'l')
+            cur[['scaf1','dist1']] = cur[['scaf1','dist1']].astype(int)
+            cur['length'] -= 1
+            scaffold_graph = pd.concat([scaffold_graph, cur], ignore_index=True)
+            scaffold_graph = RemoveRedundantEntriesInScaffoldGraph(scaffold_graph)
 #
     return scaffold_graph
 
@@ -6847,19 +6662,22 @@ def PhaseScaffoldsWithScafBridges(scaffold_paths, scaf_bridges, ploidy):
                             scaffold_paths['from_side'] = scaffold_paths[f'strand{h2}'].shift(s2, fill_value='')
                             deletions.append( scaffold_paths.loc[scaffold_paths['add'] & (scaffold_paths[f'phase{h2}'].shift(s2) > 0) & (scaffold_paths['from'] >= 0), ['pid','pos','from_phase','from','from_side',f'phase{h}',f'scaf{h}',f'strand{h}',f'dist{h}']].rename(columns={f'phase{h}':'to_phase',f'scaf{h}':'to',f'strand{h}':'to_side',f'dist{h}':'mean_dist'}) )
                 s += 1
+                scaffold_paths.drop(columns=['from','from_side'], inplace=True)
             else:
                 break
-    scaffold_paths.drop(columns=['deletion','add','from_phase','from','from_side'], inplace=True)
-    deletions = pd.concat(deletions, ignore_index=True)
-    deletions['from_side'] = np.where(deletions['from_side'] == '+', 'r', 'l')
-    deletions['to_side'] = np.where(deletions['to_side'] == '+', 'l', 'r')
-    deletions['valid'] = deletions[['from','from_side','to','to_side','mean_dist']].merge(scaf_bridges[['from','from_side','to','to_side','mean_dist']], on=['from','from_side','to','to_side','mean_dist'], how='left', indicator=True)['_merge'].values == "both"
-    deletions.sort_values(['pid','pos','from_phase'], inplace=True)
-    valid = deletions.groupby(['pid','pos','from_phase'], sort=False)['valid'].agg(['max','size'])
-    deletions['valid'] = np.repeat(valid['max'].values, valid['size'].values)
-    deletions = deletions.loc[deletions['valid'] == False, ['from_phase','to_phase']].drop_duplicates()
-    deletions.rename(columns={'from_phase':'to_phase','to_phase':'from_phase'}, inplace=True) # We need to assign 'to_phase' to 'from_phase', because from_phase is unique, but to_phase not necessarily
-    scaffold_paths = AssignNewPhases(scaffold_paths, deletions, ploidy)
+    scaffold_paths.drop(columns=['deletion','add','from_phase'], inplace=True)
+    if len(deletions):
+        deletions = pd.concat(deletions, ignore_index=True)
+    if len(deletions):
+        deletions['from_side'] = np.where(deletions['from_side'] == '+', 'r', 'l')
+        deletions['to_side'] = np.where(deletions['to_side'] == '+', 'l', 'r')
+        deletions['valid'] = deletions[['from','from_side','to','to_side','mean_dist']].merge(scaf_bridges[['from','from_side','to','to_side','mean_dist']], on=['from','from_side','to','to_side','mean_dist'], how='left', indicator=True)['_merge'].values == "both"
+        deletions.sort_values(['pid','pos','from_phase'], inplace=True)
+        valid = deletions.groupby(['pid','pos','from_phase'], sort=False)['valid'].agg(['max','size'])
+        deletions['valid'] = np.repeat(valid['max'].values, valid['size'].values)
+        deletions = deletions.loc[deletions['valid'] == False, ['from_phase','to_phase']].drop_duplicates()
+        deletions.rename(columns={'from_phase':'to_phase','to_phase':'from_phase'}, inplace=True) # We need to assign 'to_phase' to 'from_phase', because from_phase is unique, but to_phase not necessarily
+        scaffold_paths = AssignNewPhases(scaffold_paths, deletions, ploidy)
     # Combine adjacent deletions if the previous phase has no connection into the deletion (to a position of the deletion that is not the first)
     deletions = []
     for h in range(ploidy):
@@ -7002,7 +6820,8 @@ def PhaseScaffoldsWithScaffoldGraph(scaffold_paths, graph_ext, ploidy):
     cols = ['pid','hap','side','min','max','len']
     ends = pd.concat([ends, ends.rename(columns={**{f'a{n}':f'b{n}' for n in cols},**{f'b{n}':f'a{n}' for n in cols}})], ignore_index=True)
     ends = FilterInvalidConnections(ends, test_paths, graph_ext, ploidy)
-    ends = ends[ends['valid_path'] == 'ab'].drop(columns=['valid_path'])
+    if len(ends):
+        ends = ends[ends['valid_path'] == 'ab'].drop(columns=['valid_path'])
     if len(ends) == 0:
         path_errors = phase_breaks
         phase_breaks = []
@@ -7221,32 +7040,35 @@ def ScaffoldContigs(contig_parts, bridges, mappings, cov_probs, repeats, prob_fa
     return scaffold_paths, trim_repeats
 
 def RemoveScaffoldsFromAssembly(scaffold_paths, contig_parts, del_scafs):
-    # Update the original scaffolding in case of deleted contigs
-    scaffold_paths['del'] = np.isin(scaffold_paths['scaf'], del_scafs)
-    scaffold_paths.loc[scaffold_paths['del'].shift(1, fill_value=False), 'sdist_left'] = -1
-    scaffold_paths['conlen'] = 0
-    scaffold_paths.loc[scaffold_paths['con0'] >= 0, 'conlen'] = contig_parts.loc[scaffold_paths.loc[scaffold_paths['con0'] >= 0, 'con0'].values, 'end'].values - contig_parts.loc[scaffold_paths.loc[scaffold_paths['con0'] >= 0, 'con0'].values, 'start'].values
-    scaffold_paths.reset_index(drop=True, inplace=True)
-    cur_entries = scaffold_paths.loc[(scaffold_paths['sdist_right'] >= 0) & scaffold_paths['del'].shift(-1, fill_value=False) & (scaffold_paths['del'] == False), ['sdist_right']].reset_index()
-    cur_entries.index = cur_entries['index'].values
-    s = 1
-    while len(cur_entries):
-        bridged = cur_entries[scaffold_paths.loc[cur_entries['index'].values+s, 'del'].values == False].copy()
-        if len(bridged):
-            scaffold_paths.loc[bridged['index'].values, 'sdist_right'] = bridged['sdist_right'].values
-            scaffold_paths.loc[bridged['index'].values+s, 'sdist_left'] = bridged['sdist_right'].values
-            cur_entries.drop(bridged['index'].values, inplace=True)
-        broken = cur_entries[scaffold_paths.loc[cur_entries['index'].values+s, 'sdist_right'].values < 0].copy()
-        if len(broken):
-            scaffold_paths.loc[broken['index'].values, 'sdist_right'] = -1
-            cur_entries.drop(broken['index'].values, inplace=True)
-        if len(cur_entries):
-            cur_entries['sdist_right'] += scaffold_paths.loc[cur_entries['index'].values+s, 'sdist_right'].values + scaffold_paths.loc[cur_entries['index'].values+s, 'conlen'].values
-            s += 1
-    # Store removed length
-    removed_length = scaffold_paths.loc[scaffold_paths['del'], 'conlen'].values
-    # Remove the unconnected contigs scheduled for deletion
-    scaffold_paths = scaffold_paths[scaffold_paths['del'] == False].drop(columns=['del','conlen'])
+    if len(del_scafs) == 0:
+        removed_length = []
+    else:
+        # Update the original scaffolding in case of deleted contigs
+        scaffold_paths['del'] = np.isin(scaffold_paths['scaf'], del_scafs)
+        scaffold_paths.loc[scaffold_paths['del'].shift(1, fill_value=False), 'sdist_left'] = -1
+        scaffold_paths['conlen'] = 0
+        scaffold_paths.loc[scaffold_paths['con0'] >= 0, 'conlen'] = contig_parts.loc[scaffold_paths.loc[scaffold_paths['con0'] >= 0, 'con0'].values, 'end'].values - contig_parts.loc[scaffold_paths.loc[scaffold_paths['con0'] >= 0, 'con0'].values, 'start'].values
+        scaffold_paths.reset_index(drop=True, inplace=True)
+        cur_entries = scaffold_paths.loc[(scaffold_paths['sdist_right'] >= 0) & scaffold_paths['del'].shift(-1, fill_value=False) & (scaffold_paths['del'] == False), ['sdist_right']].reset_index()
+        cur_entries.index = cur_entries['index'].values
+        s = 1
+        while len(cur_entries):
+            bridged = cur_entries[scaffold_paths.loc[cur_entries['index'].values+s, 'del'].values == False].copy()
+            if len(bridged):
+                scaffold_paths.loc[bridged['index'].values, 'sdist_right'] = bridged['sdist_right'].values
+                scaffold_paths.loc[bridged['index'].values+s, 'sdist_left'] = bridged['sdist_right'].values
+                cur_entries.drop(bridged['index'].values, inplace=True)
+            broken = cur_entries[scaffold_paths.loc[cur_entries['index'].values+s, 'sdist_right'].values < 0].copy()
+            if len(broken):
+                scaffold_paths.loc[broken['index'].values, 'sdist_right'] = -1
+                cur_entries.drop(broken['index'].values, inplace=True)
+            if len(cur_entries):
+                cur_entries['sdist_right'] += scaffold_paths.loc[cur_entries['index'].values+s, 'sdist_right'].values + scaffold_paths.loc[cur_entries['index'].values+s, 'conlen'].values
+                s += 1
+        # Store removed length
+        removed_length = scaffold_paths.loc[scaffold_paths['del'], 'conlen'].values
+        # Remove the unconnected contigs scheduled for deletion
+        scaffold_paths = scaffold_paths[scaffold_paths['del'] == False].drop(columns=['del','conlen'])
 #
     return scaffold_paths, removed_length
 
@@ -7291,43 +7113,47 @@ def RemoveUnconnectedLowlyMappedOrDuplicatedContigs(scaffold_paths, result_info,
     return scaffold_paths, result_info
 
 def TrimDuplicatedEnds(contig_parts, scaffold_paths, mappings, repeats, trim_repeats, min_mapping_length, alignment_precision):
-    # Trim previously selected contig sides
-    trim = repeats.merge(trim_repeats, on=['q_con'], how='inner')
-    trim = trim[(trim['side'] == 'lr') | (trim['side'] == trim['rep_side'])].drop(columns='side')
-    trim.rename(columns={'rep_side':'side'}, inplace=True)
-    # Trim the longest duplicated regions
-    trim = trim.groupby(['q_con','side','q_confrom','q_conto']).agg({'q_start':'min', 'q_end':'max'}).reset_index()
-    # Remove the contigs that have been already removed for other reasons
-    trim = trim.merge(scaffold_paths[['con0','scaf']].rename(columns={'con0':'q_con'}), on='q_con', how='inner') # Since they were disconnected from the graph before they must be on a separate path and thus the main haplotype
-    # Make sure they are also unconnected (in case not all paths were disconnected)
-    trim = trim[ trim[['scaf']].merge(scaffold_paths.groupby('scaf')['pos'].max().reset_index(name='len'), on='scaf', how='left')['len'] == 0 ].copy()
-    if len(trim):
-        # Trim left sides
-        if np.sum(trim['side'] == 'l'):
-            contig_parts.loc[trim.loc[trim['side'] == 'l', 'q_con'].values, 'start'] = trim.loc[trim['side'] == 'l', 'q_end'].values
-        # Trim right sides
-        if np.sum(trim['side'] == 'r'):
-            contig_parts.loc[trim.loc[trim['side'] == 'r', 'q_con'].values, 'end'] = trim.loc[trim['side'] == 'r', 'q_start'].values
+    if len(trim_repeats):
+        # Trim previously selected contig sides
+        trim = repeats.merge(trim_repeats, on=['q_con'], how='inner')
+        trim = trim[(trim['side'] == 'lr') | (trim['side'] == trim['rep_side'])].drop(columns='side')
+        trim.rename(columns={'rep_side':'side'}, inplace=True)
+        # Trim the longest duplicated regions
+        trim = trim.groupby(['q_con','side','q_confrom','q_conto']).agg({'q_start':'min', 'q_end':'max'}).reset_index()
+        # Remove the contigs that have been already removed for other reasons
+        trim = trim.merge(scaffold_paths[['con0','scaf']].rename(columns={'con0':'q_con'}), on='q_con', how='inner') # Since they were disconnected from the graph before they must be on a separate path and thus the main haplotype
+        # Make sure they are also unconnected (in case not all paths were disconnected)
+        trim = trim[ trim[['scaf']].merge(scaffold_paths.groupby('scaf')['pos'].max().reset_index(name='len'), on='scaf', how='left')['len'] == 0 ].copy()
+        if len(trim):
+            # Trim left sides
+            if np.sum(trim['side'] == 'l'):
+                contig_parts.loc[trim.loc[trim['side'] == 'l', 'q_con'].values, 'start'] = trim.loc[trim['side'] == 'l', 'q_end'].values
+            # Trim right sides
+            if np.sum(trim['side'] == 'r'):
+                contig_parts.loc[trim.loc[trim['side'] == 'r', 'q_con'].values, 'end'] = trim.loc[trim['side'] == 'r', 'q_start'].values
 #
-    # Trim unconnected contigs that are duplicated on both sides by the same contig (likely alternative haplotypes)
-    ctrim = scaffold_paths.groupby(['scaf'])['pos'].max().reset_index(name='len')
-    ctrim = ctrim[ctrim['len'] == 0].drop(columns='len')
-    ctrim['q_con'] = ctrim[['scaf']].merge(scaffold_paths[['scaf','con0']], on='scaf', how='left')['con0'].values
-    ctrim = ctrim.merge(repeats.loc[repeats['side'] == 'l', ['q_con','q_end','strand','t_con','t_start','t_end']].rename(columns={'q_end':'new_start','t_start':'ltstart','t_end':'ltend'}), on='q_con', how='inner')
-    ctrim = ctrim.merge(repeats.loc[repeats['side'] == 'r', ['q_con','q_start','strand','t_con','t_start','t_end']].rename(columns={'q_start':'new_end','t_start':'rtstart','t_end':'rtend'}), on=['q_con','strand','t_con'], how='inner')
-    # Remove self-mappings
-    ctrim = ctrim[ctrim['q_con'] != ctrim['t_con']].copy()
-    # Remove overlapping duplications (we do not want to remove the contigs that passed the thresholds for not fully duplicated)
-    ctrim = ctrim[ np.where(ctrim['strand'] == '+', ctrim['ltend'] < ctrim['rtstart'], ctrim['rtend'] < ctrim['ltstart']) ].copy()
-    # Collect the trimming caused by different targets
-    ctrim = ctrim.groupby(['scaf','q_con']).agg({'new_start':'min','new_end':'max'}).reset_index()
-    if len(ctrim):
-        contig_parts.loc[ctrim['q_con'].values, ['start','end']] = ctrim[['new_start','new_end']].values
+        # Trim unconnected contigs that are duplicated on both sides by the same contig (likely alternative haplotypes)
+        ctrim = scaffold_paths.groupby(['scaf'])['pos'].max().reset_index(name='len')
+        ctrim = ctrim[ctrim['len'] == 0].drop(columns='len')
+        if len(ctrim):
+            ctrim['q_con'] = ctrim[['scaf']].merge(scaffold_paths[['scaf','con0']], on='scaf', how='left')['con0'].values
+            ctrim = ctrim.merge(repeats.loc[repeats['side'] == 'l', ['q_con','q_end','strand','t_con','t_start','t_end']].rename(columns={'q_end':'new_start','t_start':'ltstart','t_end':'ltend'}), on='q_con', how='inner')
+            ctrim = ctrim.merge(repeats.loc[repeats['side'] == 'r', ['q_con','q_start','strand','t_con','t_start','t_end']].rename(columns={'q_start':'new_end','t_start':'rtstart','t_end':'rtend'}), on=['q_con','strand','t_con'], how='inner')
+            # Remove self-mappings
+            ctrim = ctrim[ctrim['q_con'] != ctrim['t_con']].copy()
+        if len(ctrim):
+            # Remove overlapping duplications (we do not want to remove the contigs that passed the thresholds for not fully duplicated)
+            ctrim = ctrim[ np.where(ctrim['strand'] == '+', ctrim['ltend'] < ctrim['rtstart'], ctrim['rtend'] < ctrim['ltstart']) ].copy()
+        if len(ctrim):
+            # Collect the trimming caused by different targets
+            ctrim = ctrim.groupby(['scaf','q_con']).agg({'new_start':'min','new_end':'max'}).reset_index()
+            if len(ctrim):
+                contig_parts.loc[ctrim['q_con'].values, ['start','end']] = ctrim[['new_start','new_end']].values
 #
-    # Remove contig_parts that became shorter than min_mapping_length+alignment_precision completely
-    scaffold_paths, removed_length = RemoveScaffoldsFromAssembly(scaffold_paths, contig_parts, scaffold_paths.loc[np.isin(scaffold_paths['con0'], contig_parts[contig_parts['end'] - contig_parts['start'] < min_mapping_length+alignment_precision].index.values), 'scaf'].values)
-    # Remove mappings for trimmed contigs, so that they will not be extended (must happen after RemoveUnconnectedLowlyMappedOrDuplicatedContigs or we will remove all of them)
-    mappings = mappings[np.isin(mappings['conpart'], np.concatenate([ctrim['q_con'].values, trim['q_con'].values])) == False].copy()
+        # Remove contig_parts that became shorter than min_mapping_length+alignment_precision completely
+        scaffold_paths, removed_length = RemoveScaffoldsFromAssembly(scaffold_paths, contig_parts, scaffold_paths.loc[np.isin(scaffold_paths['con0'], contig_parts[contig_parts['end'] - contig_parts['start'] < min_mapping_length+alignment_precision].index.values), 'scaf'].values)
+        # Remove mappings for trimmed contigs, so that they will not be extended (must happen after RemoveUnconnectedLowlyMappedOrDuplicatedContigs or we will remove all of them)
+        mappings = mappings[np.isin(mappings['conpart'], np.concatenate([ctrim['q_con'].values, trim['q_con'].values])) == False].copy()
 #
     return contig_parts, scaffold_paths, mappings
 
@@ -7757,27 +7583,34 @@ def MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploi
     circular['tot'] = np.repeat(tmp['sum'].values, tmp['size'].values)
     # Filter circular connections with more than ploidy options
     circular = circular[np.repeat(tmp['size'].values<=ploidy, tmp['size'].values)].copy()
-    # Filter scaffolds where non circular options are dominant
+    # Filter scaffolds where non-circular options are dominant
     circular = circular.merge(circular[['scaf','pos']].drop_duplicates().merge(mappings.loc[(mappings['rcon'] >= 0) & (mappings[[f'con{h}' for h in range(ploidy)]] < 0).all(axis=1), ['scaf','pos']], on=['scaf','pos'], how='inner').groupby(['scaf','pos']).size().reset_index(name='veto'), on=['scaf','pos'], how='left')
     circular = circular[circular['count'] > circular['veto']].copy()
-    # If we have multiple haplotypes take the one with more counts (at some point I should use both, so print a warning to find a proper dataset for testing)
-    circular.sort_values(['scaf','pos','rhap','count'], inplace=True)
-    old_len = len(circular)
-    circular = circular.groupby(['scaf','pos','rhap']).last().reset_index()
-    if old_len != len(circular):
-        print("Warning:", old_len-len(circular), "alternative haplotypes have been removed for the connection of circular scaffolds. This case still needs proper handling.")
+    # Ensure that left and right haplotypes match
+    circular = circular[(circular['rhap'] == circular['lhap']) | (circular['rhap'] == 0) | (circular['lhap'] == 0)].copy()
+    circular['nhap'] = circular[['rhap','lhap']].max(axis=1)
+    circular[[f'rphase{h}' for h in range(1,ploidy)]] = circular[['scaf','pos']].merge(scaffold_paths[['scaf','pos']+[f'phase{h}' for h in range(1,ploidy)]], on=['scaf','pos'], how='left')[[f'phase{h}' for h in range(1,ploidy)]].values
+    circular[[f'lphase{h}' for h in range(1,ploidy)]] = circular[['scaf']].merge(scaffold_paths.loc[scaffold_paths['pos'] == 0, ['scaf']+[f'phase{h}' for h in range(1,ploidy)]], on=['scaf'], how='left')[[f'phase{h}' for h in range(1,ploidy)]].values
+    for h in range(1,ploidy):
+        circular = circular[ ((circular['rhap'] == circular['nhap']) | (circular['nhap'] != h) | (circular[f'rphase{h}'] < 0)) &
+                             ((circular['lhap'] == circular['nhap']) | (circular['nhap'] != h) | (circular[f'lphase{h}'] < 0)) ].drop(columns=[f'rphase{h}',f'lphase{h}'])
+    # If we have multiple connections for the same haplotype take the one with most counts
+    circular.sort_values(['scaf','pos','nhap','count'], inplace=True)
+    circular = circular.groupby(['scaf','pos','nhap']).last().reset_index()
     # Add information to accepted circular mappings
-    mappings[['hap','rmdist']] = mappings[['scaf','pos','rhap']].merge(circular[['scaf','pos','rhap','lhap','rmdist']].rename(columns={'lhap':'hap'}), on=['scaf','pos','rhap'], how='left')[['hap','rmdist']].values
-    mappings['circular'] = False
-    for h in range(ploidy):
-        mappings.loc[(mappings['hap'] == h) & (mappings[f'rmdist{h}'] == mappings['rmdist']) & (mappings[f'con{h}'] >= 0), 'circular'] = True
-    mappings.loc[mappings['circular'], 'rpos'] = 0
-    mappings.loc[mappings['circular'] == False, 'rmapid'] = mappings.loc[mappings['circular'] == False, 'mapid']
-    mappings.drop(columns=[f'con{h}' for h in range(ploidy)] + [f'rmdist{h}' for h in range(ploidy)] + ['hap','rmdist','circular'], inplace=True)
-    mappings['check_pos'] = mappings['read_pos'] + np.where(mappings['strand'] == '+', 1, -1)
-    mappings['circular'] = mappings[['read_name','read_start','read_pos','scaf','pos','strand','conpart','lcon','ldist','mapid']].merge(mappings.loc[mappings['rpos'] == 0, ['read_name','read_start','scaf','strand','check_pos','rpos','conpart','rcon','rdist','rmapid','pos']].rename(columns={'check_pos':'read_pos','rpos':'pos','conpart':'lcon','rcon':'conpart','rdist':'ldist','rmapid':'mapid','pos':'circular'}), on=['read_name','read_start','read_pos','scaf','pos','strand','conpart','lcon','ldist','mapid'], how='left')['circular'].values
-    mappings.loc[np.isnan(mappings['circular']) == False, 'lpos'] = mappings.loc[np.isnan(mappings['circular']) == False, 'circular'].astype(int)
-    mappings.drop(columns=['check_pos','circular'], inplace=True)
+    if len(circular):
+        mappings[['hap','rmdist','nhap']] = mappings[['scaf','pos','rhap']].merge(circular[['scaf','pos','rhap','lhap','rmdist','nhap']].rename(columns={'lhap':'hap'}), on=['scaf','pos','rhap'], how='left')[['hap','rmdist','nhap']].values
+        mappings['circular'] = False
+        for h in range(ploidy):
+            mappings.loc[(mappings['hap'] == h) & (mappings[f'rmdist{h}'] == mappings['rmdist']) & (mappings[f'con{h}'] >= 0), 'circular'] = True
+        mappings.loc[mappings['circular'], 'rpos'] = 0
+        mappings.loc[mappings['circular'], 'rhap'] = mappings.loc[mappings['circular'], 'nhap'].astype(int)
+        mappings.loc[mappings['circular'] == False, 'rmapid'] = mappings.loc[mappings['circular'] == False, 'mapid']
+        mappings.drop(columns=[f'con{h}' for h in range(ploidy)] + [f'rmdist{h}' for h in range(ploidy)] + ['hap','rmdist','circular','nhap'], inplace=True)
+        mappings['check_pos'] = mappings['read_pos'] + np.where(mappings['strand'] == '+', 1, -1)
+        mappings[['circular','nhap']] = mappings[['read_name','read_start','read_pos','scaf','pos','strand','conpart','lcon','ldist','mapid']].merge(mappings.loc[mappings['rpos'] == 0, ['read_name','read_start','scaf','strand','check_pos','rpos','conpart','rcon','rdist','rmapid','pos','rhap']].rename(columns={'check_pos':'read_pos','rpos':'pos','conpart':'lcon','rcon':'conpart','rdist':'ldist','rmapid':'mapid','pos':'circular'}), on=['read_name','read_start','read_pos','scaf','pos','strand','conpart','lcon','ldist','mapid'], how='left')[['circular','rhap']].values
+        mappings.loc[np.isnan(mappings['circular']) == False, ['lpos','lhap']] = mappings.loc[np.isnan(mappings['circular']) == False, ['circular','nhap']].astype(int).values
+        mappings.drop(columns=['check_pos','circular','nhap'], inplace=True)
 #
     return mappings, scaffold_paths, overlap_bridges
 
@@ -7834,8 +7667,7 @@ def CountResealedBreaks(result_info, scaffold_paths, contig_parts, ploidy):
 
     return result_info
 
-def FillGapsWithReads(scaffold_paths, mappings, contig_parts, overlap_bridges, ploidy, max_dist_contig_end, min_extension, min_num_reads, pdf):
-    ## Find best reads to fill into gaps
+def FindBestReadsToFillGaps(mappings, overlap_bridges):
     possible_reads = mappings.loc[(mappings['rcon'] >= 0) & (mappings['rpos'] >= 0), ['scaf','pos','rhap','rpos','read_pos','read_name','read_start','read_from','read_to','strand','rdist','mapq','rmapq','matches','rmatches','con_from','con_to','rmapid']].sort_values(['scaf','pos','rhap'])
 #
     # First take the one with the highest mapping qualities on both sides
@@ -7871,9 +7703,9 @@ def FillGapsWithReads(scaffold_paths, mappings, contig_parts, overlap_bridges, p
     possible_reads.loc[possible_reads['rdist'] <= 0, ['read_from','read_to']] = 0
     possible_reads.drop(columns=['rdist'], inplace=True)
 #
-    # Get the mapping information for the other side of the gap (chap is the haplotype that it connects to on the other side, for circular scaffolds it is not guaranteed to be identical with rhap)
+    # Get the mapping information for the other side of the gap
     possible_reads['read_pos'] += np.where(possible_reads['strand'] == '+', 1, -1)
-    possible_reads[['rcon_from','rcon_to','chap']] = possible_reads[['read_name','read_start','read_pos','scaf','pos','rpos','rmapid']].merge(mappings[['read_name','read_start','read_pos','scaf','pos','lpos','con_from','con_to','lhap','mapid']].rename(columns={'pos':'rpos','lpos':'pos','con_from':'rcon_from','con_to':'rcon_to','lhap':'chap','mapid':'rmapid'}), on=['read_name','read_start','read_pos','scaf','pos','rpos','rmapid'], how='left')[['rcon_from','rcon_to','chap']].astype(int).values
+    possible_reads[['rcon_from','rcon_to']] = possible_reads[['read_name','read_start','read_pos','scaf','pos','rpos','rmapid']].merge(mappings[['read_name','read_start','read_pos','scaf','pos','lpos','con_from','con_to','mapid']].rename(columns={'pos':'rpos','lpos':'pos','con_from':'rcon_from','con_to':'rcon_to','mapid':'rmapid'}), on=['read_name','read_start','read_pos','scaf','pos','rpos','rmapid'], how='left')[['rcon_from','rcon_to']].astype(int).values
     possible_reads.drop(columns=['read_pos','read_start','rmapid'], inplace=True)
 #
     # Add overlap_bridges as pseudo reads
@@ -7886,13 +7718,15 @@ def FillGapsWithReads(scaffold_paths, mappings, contig_parts, overlap_bridges, p
         pseudo_reads['chap'] = pseudo_reads['rhap']
         possible_reads = pd.concat([possible_reads, pseudo_reads], ignore_index=True)
 #
-    ## Fill scaffold_paths with read and contig information
+    return possible_reads
+
+def StoreReadAndContingInformationInScaffoldPaths(scaffold_paths, contig_parts, possible_reads, ploidy):
     for h in range(ploidy):
         # Insert contig information
         scaffold_paths = scaffold_paths.merge(contig_parts[['name','start','end']].reset_index().rename(columns={'index':f'con{h}','name':f'name{h}','start':f'start{h}','end':f'end{h}'}), on=[f'con{h}'], how='left')
         # Insert read information
         scaffold_paths = scaffold_paths.merge(possible_reads.loc[possible_reads['rhap'] == h, ['scaf','pos','read_name','read_from','read_to','strand','con_from','con_to']].rename(columns={'read_name':f'read_name{h}','read_from':f'read_from{h}','read_to':f'read_to{h}','strand':f'read_strand{h}','con_from':f'con_from{h}','con_to':f'con_to{h}'}), on=['scaf','pos'], how='left')
-        scaffold_paths = scaffold_paths.merge(possible_reads.loc[possible_reads['chap'] == h, ['scaf','rpos','rcon_from','rcon_to']].rename(columns={'rpos':'pos','rcon_from':f'rcon_from{h}','rcon_to':f'rcon_to{h}'}), on=['scaf','pos'], how='left')
+        scaffold_paths = scaffold_paths.merge(possible_reads.loc[possible_reads['rhap'] == h, ['scaf','rpos','rcon_from','rcon_to']].rename(columns={'rpos':'pos','rcon_from':f'rcon_from{h}','rcon_to':f'rcon_to{h}'}), on=['scaf','pos'], how='left')
     # Split into contig and read part and apply information
     scaffold_paths = scaffold_paths.loc[np.repeat(scaffold_paths.index.values, 1+(scaffold_paths[[f'read_name{h}' for h in range(ploidy)]].isnull().all(axis=1) == False) )].reset_index()
     scaffold_paths['type'] = np.where(scaffold_paths.groupby(['index'], sort=False).cumcount() == 0, 'contig','read')
@@ -7973,7 +7807,10 @@ def FillGapsWithReads(scaffold_paths, mappings, contig_parts, overlap_bridges, p
     scaffold_paths['sdist_right'] = -1
     scaffold_paths.loc[scaffold_paths['scaf'] != scaffold_paths['scaf'].shift(-1), 'sdist_right'] = tmp
 #
-    ## Remove mappings that are not needed for scaffold extensions into gaps and update the rest
+    return scaffold_paths
+
+def RemoveNonExtendingMappings(mappings, contig_parts, max_dist_contig_end, min_extension, min_num_reads, pdf):
+	## Remove mappings that are not needed for scaffold extensions into gaps and update the rest
     mappings.drop(columns=['lmapq','rmapq','lmatches','rmatches','read_pos','pos'],inplace=True)
     circular = np.unique(mappings.loc[mappings['rpos'] == 0, 'scaf'].values) # Get them now, because the next step removes evidence, but remove them later to use the expensive np.isin() step on less entries
     mappings = mappings[(mappings['rpos'] < 0) | (mappings['lpos'] < 0)].copy() # Only keep mappings to ends of scaffolds
@@ -8018,6 +7855,13 @@ def FillGapsWithReads(scaffold_paths, mappings, contig_parts, overlap_bridges, p
     mappings.sort_values(['scaf','side','hap'], inplace=True)
     count = mappings.groupby(['scaf','side','hap'], sort=False).size().values
     mappings = mappings[np.repeat(count >= min_num_reads, count)].copy()
+#
+    return mappings
+
+def FillGapsWithReads(scaffold_paths, mappings, contig_parts, overlap_bridges, ploidy, max_dist_contig_end, min_extension, min_num_reads, pdf):
+    possible_reads = FindBestReadsToFillGaps(mappings, overlap_bridges)
+    scaffold_paths = StoreReadAndContingInformationInScaffoldPaths(scaffold_paths, contig_parts, possible_reads, ploidy)
+    mappings = RemoveNonExtendingMappings(mappings, contig_parts, max_dist_contig_end, min_extension, min_num_reads, pdf)
 #
     return scaffold_paths, mappings
 
@@ -8129,13 +7973,10 @@ def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
 #
     print( str(timedelta(seconds=clock())), "Loading repeats")
     repeats = LoadRepeats(repeat_file, contig_ids)
-#    contigs, center_repeats = MaskRepeatEnds(contigs, repeat_file, contig_ids, max_repeat_extension, min_len_repeat_connection, repeat_len_factor_unique, remove_duplicated_contigs, pdf)
 #
     print( str(timedelta(seconds=clock())), "Filtering mappings")
     mappings, cov_counts, cov_probs = ReadMappings(mapping_file, contig_ids, min_mapq, keep_all_subreads, alignment_precision, num_read_len_groups, pdf)
     contigs, covered_regions = RemoveUnmappedContigs(contigs, mappings, remove_zero_hit_contigs)
-#
-    print( str(timedelta(seconds=clock())), "Account for left-over adapters")
     mappings = BreakReadsAtAdapters(mappings, alignment_precision, keep_all_subreads)
 #
     print( str(timedelta(seconds=clock())), "Search for possible break points")
@@ -8145,7 +7986,6 @@ def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     else:
         break_groups, spurious_break_indexes, non_informative_mappings, unconnected_breaks = FindBreakPoints(mappings, contigs, covered_regions, max_dist_contig_end, min_mapping_length, min_length_contig_break, max_break_point_distance, min_num_reads, min_extension, merge_block_length, org_scaffold_trust, cov_probs, prob_factor, allow_same_contig_breaks, prematurity_threshold, pdf)
     mappings.drop(np.concatenate([np.unique(spurious_break_indexes['map_index'].values), non_informative_mappings]), inplace=True) # Remove not-accepted breaks from mappings and mappings that do not contain any information (mappings inside of contigs that do not overlap with breaks)
-    #SplitReadsAtSpuriousBreakIndexes(mappings, spurious_break_indexes)
     del spurious_break_indexes, non_informative_mappings
 #
     contig_parts, contigs = GetContigParts(contigs, break_groups, covered_regions, remove_short_contigs, remove_zero_hit_contigs, min_mapping_length, alignment_precision, pdf)
@@ -9104,7 +8944,7 @@ def TestFindBreakPoints():
     pdf = None
     pot_breaks = GetBrokenMappings(mappings, covered_regions, max_dist_contig_end, min_length_contig_break, pdf)
     pot_breaks = pot_breaks[np.isin(pot_breaks['contig_id'], [62, 118])].copy()
-    break_points, bp_map_len = PreparePotBreakPoints(pot_breaks, max_break_point_distance, min_mapping_length, min_num_reads)
+    break_points, bp_ext_len = PreparePotBreakPoints(pot_breaks, max_break_point_distance, min_mapping_length, min_num_reads)
     test = []
     # str(break_points[break_points['contig_id'] == 118].reset_index(drop=True).to_dict())
     test.append( pd.DataFrame( {'contig_id': {0: 62, 1: 62, 2: 62, 3: 62, 4: 62, 5: 62, 6: 62, 7: 62, 8: 62, 9: 62, 10: 62, 11: 62},
@@ -9151,7 +8991,7 @@ def TestFindBreakPoints():
         print(test)
         return True
 #
-    break_points, unconnected_break_points = CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_map_len, cov_probs, covered_regions, max_dist_contig_end, max_break_point_distance, min_mapping_length, min_num_reads, min_length_contig_break, prob_factor, merge_block_length, prematurity_threshold)
+    break_points, unconnected_break_points = CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_ext_len, cov_probs, covered_regions, max_dist_contig_end, max_break_point_distance, min_mapping_length, min_num_reads, min_length_contig_break, prob_factor, merge_block_length, prematurity_threshold)
     test = []
     test.append( pd.DataFrame( {'contig_id': {0: 118, 1: 118, 2: 118, 3: 118, 4: 118, 5: 118, 6: 118, 7: 118, 8: 118, 9: 118},
                                 'position': {0: 5459, 1: 5502, 2: 5541, 3: 5551, 4: 5557, 5: 5559, 6: 5561, 7: 5562, 8: 5564, 9: 5566},
