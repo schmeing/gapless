@@ -1817,7 +1817,7 @@ def FilterLongRangeConnections(long_range_connections, long_range_extlen, scaffo
             long_range_connections['split'] = long_range_connections['conn_id'] != long_range_connections['conn_id'].shift(-1)
             long_range_connections.loc[split_index, 'split'] = True
             long_range_connections['split'] = long_range_connections['split'].shift(1, fill_value=True)
-            long_range_connections[['conn_id']] = long_range_connections['split'].cumsum()
+            long_range_connections['conn_id'] = long_range_connections['split'].cumsum()
             long_range_connections['pos'] = long_range_connections.groupby(['conn_id']).cumcount()
             con_size = long_range_connections.groupby(['conn_id'], sort=False).size().values
             long_range_connections['size'] = np.repeat(con_size, con_size)
