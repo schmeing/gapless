@@ -7238,8 +7238,8 @@ def PrepareScaffoldPathForMapping(scaffold_paths, bridges, ploidy):
     all_scafs = all_scafs.merge(bridges[['from','from_side','to','to_side','mean_dist','min_dist','max_dist']].rename(columns={'from':'conpart','to':'rcon','mean_dist':'rdist','min_dist':'rdmin','max_dist':'rdmax'}), on=['conpart','from_side','rcon','to_side','rdist'], how='left')
     consitency_check = all_scafs[(np.isnan(all_scafs['ldmin']) & (all_scafs['lcon'] >= 0)) | (np.isnan(all_scafs['rdmin']) & (all_scafs['rcon'] >= 0))].copy()
     if len(consitency_check):
-        print("Error: Scaffold paths contains connections that are not supported by a bridge.")
         print(consitency_check)
+        raise RuntimeError("Scaffold paths contains connections that are not supported by a bridge.")
     all_scafs[['ldmin','rdmin']] = all_scafs[['ldmin','rdmin']].fillna(-sys.maxsize*0.99).values.astype(int) # Use *0.99 to avoid overflow through type convertion from float to int (should be the lcon/rcon -1, where we do not want to set any constraints)
     all_scafs[['ldmax','rdmax']] = all_scafs[['ldmax','rdmax']].fillna(sys.maxsize*0.99).values.astype(int)
     all_scafs.drop(columns=['from_side','to_side'], inplace=True)
