@@ -2245,6 +2245,7 @@ def DisconnectRepeatedContigsWithConnectionsOnBothSides(scaffold_graph, scaf_rep
         remindex = np.unique(found_dup.loc[np.isin(found_dup['tindex'], found_dup['sindex'].values) == False, 'sindex'].values)
         remindex = AddConnectedIndexes(remindex, dup_combs)
         found_dup = found_dup[(np.isin(found_dup['sindex'], remindex) == False) & (np.isin(found_dup['tindex'], remindex) == False)].copy()
+    if len(found_dup):
         # Remove indexes with the lower counts at the diverging side
         found_dup['len'] = np.minimum(scaffold_graph.loc[found_dup['sindex'].values, 'length'].values, scaffold_graph.loc[found_dup['tindex'].values, 'length'].values)-1
         scaffold_graph.rename(columns={'from':'scaf0','from_side':'strand0'}, inplace=True)
@@ -2449,6 +2450,7 @@ def FindValidExtensionsInScaffoldGraph(scaffold_graph):
     ocont = []
     missing_cont = pairs[['oindex']].rename(columns={'oindex':'oindex1'}) # All origins that have an extension must have a following origin in the direction of extension
     missing_cont[['nscaf','nstrand','ndist']] = extensions.loc[pairs['eindex'].values, ['scaf1','strand1','dist1']].values
+    missing_cont[['nscaf','ndist']] = missing_cont[['nscaf','ndist']].astype(int)
     missing_cont.drop_duplicates(inplace=True)
     if len(missing_cont):
         for cut in range(origins['olength'].max()-1): # If we do not find a following origin for a given origin look for the longest match by cutting away scaffolds
@@ -2655,6 +2657,7 @@ def FollowUniquePathsThroughGraph(graph_ext):
     pairs = graph_ext['pairs'].copy()
     pairs[['oscaf1','ostrand1','scaf0','strand0','odist0']] = origins.loc[pairs['oindex'], ['oscaf1','ostrand1','scaf0','strand0','odist0']].values
     pairs[['scaf1','strand1','dist1']] = extensions.loc[pairs['eindex'], ['scaf1','strand1','dist1']].values
+    pairs[['oscaf1','scaf0','odist0','scaf1','dist1']] = pairs[['oscaf1','scaf0','odist0','scaf1','dist1']].astype(int)
     # Group pairs that share origins/extensions
     pairs['group'] = np.minimum(pairs['oindex'],pairs['eindex'])
     while True:
@@ -2765,8 +2768,8 @@ def AddConnectedScaffolds(loop_scafs, scaffold_graph):
 def FindScaffoldsConnectedToLoops(scaffold_graph):
     # Get the loop units and find scaffolds in them
     repeated_scaffolds, repeat_graph = FindRepeatedScaffolds(scaffold_graph)
+    loops = []
     if len(repeated_scaffolds):
-        loops = []
         for s in range(1, repeat_graph['length'].max()):
             loops.append(repeat_graph.loc[(repeat_graph['from'] == repeat_graph[f'scaf{s}']) & (repeat_graph['from_side'] == 'r') & (repeat_graph[f'strand{s}'] == '+'), ['from','length']+[f'scaf{s1}' for s1 in range(1,s+1) for n in ['scaf']]])
             loops[-1]['length'] = s+1
@@ -3074,7 +3077,8 @@ def FindConnectionsBetweenLoopUnits(loops, scaffold_graph, full_info):
     if len(loop_conns):
         loop_conns.drop_duplicates(inplace=True)
         for i in [1,2]:
-            loop_conns[[f'lindex{i}',f'dir{i}']] = bidi_loops.loc[loop_conns[f'bindex{i}'].values, ['lindex','strand0']].values
+            loop_conns[f'lindex{i}'] = bidi_loops.loc[loop_conns[f'bindex{i}'].values, 'lindex'].values
+            loop_conns[f'dir{i}'] = bidi_loops.loc[loop_conns[f'bindex{i}'].values, 'strand0'].values
             loop_conns[f'rdir{i}'] = np.where(loop_conns[f'dir{i}'] == '+', '-', '+')
         loop_conns = loop_conns[['lindex1','dir1','lindex2','dir2','wildcard']].merge(loop_conns[['lindex1','rdir1','lindex2','rdir2']].rename(columns={'lindex1':'lindex2','rdir1':'dir2','lindex2':'lindex1','rdir2':'dir1'}), on=['lindex1','dir1','lindex2','dir2'], how='inner')
 #
@@ -3269,6 +3273,8 @@ def AddPathThroughLoops(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges,
         loops = GetLoopUnits(loop_scafs, scaffold_graph, max_loop_units)
         if len(loops):
             CheckConsistencyOfVerticalPaths(loops)
+    else:
+        loops = []
     if len(loops):
         # Remove loop units that are already part of a multi-repeat unit
         multi_repeat = []
@@ -3289,6 +3295,8 @@ def AddPathThroughLoops(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges,
         loop_conns = FindConnectionsBetweenLoopUnits(loops, scaffold_graph, False)
         loop_conns['loop'] = loops.loc[loop_conns['lindex1'].values, 'loop'].values
         loops = loops[np.isin(loops['loop'], np.unique(loop_conns['loop']))].copy()
+    else:
+        loop_conns = []
     if len(loop_conns):
         # Check if we have evidence for an order for the repeat copies (only one valid connection)
         conn_count = loop_conns.groupby(['lindex1']).size().values
@@ -3328,6 +3336,8 @@ def AddPathThroughLoops(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges,
             for s in range(1,exits['length'].max()):
                 exits.loc[exits[['loop',f'scaf{s}']].rename(columns={f'scaf{s}':'scaf'}).merge(loop_scafs.loc[loop_scafs['inside'],['loop','scaf']], on=['loop','scaf'], how='left', indicator=True)['_merge'].values == "both", 'loopside'] = True
             exits = exits[exits['loopside']].drop(columns=['loopside'])
+    else:
+        exits = []
 #
     # Handle bridged repeats
     bridged_repeats = []
@@ -4942,8 +4952,8 @@ def MergeHaplotypes(scaffold_paths, graph_ext, scaf_bridges, ploidy, ends_in=[])
         group_info = new_paths.copy()
         for h in range(ploidy):
             new_paths[[f'phase{h}',f'scaf{h}',f'strand{h}',f'dist{h}']] = new_paths[[f'pid{h}',f'hap{h}',f'pos{h}']].rename(columns={f'{n}{h}':n for n in ['pid','hap','pos']}).merge(haps.drop(columns=['group']), on=['pid','hap','pos'], how='left')[['phase','scaf','strand','dist']].values
-            while np.sum(np.isnan(new_paths[f'phase{h}'])):
-                new_paths[f'phase{h}'] = np.where(np.isnan(new_paths[f'phase{h}']), new_paths[f'phase{h}'].shift(-1), new_paths[f'phase{h}'])
+            while np.sum(new_paths[f'phase{h}'].isnull()):
+                new_paths[f'phase{h}'] = np.where(new_paths[f'phase{h}'].isnull(), new_paths[f'phase{h}'].shift(-1), new_paths[f'phase{h}'])
             new_paths[[f'phase{h}']] = new_paths[[f'phase{h}']].astype(int)
             new_paths[[f'scaf{h}']] = new_paths[[f'scaf{h}']].fillna(-1).astype(int)
             new_paths[[f'strand{h}']] = new_paths[[f'strand{h}']].fillna('')
@@ -5387,6 +5397,7 @@ def TurnHorizontalHaplotypeIntoVertical(haps):
     if len(haps):
         for p in range(haps['pos'].max()+1):
             vhaps[[f'scaf{p}',f'strand{p}',f'dist{p}']] = vhaps[['pid']].merge(haps[haps['pos'] == p], on=['pid'], how='left')[['scaf','strand','dist']].values
+            vhaps[[f'scaf{p}',f'dist{p}']] = vhaps[[f'scaf{p}',f'dist{p}']].astype(float)
             vhaps.loc[np.isnan(vhaps[f'scaf{p}']) == False, 'length'] += 1
         vhaps.drop(columns=['dist0'], inplace=True)
 #
@@ -6309,6 +6320,7 @@ def CombineOnMatchingExtensions(scaffold_paths, graph_ext, scaffold_graph, scaf_
                 break
             else:
                 con_ext[[f'scaf{s}',f'strand{s}',f'dist{s}']] = con_ext[['apid','aside']].merge(cur_ext, on=['apid','aside'], how='left')[[f'scaf{s}',f'strand{s}',f'dist{s}']].values
+                con_ext[[f'scaf{s}',f'dist{s}']] = con_ext[[f'scaf{s}',f'dist{s}']].astype(float)
                 con_ext.loc[np.isnan(con_ext[f'scaf{s}']) == False, 'len'] += 1
                 if s==1:
                     # Only keep the sides that have any consistent extension at all
@@ -7556,7 +7568,7 @@ def MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploi
             # Start with alternative paths
             for h in range(1,ploidy):
                 rem = conn_cov.loc[(conn_cov['cov'] == 0) & (conn_cov['hap'] == h), ['scaf','rpos']].rename(columns={'rpos':'pos'}).merge(scaffold_paths[['scaf','pos',f'phase{h}']], on=['scaf','pos'], how='inner')[f'phase{h}'].values
-                rem = np.isin(scaffold_paths[f'phase{h}'], rem)
+                rem = np.isin(scaffold_paths[f'phase{h}'], np.abs(rem))
                 if np.sum(rem):
                     scaffold_paths.loc[rem, [f'con{h}',f'strand{h}',f'dist{h}']] = [-1,'',0]
                     scaffold_paths.loc[rem, f'phase{h}'] = -scaffold_paths.loc[rem, f'phase{h}']
@@ -7847,7 +7859,7 @@ def StoreReadAndContingInformationInScaffoldPaths(scaffold_paths, contig_parts, 
     return scaffold_paths
 
 def RemoveNonExtendingMappings(mappings, contig_parts, max_dist_contig_end, min_extension, min_num_reads, pdf):
-	## Remove mappings that are not needed for scaffold extensions into gaps and update the rest
+    ## Remove mappings that are not needed for scaffold extensions into gaps and update the rest
     mappings.drop(columns=['lmapq','rmapq','lmatches','rmatches','read_pos','pos'],inplace=True)
     circular = np.unique(mappings.loc[mappings['rpos'] == 0, 'scaf'].values) # Get them now, because the next step removes evidence, but remove them later to use the expensive np.isin() step on less entries
     mappings = mappings[(mappings['rpos'] < 0) | (mappings['lpos'] < 0)].copy() # Only keep mappings to ends of scaffolds
