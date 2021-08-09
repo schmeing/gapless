@@ -195,7 +195,7 @@ def GetInputInfo(result_info, contigs):
     return result_info
 
 def ReadPaf(file_name):
-    return pd.read_csv(file_name, sep='\t', header=None, usecols=range(12), names=['q_name','q_len','q_start','q_end','strand','t_name','t_len','t_start','t_end','matches','alignment_length','mapq'], dtype={'q_name':np.object, 'q_len':np.int32, 'q_start':np.int32, 'q_end':np.int32, 'strand':np.str, 't_name':np.object, 't_len':np.int32, 't_start':np.int32, 't_end':np.int32, 'matches':np.int32, 'alignment_length':np.int32, 'mapq':np.int16})
+    return pd.read_csv(file_name, sep='\t', header=None, usecols=range(12), names=['q_name','q_len','q_start','q_end','strand','t_name','t_len','t_start','t_end','matches','alignment_length','mapq'], dtype={'q_name':object, 'q_len':np.int32, 'q_start':np.int32, 'q_end':np.int32, 'strand':str, 't_name':object, 't_len':np.int32, 't_start':np.int32, 't_end':np.int32, 'matches':np.int32, 'alignment_length':np.int32, 'mapq':np.int16})
 
 def stackhist(x, y, **kws):
     grouped = pd.groupby(x, y)
@@ -267,13 +267,13 @@ def PlotXY(pdf, xtitle, ytitle, x, y, category=[], count=[], logx=False, linex=[
 
     if len(count):
         if len(category):
-            ax = sns.scatterplot(x, y, hue=count, style=category, linewidth=0, alpha = 0.7)
+            ax = sns.scatterplot(x=x, y=y, hue=count, style=category, linewidth=0, alpha = 0.7)
         else:
-            ax = sns.scatterplot(x, y, hue=count, linewidth=0, alpha = 0.7);
+            ax = sns.scatterplot(x=x, y=y, hue=count, linewidth=0, alpha = 0.7);
     elif len(category):
-        ax = sns.scatterplot(x, y, hue=category, linewidth=0, alpha = 0.7)
+        ax = sns.scatterplot(x=x, y=y, hue=category, linewidth=0, alpha = 0.7)
     else:
-        ax = sns.scatterplot(x, y, linewidth=0, alpha = 0.7)
+        ax = sns.scatterplot(x=x, y=y, linewidth=0, alpha = 0.7)
     plt.xlabel(xtitle)
     plt.ylabel(ytitle)
 
@@ -2679,8 +2679,16 @@ def FollowUniquePathsThroughGraph(graph_ext):
     inconsistency = inconsistency[(inconsistency['count'] != 0) & (inconsistency['count'] != inconsistency['size'])].reset_index()[['group','strand']]
     other_side = path_ext[['group','strand','oindex2']].merge(inconsistency, on=['group','strand'], how='inner')[['oindex2']].rename(columns={'oindex2':'oindex'}).merge(path_ext[['group','strand','oindex']])[['group','strand']].drop_duplicates()
     other_side['strand'] = np.where(other_side['strand'] == '+', '-', '+')
-    path_ext = path_ext[ np.isin(path_ext['group'], inconsistency['group'].values) == False ].copy() # We need to remove the inconsistent group completely to not have a two scaffold overlap afterwards that is preferred in CombinePathOnUniqueOverlap
-    path_ext.loc[ path_ext[['group','strand']].merge(other_side, on=['group','strand'], how='left', indicator=True)['_merge'].values == "both" , 'oindex2'] = np.nan
+    path_ext.loc[ path_ext[['group','strand']].merge(pd.concat([inconsistency, other_side], ignore_index=True).drop_duplicates(), on=['group','strand'], how='left', indicator=True)['_merge'].values == "both" , 'oindex2'] = np.nan
+    # Prevent separate path from merging into one
+    inconsistency = path_ext.loc[np.isnan(path_ext['oindex2']) == False, ['group','strand','oindex2']].rename(columns={'oindex2':'oindex'}).merge(path_ext[['oindex','group','strand']].rename(columns={'group':'ngroup','strand':'nstrand'}), on='oindex', how='left')
+    inconsistency.drop(columns='oindex', inplace=True)
+    inconsistency.drop_duplicates(inplace=True)
+    inconsistency['nalt'] = inconsistency[['ngroup','nstrand']].merge( inconsistency.groupby(['ngroup','nstrand']).size().reset_index(name='nalt'), on=['ngroup','nstrand'], how='left')['nalt'].values
+    inconsistency = inconsistency.loc[inconsistency['nalt'] > 1].drop(columns='nalt')
+    inconsistency['nstrand'] = np.where(inconsistency['nstrand'] == '+', '-', '+') # For the next group we need to block extension in the other direction, because their origins are duplicated not their extensions
+    inconsistency = pd.concat([ inconsistency[['group','strand']], inconsistency[['ngroup','nstrand']].rename(columns={'ngroup':'group', 'nstrand':'strand'}) ], ignore_index=True).drop_duplicates()
+    path_ext.loc[ path_ext[['group','strand']].merge(inconsistency, on=['group','strand'], how='left', indicator=True)['_merge'].values == "both" , 'oindex2'] = np.nan
     # Find the path ends to start from there (starting on both sides will duplicate all paths, but is less effort then linearly going through all the paths to prevent this)
     path_ends = path_ext.groupby(['group','strand'])['oindex2'].agg(['count']).reset_index()
     path_ends = path_ends[path_ends['count'] == 0].drop(columns=['count'])
@@ -3302,7 +3310,12 @@ def AddPathThroughLoops(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges,
                 loops.drop(cur['lindex2'].values, inplace=True)
                 loop_conns = loop_conns[loop_conns['append'] == False].copy()
                 loop_conns['new_index'] = loop_conns[['lindex1']].merge(cur[['lindex1','lindex2']].rename(columns={'lindex1':'new_index','lindex2':'lindex1'}), on=['lindex1'], how='left')['new_index'].values
-                loop_conns.loc[np.isnan(loop_conns['new_index']) == False, 'lindex1'] = loop_conns.loc[np.isnan(loop_conns['new_index']) == False, 'new_index'].astype(int)
+                try:
+                    loop_conns.loc[np.isnan(loop_conns['new_index']) == False, 'lindex1'] = loop_conns.loc[np.isnan(loop_conns['new_index']) == False, 'new_index'].astype(int)
+                except TypeError:
+                    print(loop_conns.dtypes)
+                    print(loop_conns)
+                    raise
         CheckConsistencyOfVerticalPaths(loops)
 #
     # Get exits for the repeats
@@ -4091,21 +4104,22 @@ def CheckScaffoldPathsConsistency(scaffold_paths):
     # Check that the first positions have zero distance
     check = scaffold_paths[(scaffold_paths['pos'] == 0) & (scaffold_paths[[col for col in scaffold_paths.columns if col[:4] == "dist"]] != 0).any(axis=1)].copy()
     if len(check):
-        print("Warning: First distances are not zero.")
         print(check)
+        raise RuntimeError("First distances are not zero.")
 #
     # Check that positions are consistent in scaffold_paths
     inconsistent = scaffold_paths[(scaffold_paths['pos'] < 0) |
                                   ((scaffold_paths['pos'] == 0) & (scaffold_paths['pid'] == scaffold_paths['pid'].shift(1))) |
                                   ((scaffold_paths['pos'] > 0) & ((scaffold_paths['pid'] != scaffold_paths['pid'].shift(1)) | (scaffold_paths['pos'] != scaffold_paths['pos'].shift(1)+1)))].copy()
     if len(inconsistent):
-        print("Warning: Scaffold paths got inconsistent.")
         print(inconsistent)
+        raise RuntimeError("Scaffold paths got inconsistent.")
+        
     # Check that we do not have a phase 0, because it cannot be positive/negative as required for a phase
     inconsistent = scaffold_paths[(scaffold_paths[[col for col in scaffold_paths.columns if col[:5] == "phase"]] == 0).any(axis=1)].copy()
     if len(inconsistent):
-        print("Warning: Scaffold paths has a zero phase.")
         print(inconsistent)
+        raise RuntimeError("Scaffold paths has a zero phase.")
 
 def CheckIfScaffoldPathsFollowsValidBridges(scaffold_paths, scaf_bridges, ploidy):
     test_paths = scaffold_paths.copy()
@@ -4127,8 +4141,9 @@ def CheckIfScaffoldPathsFollowsValidBridges(scaffold_paths, scaf_bridges, ploidy
     test_bridges = test_bridges.groupby(['pid','pos','from','from_side','to','to_side','mean_dist'])['hap'].min().reset_index()
     test_bridges = test_bridges[ test_bridges.merge(scaf_bridges[['from','from_side','to','to_side','mean_dist']], on=['from','from_side','to','to_side','mean_dist'], how='left', indicator=True)['_merge'].values == 'left_only' ].copy()
     if len(test_bridges):
-        print("Scaffold path contains invalid bridges.")
         print(test_bridges[['pid','pos','hap','from','from_side','to','to_side','mean_dist']])
+        raise RuntimeError("Scaffold path contains invalid bridges.")
+        
 
 def ReverseScaffolds(scaffold_paths, reverse, ploidy):
     # Reverse Strand
@@ -6848,8 +6863,8 @@ def PhaseScaffoldsWithScaffoldGraph(scaffold_paths, graph_ext, ploidy):
         phase_breaks['rhap'] = phase_breaks['hap']
         path_errors = phase_breaks[ phase_breaks.rename(columns={'hap':'lhap'}).merge(test_conns, on=['pid','lpos','rpos','lhap','rhap'], how='left', indicator=True)['_merge'].values == "left_only" ].copy()
     if len(path_errors):
-        print("Warning: Found scaffold_paths that violate scaffold_graph.")
         print(path_errors)
+        raise RuntimeError("Found scaffold_paths that violate scaffold_graph.")
     # Combine phases where we do not have alternative options
     if len(phase_breaks):
         phase_breaks = phase_breaks.merge(test_conns.rename(columns={'lhap':'hap'}), on=['pid','lpos','rpos','hap','rhap'], how='inner').drop(columns=['rhap'])
@@ -7629,7 +7644,7 @@ def MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploi
         mappings.drop(columns=['check_pos','circular','nhap'], inplace=True)
     else:
         mappings['rmapid'] = mappings['mapid']
-    mappings.drop(columns=[f'rmdist{h}' for h in range(ploidy)], inplace=True)
+        mappings.drop(columns=[f'rmdist{h}' for h in range(ploidy)], inplace=True)
 #
     return mappings, scaffold_paths, overlap_bridges
 
