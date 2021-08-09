@@ -195,7 +195,7 @@ def GetInputInfo(result_info, contigs):
     return result_info
 
 def ReadPaf(file_name):
-    return pd.read_csv(file_name, sep='\t', header=None, usecols=range(12), names=['q_name','q_len','q_start','q_end','strand','t_name','t_len','t_start','t_end','matches','alignment_length','mapq'], dtype={'q_len':np.int32, 'q_start':np.int32, 'q_end':np.int32, 't_len':np.int32, 't_start':np.int32, 't_end':np.int32, 'matches':np.int32, 'alignment_length':np.int32, 'mapq':np.int16})
+    return pd.read_csv(file_name, sep='\t', header=None, usecols=range(12), names=['q_name','q_len','q_start','q_end','strand','t_name','t_len','t_start','t_end','matches','alignment_length','mapq'], dtype={'q_name':np.object, 'q_len':np.int32, 'q_start':np.int32, 'q_end':np.int32, 'strand':np.str, 't_name':np.object, 't_len':np.int32, 't_start':np.int32, 't_end':np.int32, 'matches':np.int32, 'alignment_length':np.int32, 'mapq':np.int16})
 
 def stackhist(x, y, **kws):
     grouped = pd.groupby(x, y)
@@ -3025,6 +3025,8 @@ def FindLoopUnitExtensions(bidi_loops, scaffold_graph):
         extensions = extensions[extensions['diff'] == np.repeat(max_diff['max'].values, max_diff['size'].values)].drop(columns=['diff'])
         extensions = RemoveEmptyColumns(extensions)
         extendible = diffs.loc[np.isin(diffs['index1'], max_diff.index.values), ['index1','bindex']].drop_duplicates()
+    else:
+        extendible = []
 #
     return extensions, extendible
 
@@ -7625,6 +7627,9 @@ def MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploi
         mappings[['circular','nhap']] = mappings[['read_id','read_start','read_pos','scaf','pos','strand','conpart','lcon','ldist','mapid']].merge(mappings.loc[mappings['rpos'] == 0, ['read_id','read_start','scaf','strand','check_pos','rpos','conpart','rcon','rdist','rmapid','pos','rhap']].rename(columns={'check_pos':'read_pos','rpos':'pos','conpart':'lcon','rcon':'conpart','rdist':'ldist','rmapid':'mapid','pos':'circular'}), on=['read_id','read_start','read_pos','scaf','pos','strand','conpart','lcon','ldist','mapid'], how='left')[['circular','rhap']].values
         mappings.loc[np.isnan(mappings['circular']) == False, ['lpos','lhap']] = mappings.loc[np.isnan(mappings['circular']) == False, ['circular','nhap']].astype(int).values
         mappings.drop(columns=['check_pos','circular','nhap'], inplace=True)
+    else:
+        mappings['rmapid'] = mappings['mapid']
+    mappings.drop(columns=[f'rmdist{h}' for h in range(ploidy)], inplace=True)
 #
     return mappings, scaffold_paths, overlap_bridges
 
@@ -7641,7 +7646,8 @@ def CountResealedBreaks(result_info, scaffold_paths, contig_parts, ploidy):
             resealed_breaks.rename(columns={'con0':'con','strand0':'strand'}, inplace=True)
             for h in range(1,ploidy):
                 change = (resealed_breaks['hap'] == h) & (resealed_breaks[f'phase{h}'] >= 0)
-                resealed_breaks.loc[change, ['con','strand']] = resealed_breaks.loc[change, [f'con{h}',f'strand{h}']].values
+                if np.sum(change):
+                    resealed_breaks.loc[change, ['con','strand']] = resealed_breaks.loc[change, [f'con{h}',f'strand{h}']].values
             resealed_breaks['scaf'] = resealed_breaks['scaf']*ploidy + resealed_breaks['hap']
             resealed_breaks.drop(columns=['hap','phase0'] + [f'{n}{h}' for h in range(1,ploidy) for n in ['phase','con','strand']], inplace=True)
             resealed_breaks = resealed_breaks[resealed_breaks['con'] >= 0].copy()
