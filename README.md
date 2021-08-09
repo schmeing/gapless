@@ -22,14 +22,14 @@ The first list are the python requirements for `gapless.py` and the second list 
 
 | Requirement               | Tested version | Installation instructions                                         |
 |---------------------------|----------------|-------------------------------------------------------------------|
-| Python 3                  | 3.6.11         |                                                                   |
+| Python 3                  | 3.9.6          |                                                                   |
 | biopython                 | 1.77           | https://biopython.org/wiki/Download                               |
-| matplotlib                | 3.3.1          | https://matplotlib.org/stable/users/installing.html               |
-| numpy                     | 1.19.1         | https://numpy.org/install/                                        |
-| pandas                    | 1.1.0          | https://pandas.pydata.org/docs/getting_started/install.html       |
-| pillow                    | 7.2.0          | https://pillow.readthedocs.io/en/stable/installation.html         |
-| scipy                     | 1.5.2          | https://www.scipy.org/install.html                                |
-| seaborn                   | 0.10.1         | https://seaborn.pydata.org/installing.html                        |
+| matplotlib                | 3.4.2          | https://matplotlib.org/stable/users/installing.html               |
+| numpy                     | 1.21.1         | https://numpy.org/install/                                        |
+| pandas                    | 1.3.1          | https://pandas.pydata.org/docs/getting_started/install.html       |
+| pillow                    | 8.3.1          | https://pillow.readthedocs.io/en/stable/installation.html         |
+| scipy                     | 1.6.3          | https://www.scipy.org/install.html                                |
+| seaborn                   | 0.11.1         | https://seaborn.pydata.org/installing.html                        |
 |---------------------------|----------------|-------------------------------------------------------------------|
 | Linux system              |                |                                                                   |
 | minimap2                  | 2.18-r1015     | https://github.com/lh3/minimap2                                   |
