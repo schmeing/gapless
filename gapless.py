@@ -3496,7 +3496,7 @@ def AddPathThroughLoops(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges,
                     start_units['keep'] = cur == False
                     start_units.loc[cur, 'keep'] = (start_units.loc[cur, ['cscaf','cstrand','cdist']].values == extensions.loc[start_units.loc[cur, 'extindex'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values).all(axis=1)
                     start_units = start_units[ start_units['keep'] ].copy()
-            start_units.drop(columns=['extindex','length','cscaf','cstrand','cdist','keep'], inplace=True)
+            start_units.drop(columns=['extindex','length','cscaf','cstrand','cdist','keep'], errors='ignore', inplace=True)
             start_units.drop_duplicates(inplace=True)
             exit_conns.drop(columns=['scaf0','strand0'], inplace=True)
         exit_conns['from_units'] = 0
