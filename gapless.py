@@ -3424,10 +3424,41 @@ def AddPathThroughLoops(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges,
         CheckConsistencyOfVerticalPaths(bidi_loops)
     # Get the loop units to fill the connections
     start_units = []
+    vetos = []
     if len(exit_conns) and len(loops):
+        # If a scaffold within a loop unit connects with all paths to an exit it vetos every indirect connection containing this loop unit
+        for s in range(1,exit_conns['length'].max()):
+            vetos.append( exit_conns.loc[np.isnan(exit_conns[f'scaf{s}']) == False, ['loop',f'scaf{s}']].rename(columns={f'scaf{s}':'scaf'}) )
+        vetos = pd.concat(vetos, ignore_index=True).drop_duplicates()
+        vetos['scaf'] = vetos['scaf'].astype(int)
+        veto_graph = vetos.merge( scaffold_graph[['from','length']+[f'scaf{s}' for s in range(1,scaffold_graph['length'].max())]].reset_index().rename(columns={'index':'sindex','from':'scaf'}), on='scaf', how='inner' )
+        vetos = []
+        for s in range(1,veto_graph['length'].max()):
+            vetos.append( veto_graph.loc[np.isnan(veto_graph[f'scaf{s}']) == False, ['loop','scaf','sindex',f'scaf{s}']].rename(columns={f'scaf{s}':'escaf'}) )
+        vetos = pd.concat(vetos, ignore_index=True).drop_duplicates()
+        vetos['escaf'] = vetos['escaf'].astype(int)
+        vetos['exit'] = vetos[['loop','escaf']].merge(loop_scafs.loc[loop_scafs['exit'], ['loop','scaf']].rename(columns={'scaf':'escaf'}), on=['loop','escaf'], how='left', indicator=True)['_merge'].values == "both"
+        vetos = vetos.groupby(['loop','scaf','sindex'])['exit'].max().reset_index() # Does the scaffold graph entry (sindex) has an exit in it
+        vetos = vetos.groupby(['loop','scaf'])['exit'].min().reset_index() # Do all scaffold graph entries for a scaffold have an exit in them
+        vetos = vetos.loc[vetos['exit'], ['loop','scaf']].drop_duplicates()
+        veto_units = []
+        if len(vetos):
+            possible_vetos = loops[np.isin(loops['loop'], vetos['loop'].values)].copy()
+            s=1
+            while len(possible_vetos):
+                veto_units.append( possible_vetos[['loop',f'scaf{s}']].reset_index().rename(columns={f'scaf{s}':'scaf'}).merge(vetos, on=['loop','scaf'], how='inner')['index'].values )
+                possible_vetos.drop(veto_units[-1], inplace=True)
+                s += 1
+                possible_vetos = possible_vetos[possible_vetos['length'] > s].copy()
+            if len(veto_units):
+                veto_units = np.concatenate(veto_units)
+            if len(veto_units):
+                veto_units = bidi_loops[np.isin(bidi_loops['lindex'], veto_units)].reset_index()['index'].values
+        vetos = veto_units
         # Store all loop units consistent with the sequence from the exit in start_units
         for sfrom in range(1,exit_conns['length'].max()):
             pairs = exit_conns.loc[exit_conns['length'] > sfrom, ['loop',f'scaf{sfrom}',f'strand{sfrom}']].reset_index().rename(columns={'index':'eindex',f'scaf{sfrom}':'scaf0',f'strand{sfrom}':'strand0'}).merge(bidi_loops[['loop','scaf0','strand0']].reset_index().rename(columns={'index':'bindex'}), on=['loop','scaf0','strand0'], how='inner').drop(columns=['loop','scaf0','strand0'])
+            pairs = pairs[np.isin(pairs['bindex'], vetos) == False].copy()
             pairs['length'] = np.minimum(exit_conns.loc[pairs['eindex'].values, 'length'].values - sfrom, bidi_loops.loc[pairs['bindex'].values, 'length'].values)
             s = 1
             while len(pairs):
@@ -3555,9 +3586,9 @@ def AddPathThroughLoops(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges,
         # Check validity
         ends = FilterInvalidConnections(ends, test_paths, graph_ext, 1)
         if len(ends):
-            ends[ends['valid_path'] == 'ab'].drop(columns='valid_path', inplace=True)
+            ends = ends[ends['valid_path'] == 'ab'].drop(columns='valid_path')
         if len(ends):
-            direct_conns.drop(columns={'lena','lenb','startb'}, inplace=True)
+            direct_conns.drop(columns=['lena','lenb','startb'], inplace=True)
             direct_conns = direct_conns.merge(ends[['apid','bpid']].rename(columns={'apid':'ifrom','bpid':'ito'}), on=['ifrom','ito'], how='inner')
         else:
             direct_conns = []
@@ -3576,6 +3607,8 @@ def AddPathThroughLoops(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges,
     if len(loop_conns):
         for i in [1,2]:
             loop_conns = loop_conns.merge(bidi_loops[['lindex','strand0']].reset_index().rename(columns={'index':f'bindex{i}','lindex':f'lindex{i}','strand0':f'dir{i}'}), on=[f'lindex{i}',f'dir{i}'], how='left')
+    if len(loop_conns):
+        loop_conns = loop_conns[(np.isin(loop_conns['bindex1'], vetos) == False) & (np.isin(loop_conns['bindex2'], vetos) == False)].copy()
     if len(indirect_conns) and len(start_units):
         indirect_paths = indirect_conns[['ifrom','ito']].reset_index().rename(columns={'index':'cindex'})
         indirect_paths = indirect_paths.merge(start_units[['eindex','bindex']].rename(columns={'eindex':'ifrom','bindex':'bifrom'}), on=['ifrom'], how='left')
@@ -6445,7 +6478,7 @@ def CombineOnMatchingExtensions(scaffold_paths, graph_ext, scaffold_graph, scaf_
     ends = ends[(ends['aleft'] & ends['aright'])].drop(columns=['did','amin','amax','alen','aleft','aright','bleft','bright','bhap','matches','blen'])
     ends.drop_duplicates(inplace=True)
     # Require that all haplotypes are found at that position
-    ends['ahap'] = (np.repeat("hap", len(ends)).astype(np.object) + ends['ahap'].astype(str)).astype(str)
+    ends['ahap'] = (np.repeat("hap", len(ends)).astype(object) + ends['ahap'].astype(str)).astype(str)
     ends['present'] = True
     ends = ends.pivot(index=['apid','bpid','bmin','bmax'], columns='ahap', values='present').reset_index().rename_axis(None, axis=1)
     for h in range(ploidy):
