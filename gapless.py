@@ -1723,17 +1723,16 @@ def TransformContigConnectionsToScaffoldConnections(long_range_connections, scaf
 
 def SummarizeLongRangeConnections(long_range_connections):
     long_range_extlen = []
-    if len(long_range_extlen):
+    if len(long_range_connections):
         # Separate long_range_extlen
         long_range_extlen = long_range_connections[['conn_code','pos','pgaplen', 'ngaplen', 'pextlen', 'nextlen']].copy()
 #
-        if len(long_range_connections):
-            # Summarize identical long_range_connections (since we already trimmed all contigs without alternative bridges from both sides, we do not need to update conn_id to scaffolds)
-            long_range_connections = long_range_connections.groupby(['conn_code','pos','size','scaffold','strand','prev_alt','next_alt','prev_dist','next_dist']).size().reset_index(name='count')
-            long_range_connections['conn_id'] = (long_range_connections['conn_code'] != long_range_connections['conn_code'].shift(1)).cumsum()
-            long_range_extlen['conn_id'] = long_range_extlen[['conn_code']].merge(long_range_connections[['conn_code','conn_id']].drop_duplicates(), on='conn_code', how='left')['conn_id'].values
-            long_range_extlen.drop(columns=['conn_code'], inplace=True)
-            long_range_connections.drop(columns=['conn_code'], inplace=True)
+        # Summarize identical long_range_connections (since we already trimmed all contigs without alternative bridges from both sides, we do not need to update conn_id to scaffolds)
+        long_range_connections = long_range_connections.groupby(['conn_code','pos','size','scaffold','strand','prev_alt','next_alt','prev_dist','next_dist']).size().reset_index(name='count')
+        long_range_connections['conn_id'] = (long_range_connections['conn_code'] != long_range_connections['conn_code'].shift(1)).cumsum()
+        long_range_extlen['conn_id'] = long_range_extlen[['conn_code']].merge(long_range_connections[['conn_code','conn_id']].drop_duplicates(), on='conn_code', how='left')['conn_id'].values
+        long_range_extlen.drop(columns=['conn_code'], inplace=True)
+        long_range_connections.drop(columns=['conn_code'], inplace=True)
 #
     return long_range_connections, long_range_extlen
 
@@ -3479,6 +3478,8 @@ def AddPathThroughLoops(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges,
             start_units.sort_values(['eindex','sfrom','bindex'], inplace=True)
             first_match = start_units.groupby(['eindex'])['sfrom'].agg(['min','size'])
             start_units = start_units[start_units['sfrom'] == np.repeat(first_match['min'].values, first_match['size'].values)].copy()
+            # Remove loop units that do not exceed the exit path
+            start_units = start_units[exit_conns.loc[start_units['eindex'].values, 'length'].values < start_units['sfrom'] + bidi_loops.loc[start_units['bindex'].values, 'length'].values].copy()
             # Add loop unit information and try to reduce to ploidy alternatives
             start_units[['loop','from','from_side','length']] = bidi_loops.loc[ start_units['bindex'].values, ['loop','scaf0','strand0','length']].values
             start_units['from_side'] = np.where(start_units['from_side'] == '+', 'r', 'l')
@@ -3507,8 +3508,9 @@ def AddPathThroughLoops(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges,
         for sfrom in range(1,direct_conns['length'].max()):
             direct_conns['match'] = True
             cur = direct_conns['sfrom'] == sfrom
-            direct_conns.loc[cur, 'match'] = (direct_conns.loc[cur, [f'scaf{sfrom}',f'strand{sfrom}']].values == direct_conns.loc[cur, ['rscaf0','rstrand0']].values).all(axis=1)
-            for s in range(sfrom+1, direct_conns['length'].max()):
+            direct_conns.loc[cur, 'match'] = ( (direct_conns.loc[cur, [f'scaf{sfrom}',f'strand{sfrom}']].values == direct_conns.loc[cur, ['rscaf0','rstrand0']].values).all(axis=1) &
+                                               (direct_conns.loc[cur, 'length'] < direct_conns.loc[cur, 'sfrom'] + direct_conns.loc[cur, 'rlength']) ) # Otherwise we would have bridged the loop
+            for s in range(sfrom+1, direct_conns.loc[direct_conns['match'], 'length'].max()):
                 cur = direct_conns['match'] & (direct_conns['sfrom'] == sfrom) & (direct_conns['length'] > s)
                 direct_conns.loc[cur, 'match'] = (direct_conns.loc[cur, [f'scaf{s}',f'strand{s}',f'dist{s}']].values == direct_conns.loc[cur, [f'rscaf{s-sfrom}',f'rstrand{s-sfrom}',f'rdist{s-sfrom}']].values).all(axis=1)
             direct_conns.loc[direct_conns['match'] == False, 'sfrom'] += 1
@@ -7432,7 +7434,7 @@ def BasicMappingToScaffolds(mappings, all_scafs):
             if len(new_groups):
                 new_groups['new_group'] = np.arange(start_group_id, start_group_id+len(new_groups))
                 start_group_id += len(new_groups)
-                merged_groups = pd.concat([merged_groups, sep_groups], ignore_index=True)
+                merged_groups = pd.concat([merged_groups, new_groups], ignore_index=True)
             # Store valid extensions and prepare next round
             sep_groups = pd.concat([sep_groups, merged_groups[['group','new_group','mindex']].copy()], ignore_index=True)
             merged_groups = merged_groups[merged_groups['read_pos'] < merged_groups['max_pos']].drop(columns=['mindex','strand','rpos','lpos'])
@@ -7444,8 +7446,8 @@ def BasicMappingToScaffolds(mappings, all_scafs):
     merged_groups = mappings.groupby(['group','read_pos']).size()
     merged_groups = merged_groups[merged_groups > 1].reset_index()[['group']].drop_duplicates()
     if len(merged_groups):
-        print("Error: Groups have duplicated positions after BasicMappingToScaffolds.")
         print( mappings.loc[np.isin(mappings['group'].values, merged_groups['group'].values)] )
+        raise RuntimeError("Groups have duplicated positions after BasicMappingToScaffolds.")
 #
     return mappings
 
