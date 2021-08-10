@@ -96,7 +96,7 @@ def ReadContigs(assembly_file):
     contig_end = -1
     last_scaffold = ""
 
-    with gzip.open(assembly_file, 'rt') if 'gz' == assembly_file.rsplit('.',1)[-1] else open(assembly_file, 'rU') as fin:
+    with gzip.open(assembly_file, 'rt') if 'gz' == assembly_file.rsplit('.',1)[-1] else open(assembly_file, 'r') as fin:
         for record in SeqIO.parse(fin, "fasta"):
             seqid = record.description.split(' ', 1 ) # Split identifier(name) and further description
             names.append(seqid[0])
@@ -1704,33 +1704,36 @@ def GetLongRangeConnections(bridges, mappings, contig_parts, max_dist_contig_end
     return long_range_connections
 
 def TransformContigConnectionsToScaffoldConnections(long_range_connections, scaffold_parts):
-    long_range_connections[['scaffold','scaf_pos','reverse']] = scaffold_parts.loc[long_range_connections['conpart'].values,['scaffold','pos','reverse']].values
-    # Reverse strand of contigs that are reversed in the scaffold to get the scaffold strand
-    long_range_connections.loc[long_range_connections['reverse'], 'strand'] = np.where(long_range_connections.loc[long_range_connections['reverse'], 'strand'] == '+', '-', '+')
-    # Group and combine contigs which are all part of the same scaffold (and are following it's order, so are not a repeat)
-    long_range_connections['group'] = ( (long_range_connections['conn_id'] != long_range_connections['conn_id'].shift(1)) | (long_range_connections['scaffold'] != long_range_connections['scaffold'].shift(1)) | 
-                                        ((long_range_connections['scaf_pos']+1 != long_range_connections['scaf_pos'].shift(1)) & (long_range_connections['scaf_pos']-1 != long_range_connections['scaf_pos'].shift(1))) ).cumsum()
-    long_range_connections = long_range_connections.groupby(['group', 'conn_id', 'conn_code', 'scaffold', 'strand'], sort=False).agg({'prev_alt':'first','next_alt':'last','prev_dist':'first','next_dist':'last','pgaplen':'first','ngaplen':'last','pextlen':'first','nextlen':'last'}).reset_index().drop(columns=['group'])
+    if len(long_range_connections):
+        long_range_connections[['scaffold','scaf_pos','reverse']] = scaffold_parts.loc[long_range_connections['conpart'].values,['scaffold','pos','reverse']].values
+        # Reverse strand of contigs that are reversed in the scaffold to get the scaffold strand
+        long_range_connections.loc[long_range_connections['reverse'], 'strand'] = np.where(long_range_connections.loc[long_range_connections['reverse'], 'strand'] == '+', '-', '+')
+        # Group and combine contigs which are all part of the same scaffold (and are following it's order, so are not a repeat)
+        long_range_connections['group'] = ( (long_range_connections['conn_id'] != long_range_connections['conn_id'].shift(1)) | (long_range_connections['scaffold'] != long_range_connections['scaffold'].shift(1)) | 
+                                            ((long_range_connections['scaf_pos']+1 != long_range_connections['scaf_pos'].shift(1)) & (long_range_connections['scaf_pos']-1 != long_range_connections['scaf_pos'].shift(1))) ).cumsum()
+        long_range_connections = long_range_connections.groupby(['group', 'conn_id', 'conn_code', 'scaffold', 'strand'], sort=False).agg({'prev_alt':'first','next_alt':'last','prev_dist':'first','next_dist':'last','pgaplen':'first','ngaplen':'last','pextlen':'first','nextlen':'last'}).reset_index().drop(columns=['group'])
 
-    # Get size and pos again
-    con_size = long_range_connections.groupby(['conn_id']).size().reset_index(name='size')
-    long_range_connections['size'] = np.repeat(con_size['size'].values, con_size['size'].values)
-    long_range_connections = long_range_connections[long_range_connections['size'] > 2].copy()
-    long_range_connections['pos'] = long_range_connections.groupby(['conn_id'], sort=False).cumcount()
+        # Get size and pos again
+        con_size = long_range_connections.groupby(['conn_id']).size().reset_index(name='size')
+        long_range_connections['size'] = np.repeat(con_size['size'].values, con_size['size'].values)
+        long_range_connections = long_range_connections[long_range_connections['size'] > 2].copy()
+        long_range_connections['pos'] = long_range_connections.groupby(['conn_id'], sort=False).cumcount()
 
     return long_range_connections
 
 def SummarizeLongRangeConnections(long_range_connections):
-    # Separate long_range_extlen
-    long_range_extlen = long_range_connections[['conn_code','pos','pgaplen', 'ngaplen', 'pextlen', 'nextlen']].copy()
- #
-    if len(long_range_connections):
-        # Summarize identical long_range_connections (since we already trimmed all contigs without alternative bridges from both sides, we do not need to update conn_id to scaffolds)
-        long_range_connections = long_range_connections.groupby(['conn_code','pos','size','scaffold','strand','prev_alt','next_alt','prev_dist','next_dist']).size().reset_index(name='count')
-        long_range_connections['conn_id'] = (long_range_connections['conn_code'] != long_range_connections['conn_code'].shift(1)).cumsum()
-        long_range_extlen['conn_id'] = long_range_extlen[['conn_code']].merge(long_range_connections[['conn_code','conn_id']].drop_duplicates(), on='conn_code', how='left')['conn_id'].values
-        long_range_extlen.drop(columns=['conn_code'], inplace=True)
-        long_range_connections.drop(columns=['conn_code'], inplace=True)
+    long_range_extlen = []
+    if len(long_range_extlen):
+        # Separate long_range_extlen
+        long_range_extlen = long_range_connections[['conn_code','pos','pgaplen', 'ngaplen', 'pextlen', 'nextlen']].copy()
+#
+        if len(long_range_connections):
+            # Summarize identical long_range_connections (since we already trimmed all contigs without alternative bridges from both sides, we do not need to update conn_id to scaffolds)
+            long_range_connections = long_range_connections.groupby(['conn_code','pos','size','scaffold','strand','prev_alt','next_alt','prev_dist','next_dist']).size().reset_index(name='count')
+            long_range_connections['conn_id'] = (long_range_connections['conn_code'] != long_range_connections['conn_code'].shift(1)).cumsum()
+            long_range_extlen['conn_id'] = long_range_extlen[['conn_code']].merge(long_range_connections[['conn_code','conn_id']].drop_duplicates(), on='conn_code', how='left')['conn_id'].values
+            long_range_extlen.drop(columns=['conn_code'], inplace=True)
+            long_range_connections.drop(columns=['conn_code'], inplace=True)
 #
     return long_range_connections, long_range_extlen
 
@@ -1744,86 +1747,87 @@ def GetScaffoldLength(scaffold_parts, contig_parts):
 
 def FilterLongRangeConnections(long_range_connections, long_range_extlen, scaffold_parts, contig_parts, cov_probs, prob_factor, min_mapping_length, prematurity_threshold):
     scaf_len = GetScaffoldLength(scaffold_parts, contig_parts)
-    for l in range(3,long_range_connections['size'].max()+1):
-        for cfilter in ['prematurity','counts']:
-            # Get all connections of length l (this includes the connections within longer connections)
-            long_range_connections.reset_index(drop=True, inplace=True)
-            cons = long_range_connections.loc[long_range_connections['pos'] + l <= long_range_connections['size'], ['scaffold','strand','count']].reset_index()
-            cons.rename(columns={'index':'cindex', 'scaffold':'scaf0', 'strand':'strand0'}, inplace=True)
-            for i in range(1,l):
-                cons[[f'scaf{i}',f'strand{i}',f'dist{i}']] = long_range_connections.loc[cons['cindex']+i, ['scaffold','strand','prev_dist']].values
-            mcols = ['scaf0','strand0']+[f'{n}{s}' for s in range(1,l) for n in ['scaf','strand','dist']]
-            if cfilter == 'prematurity':
-                cons[['conn_id', 'pos']] = long_range_connections.loc[cons['cindex'].values, ['conn_id', 'pos']].values
-                for s in ['n','p']:
-                    complen = cons.drop(columns=['count']).merge(long_range_extlen[['conn_id','pos',f'{s}gaplen',f'{s}extlen']], on=['conn_id','pos'], how='left')
-                    complen.rename(columns={f'{s}{n}':n for n in ['gaplen','extlen']}, inplace=True)
-                    complen.drop(columns=['conn_id','pos'], inplace=True)
-                    if s == 'n':
-                        gcols = ['scaf1','strand1']+[f'{n}{s}' for s in range(2,l) for n in ['scaf','strand','dist']]
-                    else:
-                        gcols = ['scaf0','strand0']+[f'{n}{s}' for s in range(1,l-1) for n in ['scaf','strand','dist']]
-                    clen = complen.groupby(mcols).agg({'extlen':'max','gaplen':'size'}).rename(columns={'gaplen':'counts'}).reset_index()
-                    clen.sort_values(gcols, inplace=True)
-                    maxlen = clen.groupby(gcols, sort=False)['extlen'].agg(['size','max'])
-                    clen['maxlen'] = np.repeat(maxlen['max'].values, maxlen['size'].values)
-                    longest = clen[clen['extlen'] == clen['maxlen']].drop(columns=['extlen'])
-                    longest.rename(columns={'counts':'ncontrol'}, inplace=True)
-                    clen = clen[clen['maxlen'] > clen['extlen']].copy()
-                    clen.reset_index(drop=True, inplace=True)
-                    clen['gaplen'] = clen[mcols+['extlen']].merge(complen.groupby(mcols+['extlen'])['gaplen'].max().reset_index(), on=mcols+['extlen'], how='left')['gaplen'].values
-                    longest = longest.merge(clen[gcols+['extlen','counts','gaplen']].reset_index().rename(columns={'index':'cindex','extlen':'tlen','counts':'ntest','gaplen':'tgaplen'}), on=gcols, how='inner')
-                    longer = longest[mcols+['tlen','tgaplen']].drop_duplicates().merge(complen[mcols+['extlen','gaplen']], on=mcols, how='left')
-                    longer = longer[longer['extlen'] > longer['tlen'] + np.maximum(0, longer['tgaplen']-longer['gaplen'])].groupby(mcols+['tlen','tgaplen']).size().reset_index(name='longer')
-                    longest['longer'] = longest[mcols+['tlen','tgaplen']].merge(longer, on=mcols+['tlen','tgaplen'], how='left')['longer'].fillna(0).astype(int).values
-                    if np.sum(longest['longer'] > 0):
-                        longest['premat_prob'] = GetPrematureStopProb(longest['ntest'], longest['ncontrol'], longest['longer'])
-                    else:
-                        longest['premat_prob'] = 1.0
-                    tmp = longest.groupby(['cindex'])['premat_prob'].min().reset_index()
-                    clen.loc[tmp['cindex'].values, 'premat_prob'] = tmp['premat_prob'].values
-                    cons[f'{s}premat_prob'] = cons[mcols].merge(clen[mcols+['premat_prob']], on=mcols, how='left')['premat_prob'].fillna(1.0).values
-                    if s == 'n':
-                        cons['pos'] += l-1
-                cons['ndel'] = cons['npremat_prob'] <= prematurity_threshold
-                cons['pdel'] = cons['ppremat_prob'] <= prematurity_threshold
-                one_sided_dels = cons.loc[cons['ndel'] != cons['pdel'], mcols+['ndel','pdel']].drop_duplicates()
-                cons = cons[cons['ndel'] & cons['pdel']].drop(columns=['conn_id', 'pos','npremat_prob','ppremat_prob','ndel','pdel'])
-            else:
-                # Sum counts for identical cons
-                counts = cons.groupby(mcols)['count'].sum().reset_index()
-                # Get minimum length of a read to span that connection
-                counts['min_length'] = 2*min_mapping_length + np.maximum(0, counts['dist1']) + np.maximum(0, counts[f'dist{l-1}'])
-                for i in range(1,l-1):
-                    counts['min_length'] += scaf_len.loc[counts[f'scaf{i}'].values, 'length'].values
-                    if i > 1:
-                        counts['min_length'] += counts[f'dist{i}']
-                # Get probability of observing this number of counts or lower
-                counts['probability'] = GetConProb(cov_probs, counts['min_length'], counts['count'])
-                # Compare probability between long_range_connections that are identical except for the first scaffold
-                counts.sort_values(['scaf1','strand1']+[f'{n}{s}' for s in range(2,l) for n in ['scaf','strand','dist']], inplace=True)
-                max_prob = counts.groupby(['scaf1','strand1']+[f'{n}{s}' for s in range(2,l) for n in ['scaf','strand','dist']], sort=False)['probability'].agg(['size','max'])
-                counts['nmax_prob'] = np.repeat(max_prob['max'].values, max_prob['size'].values)
-                # Compare probability between long_range_connections that are identical except for the last scaffold
-                counts.sort_values(['scaf0','strand0']+[f'{n}{s}' for s in range(1,l-1) for n in ['scaf','strand','dist']], inplace=True)
-                max_prob = counts.groupby(['scaf0','strand0']+[f'{n}{s}' for s in range(1,l-1) for n in ['scaf','strand','dist']], sort=False)['probability'].agg(['size','max'])
-                counts['pmax_prob'] = np.repeat(max_prob['max'].values, max_prob['size'].values)
-                # Delete connections that are unprobable in both directions (since we keep the shorter connections, removing only one direction would keep the problematic split, but throw away information how to proceed after the split, while in the case of a two-sided removal on both sides are better alternatives and we can savely remove it)
-                counts['ndel'] = (counts['probability']*prob_factor < counts['nmax_prob']) | counts[mcols].merge(one_sided_dels, on=mcols, how='left')['ndel'].fillna(False).values
-                counts['pdel'] = (counts['probability']*prob_factor < counts['pmax_prob']) | counts[mcols].merge(one_sided_dels, on=mcols, how='left')['pdel'].fillna(False).values
-                counts = counts[counts['ndel'] & counts['pdel']].drop(columns=['count','min_length','probability','nmax_prob','pmax_prob','ndel','pdel'])
-                cons = cons.merge(counts, on=mcols, how='inner')
-            split_index = np.concatenate([cons['cindex'].values, cons['cindex'].values+l-2])
-            long_range_connections['split'] = long_range_connections['conn_id'] != long_range_connections['conn_id'].shift(-1)
-            long_range_connections.loc[split_index, 'split'] = True
-            long_range_connections['split'] = long_range_connections['split'].shift(1, fill_value=True)
-            long_range_connections['conn_id'] = long_range_connections['split'].cumsum()
-            long_range_connections['pos'] = long_range_connections.groupby(['conn_id']).cumcount()
-            con_size = long_range_connections.groupby(['conn_id'], sort=False).size().values
-            long_range_connections['size'] = np.repeat(con_size, con_size)
-            long_range_connections = long_range_connections[long_range_connections['size'] > 2].drop(columns=['split'])
-            long_range_connections.loc[long_range_connections['pos'] == 0, ['prev_alt','prev_dist']] = 0
-            long_range_connections.loc[long_range_connections['pos'] == long_range_connections['size']-1, ['next_alt','next_dist']] = 0
+    if len(long_range_connections):
+        for l in range(3,long_range_connections['size'].max()+1):
+            for cfilter in ['prematurity','counts']:
+                # Get all connections of length l (this includes the connections within longer connections)
+                long_range_connections.reset_index(drop=True, inplace=True)
+                cons = long_range_connections.loc[long_range_connections['pos'] + l <= long_range_connections['size'], ['scaffold','strand','count']].reset_index()
+                cons.rename(columns={'index':'cindex', 'scaffold':'scaf0', 'strand':'strand0'}, inplace=True)
+                for i in range(1,l):
+                    cons[[f'scaf{i}',f'strand{i}',f'dist{i}']] = long_range_connections.loc[cons['cindex']+i, ['scaffold','strand','prev_dist']].values
+                mcols = ['scaf0','strand0']+[f'{n}{s}' for s in range(1,l) for n in ['scaf','strand','dist']]
+                if cfilter == 'prematurity':
+                    cons[['conn_id', 'pos']] = long_range_connections.loc[cons['cindex'].values, ['conn_id', 'pos']].values
+                    for s in ['n','p']:
+                        complen = cons.drop(columns=['count']).merge(long_range_extlen[['conn_id','pos',f'{s}gaplen',f'{s}extlen']], on=['conn_id','pos'], how='left')
+                        complen.rename(columns={f'{s}{n}':n for n in ['gaplen','extlen']}, inplace=True)
+                        complen.drop(columns=['conn_id','pos'], inplace=True)
+                        if s == 'n':
+                            gcols = ['scaf1','strand1']+[f'{n}{s}' for s in range(2,l) for n in ['scaf','strand','dist']]
+                        else:
+                            gcols = ['scaf0','strand0']+[f'{n}{s}' for s in range(1,l-1) for n in ['scaf','strand','dist']]
+                        clen = complen.groupby(mcols).agg({'extlen':'max','gaplen':'size'}).rename(columns={'gaplen':'counts'}).reset_index()
+                        clen.sort_values(gcols, inplace=True)
+                        maxlen = clen.groupby(gcols, sort=False)['extlen'].agg(['size','max'])
+                        clen['maxlen'] = np.repeat(maxlen['max'].values, maxlen['size'].values)
+                        longest = clen[clen['extlen'] == clen['maxlen']].drop(columns=['extlen'])
+                        longest.rename(columns={'counts':'ncontrol'}, inplace=True)
+                        clen = clen[clen['maxlen'] > clen['extlen']].copy()
+                        clen.reset_index(drop=True, inplace=True)
+                        clen['gaplen'] = clen[mcols+['extlen']].merge(complen.groupby(mcols+['extlen'])['gaplen'].max().reset_index(), on=mcols+['extlen'], how='left')['gaplen'].values
+                        longest = longest.merge(clen[gcols+['extlen','counts','gaplen']].reset_index().rename(columns={'index':'cindex','extlen':'tlen','counts':'ntest','gaplen':'tgaplen'}), on=gcols, how='inner')
+                        longer = longest[mcols+['tlen','tgaplen']].drop_duplicates().merge(complen[mcols+['extlen','gaplen']], on=mcols, how='left')
+                        longer = longer[longer['extlen'] > longer['tlen'] + np.maximum(0, longer['tgaplen']-longer['gaplen'])].groupby(mcols+['tlen','tgaplen']).size().reset_index(name='longer')
+                        longest['longer'] = longest[mcols+['tlen','tgaplen']].merge(longer, on=mcols+['tlen','tgaplen'], how='left')['longer'].fillna(0).astype(int).values
+                        if np.sum(longest['longer'] > 0):
+                            longest['premat_prob'] = GetPrematureStopProb(longest['ntest'], longest['ncontrol'], longest['longer'])
+                        else:
+                            longest['premat_prob'] = 1.0
+                        tmp = longest.groupby(['cindex'])['premat_prob'].min().reset_index()
+                        clen.loc[tmp['cindex'].values, 'premat_prob'] = tmp['premat_prob'].values
+                        cons[f'{s}premat_prob'] = cons[mcols].merge(clen[mcols+['premat_prob']], on=mcols, how='left')['premat_prob'].fillna(1.0).values
+                        if s == 'n':
+                            cons['pos'] += l-1
+                    cons['ndel'] = cons['npremat_prob'] <= prematurity_threshold
+                    cons['pdel'] = cons['ppremat_prob'] <= prematurity_threshold
+                    one_sided_dels = cons.loc[cons['ndel'] != cons['pdel'], mcols+['ndel','pdel']].drop_duplicates()
+                    cons = cons[cons['ndel'] & cons['pdel']].drop(columns=['conn_id', 'pos','npremat_prob','ppremat_prob','ndel','pdel'])
+                else:
+                    # Sum counts for identical cons
+                    counts = cons.groupby(mcols)['count'].sum().reset_index()
+                    # Get minimum length of a read to span that connection
+                    counts['min_length'] = 2*min_mapping_length + np.maximum(0, counts['dist1']) + np.maximum(0, counts[f'dist{l-1}'])
+                    for i in range(1,l-1):
+                        counts['min_length'] += scaf_len.loc[counts[f'scaf{i}'].values, 'length'].values
+                        if i > 1:
+                            counts['min_length'] += counts[f'dist{i}']
+                    # Get probability of observing this number of counts or lower
+                    counts['probability'] = GetConProb(cov_probs, counts['min_length'], counts['count'])
+                    # Compare probability between long_range_connections that are identical except for the first scaffold
+                    counts.sort_values(['scaf1','strand1']+[f'{n}{s}' for s in range(2,l) for n in ['scaf','strand','dist']], inplace=True)
+                    max_prob = counts.groupby(['scaf1','strand1']+[f'{n}{s}' for s in range(2,l) for n in ['scaf','strand','dist']], sort=False)['probability'].agg(['size','max'])
+                    counts['nmax_prob'] = np.repeat(max_prob['max'].values, max_prob['size'].values)
+                    # Compare probability between long_range_connections that are identical except for the last scaffold
+                    counts.sort_values(['scaf0','strand0']+[f'{n}{s}' for s in range(1,l-1) for n in ['scaf','strand','dist']], inplace=True)
+                    max_prob = counts.groupby(['scaf0','strand0']+[f'{n}{s}' for s in range(1,l-1) for n in ['scaf','strand','dist']], sort=False)['probability'].agg(['size','max'])
+                    counts['pmax_prob'] = np.repeat(max_prob['max'].values, max_prob['size'].values)
+                    # Delete connections that are unprobable in both directions (since we keep the shorter connections, removing only one direction would keep the problematic split, but throw away information how to proceed after the split, while in the case of a two-sided removal on both sides are better alternatives and we can savely remove it)
+                    counts['ndel'] = (counts['probability']*prob_factor < counts['nmax_prob']) | counts[mcols].merge(one_sided_dels, on=mcols, how='left')['ndel'].fillna(False).values
+                    counts['pdel'] = (counts['probability']*prob_factor < counts['pmax_prob']) | counts[mcols].merge(one_sided_dels, on=mcols, how='left')['pdel'].fillna(False).values
+                    counts = counts[counts['ndel'] & counts['pdel']].drop(columns=['count','min_length','probability','nmax_prob','pmax_prob','ndel','pdel'])
+                    cons = cons.merge(counts, on=mcols, how='inner')
+                split_index = np.concatenate([cons['cindex'].values, cons['cindex'].values+l-2])
+                long_range_connections['split'] = long_range_connections['conn_id'] != long_range_connections['conn_id'].shift(-1)
+                long_range_connections.loc[split_index, 'split'] = True
+                long_range_connections['split'] = long_range_connections['split'].shift(1, fill_value=True)
+                long_range_connections['conn_id'] = long_range_connections['split'].cumsum()
+                long_range_connections['pos'] = long_range_connections.groupby(['conn_id']).cumcount()
+                con_size = long_range_connections.groupby(['conn_id'], sort=False).size().values
+                long_range_connections['size'] = np.repeat(con_size, con_size)
+                long_range_connections = long_range_connections[long_range_connections['size'] > 2].drop(columns=['split'])
+                long_range_connections.loc[long_range_connections['pos'] == 0, ['prev_alt','prev_dist']] = 0
+                long_range_connections.loc[long_range_connections['pos'] == long_range_connections['size']-1, ['next_alt','next_dist']] = 0
 #
     return long_range_connections
 
@@ -1858,27 +1862,35 @@ def RemoveRedundantEntriesInScaffoldGraph(scaffold_graph):
 
 def BuildScaffoldGraph(long_range_connections, scaf_bridges):
     # First start from every contig and extend in both directions on valid reads
-    scaffold_graph = long_range_connections[['scaffold','strand','conn_id','pos','size']].copy()
-    scaffold_graph = scaffold_graph[scaffold_graph['pos']+1 < scaffold_graph['size']].copy() # If we are already at the last position we cannot extend
-    scaffold_graph['org_pos'] = scaffold_graph['pos']
-    scaffold_graph.rename(columns={'scaffold':'from', 'strand':'from_side'}, inplace=True)
-    scaffold_graph['from_side'] = np.where(scaffold_graph['from_side'] == '+','r','l')
-    for s in range(1,scaffold_graph['size'].max()):
-        scaffold_graph['pos'] += 1
-        scaffold_graph = scaffold_graph.merge(long_range_connections[['conn_id','pos','scaffold','strand','prev_dist']].rename(columns={'scaffold':'scaf'+str(s), 'strand':'strand'+str(s), 'prev_dist':'dist'+str(s)}), on=['conn_id','pos'], how='left')
-    scaffold_graph.drop(columns=['pos','conn_id'],inplace=True)
-    scaffold_graph['length'] = scaffold_graph['size'] - scaffold_graph['org_pos']
-    scaffold_graph.drop(columns=['size','org_pos'],inplace=True)
+    if len(long_range_connections):
+        scaffold_graph = long_range_connections[['scaffold','strand','conn_id','pos','size']].copy()
+        scaffold_graph = scaffold_graph[scaffold_graph['pos']+1 < scaffold_graph['size']].copy() # If we are already at the last position we cannot extend
+        scaffold_graph['org_pos'] = scaffold_graph['pos']
+        scaffold_graph.rename(columns={'scaffold':'from', 'strand':'from_side'}, inplace=True)
+        scaffold_graph['from_side'] = np.where(scaffold_graph['from_side'] == '+','r','l')
+        for s in range(1,scaffold_graph['size'].max()):
+            scaffold_graph['pos'] += 1
+            scaffold_graph = scaffold_graph.merge(long_range_connections[['conn_id','pos','scaffold','strand','prev_dist']].rename(columns={'scaffold':'scaf'+str(s), 'strand':'strand'+str(s), 'prev_dist':'dist'+str(s)}), on=['conn_id','pos'], how='left')
+        scaffold_graph.drop(columns=['pos','conn_id'],inplace=True)
+        scaffold_graph['length'] = scaffold_graph['size'] - scaffold_graph['org_pos']
+        scaffold_graph.drop(columns=['size','org_pos'],inplace=True)
+    else:
+        scaffold_graph = []
 #
     # Then add scaf_bridges with alternatives
-    short_bridges = scaf_bridges[['from','from_side','to','to_side','mean_dist']].copy()
-    short_bridges.rename(columns={'to':'scaf1','to_side':'strand1','mean_dist':'dist1'}, inplace=True)
-    short_bridges['strand1'] = np.where(short_bridges['strand1'] == 'l', '+', '-')
-    short_bridges['length'] = 2
-    scaffold_graph = pd.concat([scaffold_graph, short_bridges[['from','from_side','length','scaf1','strand1','dist1']]], ignore_index=True, sort=False)
+    if len(scaf_bridges):
+        short_bridges = scaf_bridges[['from','from_side','to','to_side','mean_dist']].copy()
+        short_bridges.rename(columns={'to':'scaf1','to_side':'strand1','mean_dist':'dist1'}, inplace=True)
+        short_bridges['strand1'] = np.where(short_bridges['strand1'] == 'l', '+', '-')
+        short_bridges['length'] = 2
+        short_bridges = short_bridges[['from','from_side','length','scaf1','strand1','dist1']].copy()
+        if len(scaffold_graph):
+            scaffold_graph = pd.concat([scaffold_graph, short_bridges], ignore_index=True, sort=False)
+        else:
+            scaffold_graph = short_bridges
 #
-    # Remove redundant entries
-    scaffold_graph = RemoveRedundantEntriesInScaffoldGraph(scaffold_graph)
+        # Remove redundant entries
+        scaffold_graph = RemoveRedundantEntriesInScaffoldGraph(scaffold_graph)
 
     return scaffold_graph
 
@@ -2097,7 +2109,8 @@ def DisconnectRepeatedContigsWithConnectionsOnBothSides(scaffold_graph, scaf_rep
     for s in range(1, scaffold_graph['length'].max()-1):
         dup_graph.append(scaffold_graph[np.isin(scaffold_graph[f'scaf{s}'], dup_scafs) & (scaffold_graph['length'] > s+1)].reset_index().rename(columns={'index':'sindex'}))
         dup_graph[-1]['dup'] = s
-    dup_graph = RemoveEmptyColumns(pd.concat(dup_graph, ignore_index=True))
+    if len(dup_graph):
+        dup_graph = RemoveEmptyColumns(pd.concat(dup_graph, ignore_index=True))
     if len(dup_graph):
         dup_graph.sort_values(['sindex','dup'], inplace=True)
         # Only keep the longest entries (on both sides) for each dup
@@ -2305,182 +2318,192 @@ def DisconnectRepeatedContigsWithConnectionsOnBothSides(scaffold_graph, scaf_rep
     return scaffold_graph
 
 def DeduplicateScaffoldsInGraph(scaffold_graph, repeats, scaffold_parts, scaf_bridges):
-    scaf_reps = FindFullyDuplicatedScaffolds(scaffold_parts, repeats)
-    end_reps = FindSingleContigScaffoldsWithOneDuplicatedUnconnectedEnd(scaffold_parts, repeats, scaffold_graph)
-    scaffold_graph, trim_repeats = DisconnectRepeatedContigsWithConnectionsOnOneSide(scaffold_graph, scaf_reps, end_reps, scaf_bridges)
-    scaffold_graph = DisconnectRepeatedContigsWithConnectionsOnBothSides(scaffold_graph, scaf_reps, scaf_bridges)
+    if len(scaffold_graph):
+        scaf_reps = FindFullyDuplicatedScaffolds(scaffold_parts, repeats)
+        end_reps = FindSingleContigScaffoldsWithOneDuplicatedUnconnectedEnd(scaffold_parts, repeats, scaffold_graph)
+        scaffold_graph, trim_repeats = DisconnectRepeatedContigsWithConnectionsOnOneSide(scaffold_graph, scaf_reps, end_reps, scaf_bridges)
+        scaffold_graph = DisconnectRepeatedContigsWithConnectionsOnBothSides(scaffold_graph, scaf_reps, scaf_bridges)
+    else:
+        trim_repeats = []
 #
     return scaffold_graph, trim_repeats
 
 def UpdateScafBridgesAccordingToScaffoldGraph(scaf_bridges, scaffold_graph):
-    valid_bridges = scaffold_graph[['from','from_side','scaf1','strand1','dist1']].drop_duplicates()
-    valid_bridges.rename(columns={'scaf1':'to','strand1':'to_side','dist1':'mean_dist'}, inplace=True)
-    valid_bridges['to_side'] = np.where(valid_bridges['to_side'] == '+', 'l', 'r')
-    scaf_bridges = scaf_bridges.merge(valid_bridges, on=['from','from_side','to','to_side','mean_dist'], how='inner')
-    scaf_bridges = CountAlternatives(scaf_bridges)
+    if len(scaffold_graph):
+        valid_bridges = scaffold_graph[['from','from_side','scaf1','strand1','dist1']].drop_duplicates()
+        valid_bridges.rename(columns={'scaf1':'to','strand1':'to_side','dist1':'mean_dist'}, inplace=True)
+        valid_bridges['to_side'] = np.where(valid_bridges['to_side'] == '+', 'l', 'r')
+        scaf_bridges = scaf_bridges.merge(valid_bridges, on=['from','from_side','to','to_side','mean_dist'], how='inner')
+        scaf_bridges = CountAlternatives(scaf_bridges)
 #
     return scaf_bridges
 
 def FindValidExtensionsInScaffoldGraph(scaffold_graph):
-    # Get all the possible continuations from a given scaffold
-    extensions = scaffold_graph.rename(columns={'from':'scaf0','from_side':'strand0'})
-    extensions['strand0'] = np.where(extensions['strand0'] == 'r', '+', '-')
-    extensions.reset_index(drop=True, inplace=True)
-    # All possible origins are just the inverse
-    origins = extensions.rename(columns={col:f'o{col}' for col in extensions.columns if col not in ['scaf0','strand0']})
-    origins.rename(columns={**{f'odist{s}':f'odist{s-1}' for s in range(1,origins['olength'].max())}}, inplace=True)
-    origins['strand0'] = np.where(origins['strand0'] == '+', '-', '+')
-    for s in range(1,origins['olength'].max()):
-        origins.loc[origins[f'ostrand{s}'].isnull() == False, f'ostrand{s}'] = np.where(origins.loc[origins[f'ostrand{s}'].isnull() == False, f'ostrand{s}'] == '+', '-', '+')
-    # Get all the branch points for the origins
-    branches = origins[['scaf0','strand0']].reset_index().rename(columns={'index':'oindex1'}).merge(origins[['scaf0','strand0']].reset_index().rename(columns={'index':'oindex2'}), on=['scaf0','strand0'], how='inner').drop(columns=['scaf0','strand0'])
-    nbranches = branches.groupby(['oindex1'], sort=False).size().reset_index(name='nbranches')
-    branches = branches[np.isin(branches['oindex1'], nbranches.loc[nbranches['nbranches'] == 1, 'oindex1'].values) == False].copy() # With only one matching branch the branches do not have a branch point
-    nbranches = nbranches[nbranches['nbranches'] > 1].copy()
-    s = 1
-    branch_points = []
-    while len(branches):
-        # Remove pairs where branch 2 stops matching branch 1 at scaffold s 
-        branches = branches[(origins.loc[branches['oindex1'].values, [f'oscaf{s}',f'ostrand{s}',f'odist{s-1}']].values == origins.loc[branches['oindex2'].values, [f'oscaf{s}',f'ostrand{s}',f'odist{s-1}']].values).all(axis=1)].copy()
-        # Add a branch point for the branches 1 that now have less pairs
-        nbranches['nbranches_new'] = nbranches[['oindex1']].merge(branches.groupby(['oindex1'], sort=False).size().reset_index(name='nbranches'), on=['oindex1'], how='left')['nbranches'].fillna(0).astype(int).values
-        branch_points.append( nbranches.loc[nbranches['nbranches_new'] < nbranches['nbranches'], ['oindex1']].rename(columns={'oindex1':'oindex'}) )
-        branch_points[-1]['pos'] = s
-        # Remove the branches that do not have further branch points
-        nbranches['nbranches'] = nbranches['nbranches_new']
-        nbranches.drop(columns=['nbranches_new'], inplace=True)
+    if len(scaffold_graph) == 0:
+        origins = []
+        extensions = []
+        pairs = []
+        ocont = []
+    else:
+        # Get all the possible continuations from a given scaffold
+        extensions = scaffold_graph.rename(columns={'from':'scaf0','from_side':'strand0'})
+        extensions['strand0'] = np.where(extensions['strand0'] == 'r', '+', '-')
+        extensions.reset_index(drop=True, inplace=True)
+        # All possible origins are just the inverse
+        origins = extensions.rename(columns={col:f'o{col}' for col in extensions.columns if col not in ['scaf0','strand0']})
+        origins.rename(columns={**{f'odist{s}':f'odist{s-1}' for s in range(1,origins['olength'].max())}}, inplace=True)
+        origins['strand0'] = np.where(origins['strand0'] == '+', '-', '+')
+        for s in range(1,origins['olength'].max()):
+            origins.loc[origins[f'ostrand{s}'].isnull() == False, f'ostrand{s}'] = np.where(origins.loc[origins[f'ostrand{s}'].isnull() == False, f'ostrand{s}'] == '+', '-', '+')
+        # Get all the branch points for the origins
+        branches = origins[['scaf0','strand0']].reset_index().rename(columns={'index':'oindex1'}).merge(origins[['scaf0','strand0']].reset_index().rename(columns={'index':'oindex2'}), on=['scaf0','strand0'], how='inner').drop(columns=['scaf0','strand0'])
+        nbranches = branches.groupby(['oindex1'], sort=False).size().reset_index(name='nbranches')
         branches = branches[np.isin(branches['oindex1'], nbranches.loc[nbranches['nbranches'] == 1, 'oindex1'].values) == False].copy() # With only one matching branch the branches do not have a branch point
         nbranches = nbranches[nbranches['nbranches'] > 1].copy()
-        # Prepare next round
-        s += 1
-    branch_points = pd.concat(branch_points, ignore_index=True)
-    branch_points.sort_values(['oindex','pos'], ascending=[True,False], inplace=True)
-    # Get all the valid extensions for a given origin possible origin-extension-pairs and count how long they match
-    pairs = origins[['scaf0','strand0']].reset_index().rename(columns={'index':'oindex'}).merge(extensions[['scaf0','strand0']].reset_index().rename(columns={'index':'eindex'}), on=['scaf0','strand0'], how='inner').drop(columns=['scaf0','strand0'])
-    pairs[['scaf1','strand1','dist1']] = extensions.loc[pairs['eindex'].values, ['scaf1','strand1','dist1']].values
-    while len(branch_points):
-        # Get the furthest branch_point and find extensions starting from there
-        highest_bp = branch_points.groupby(['oindex']).first().reset_index()
-        cur_ext = []
-        for bp in np.unique(highest_bp['pos']):
-            cur = origins.loc[highest_bp.loc[highest_bp['pos'] == bp, 'oindex'].values].rename(columns={**{'scaf0':f'scaf{bp}','strand0':f'strand{bp}','odist0':f'dist{bp}'}, **{f'o{n}{s}':f'{n}{bp-s}' for s in range(1,bp+1) for n in ['scaf','strand','dist']}})
-            cur.drop(columns=['olength']+[col for col in cur.columns if col[:5] == "oscaf" or col[:7] == "ostrand" or col[:5] == "odist"], inplace=True)
-            cur.drop(columns=['dist0'], inplace=True, errors='ignore') # dist0 does not exist for a branch point at the highest position in scaffold_graph
-            cur.reset_index(inplace=True)
-            cur.rename(columns={'index':'oindex','scaf0':'from','strand0':'from_side'}, inplace=True)
-            cur['from_side'] = np.where(cur['from_side'] == '+', 'r', 'l')
-            cur = cur.merge(scaffold_graph[scaffold_graph['length'] > bp+1], on=[col for col in cur if col != 'oindex'], how='inner')
-            if len(cur):
-                # Trim cur to only contain the extensions
-                cur.drop(columns=['from','from_side']+[f'{n}{s}' for s in range(1,bp+1) for n in ['scaf','strand','dist']], inplace=True)
-                cur = RemoveEmptyColumns(cur)
-                cur.rename(columns={f'{n}{s}':f'{n}{s-bp}' for s in range(bp+1,cur['length'].max()) for n in ['scaf','strand','dist']}, inplace=True)
-                cur['length'] -= bp
-                cur_ext.append(cur)
-        if len(cur_ext):
-            cur = pd.concat(cur_ext, ignore_index=True)
-            del cur_ext
-            if len(cur):
-                # Check whether they map until the end
-                cur_pairs = cur[['oindex','length','scaf1','strand1','dist1']].reset_index().rename(columns={'index':'cindex'}).merge(pairs[['oindex','eindex','scaf1','strand1','dist1']], on=['oindex','scaf1','strand1','dist1'], how='inner').drop(columns=['scaf1','strand1','dist1'])
-                cur_pairs['matches'] = 1
-                for s in range(2, cur['length'].max()):
-                    comp = (cur_pairs['matches'] == s-1) & (cur_pairs['length'] > s)
-                    cur_pairs.loc[comp,'matches'] += (cur.loc[cur_pairs.loc[comp, 'cindex'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values == extensions.loc[cur_pairs.loc[comp, 'eindex'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values).all(axis=1).astype(int)
-                cur_pairs['end'] = cur_pairs['matches']+1 == cur_pairs['length']
-                # Check if the extension matches at least one of the possible extensions of origin (An origin can have multiple scaffold_graph entries that extend it and extensions are compared to each of them)
-                cur_pairs = cur_pairs.groupby(['oindex','eindex'])[['end']].max().reset_index()
-                # Add a end=False for every extension/origin pair that should have been checked, but was not, because already scaf1 did not match and they never went into cur_pairs
-                cur_pairs = pairs[['oindex','eindex']].merge(cur[['oindex']].drop_duplicates(), on=['oindex'], how='inner').merge(cur_pairs, on=['oindex','eindex'], how='left')
-                cur_pairs['end'] = cur_pairs['end'].fillna(False)
-                # Remove pairs that do not match until the end
-                pairs.drop(pairs[pairs[['oindex','eindex']].merge(cur_pairs, on=['oindex','eindex'], how='left')['end'].values == False].index.values, inplace=True)
-        branch_points = branch_points[branch_points.merge(highest_bp, on=['oindex','pos'], how='left', indicator=True)['_merge'].values == "left_only"].copy()
-    pairs.drop(columns=['scaf1','strand1','dist1'], inplace=True)
-    # Add everything also in the other direction
-    pairs = pairs.merge(pairs.rename(columns={'oindex':'eindex','eindex':'oindex'}), on=['oindex','eindex'], how='outer')
-    pairs.sort_values(['oindex','eindex'], inplace=True)
-    # Get continuations of origins and extensions to make neighbours consistent
-    ocont = []
-    for l in np.unique(origins.loc[origins['olength'] > 1, 'olength'].values):
-            cur = origins[origins['olength'] == l].reset_index()
-            if len(cur):
-                cur.rename(columns={**{'index':'oindex2','scaf0':'nscaf','strand0':'nstrand','odist0':'ndist'}, **{f'{n}{s}':f'{n}{s-1}' for s in range(1,l) for n in ['oscaf','ostrand','odist']}}, inplace=True)
-                cur.rename(columns={'oscaf0':'scaf0','ostrand0':'strand0'}, inplace=True)
-                cur.drop(columns=['olength'] + [f'{n}{s}' for s in range(l,l) for n in ['oscaf','ostrand']] + [f'odist{s}' for s in range(l,l-1)], inplace=True)
-                cur = RemoveEmptyColumns(cur)
-                mcols = ['scaf0','strand0'] + [f'{n}{s}' for s in range(1,l-1) for n in ['oscaf','ostrand']] + [f'odist{s}' for s in range(l-2)]
-                cur = cur.merge(origins[mcols].reset_index().rename(columns={'index':'oindex1'}), on=mcols, how='inner').drop(columns=mcols)
-                ocont.append(cur)
-    perfect_ocont = pd.concat(ocont, ignore_index=True).drop(columns=['nscaf','nstrand','ndist'])
-    econt = []
-    for l in np.unique(extensions['length'].values):
-        cur = extensions[extensions['length'] == l].reset_index()
-        cur.drop(columns=['scaf0','strand0','dist1','length'], inplace=True)
-        cur = RemoveEmptyColumns(cur)
-        cur.rename(columns={**{'index':'eindex1'}, **{f'{n}{s}':f'{n}{s-1}' for s in range(1,l) for n in ['scaf','strand','dist']}}, inplace=True)
-        mcols = ['scaf0','strand0'] + [f'{n}{s}' for s in range(1,l-1) for n in ['scaf','strand','dist']]
-        cur = cur.merge(extensions[mcols].reset_index().rename(columns={'index':'eindex2'}), on=mcols, how='inner').drop(columns=mcols)
-        econt.append(cur)
-    if len(econt):
-        econt = pd.concat(econt, ignore_index=True)
-        econt.sort_values(['eindex1','eindex2'], inplace=True)
-    else:
-        econt = pd.DataFrame({'eindex1':[],'eindex2':[]})
-    # Check that neighbours have consistent pairs
-    while True:
-        # Extend the extension to the next scaffold and then propagate back the origins to get the extension/origin pairs that should be there based on the neighbours
-        new_pairs = econt.copy()
-        new_pairs[['oscaf1','ostrand1','odist0']] = extensions.loc[new_pairs['eindex1'].values, ['scaf0','strand0','dist1']].values
-        pairs[['oscaf1','ostrand1','odist0']] = origins.loc[pairs['oindex'].values, ['oscaf1','ostrand1','odist0']].values
-        new_pairs = new_pairs.merge(pairs.rename(columns={'eindex':'eindex2','oindex':'oindex2'}), on=['eindex2','oscaf1','ostrand1','odist0'], how='inner').drop(columns=['oscaf1','ostrand1','odist0'])
-        pairs.drop(columns=['oscaf1','ostrand1','odist0'], inplace=True)
-        new_pairs = new_pairs.merge(perfect_ocont, on=['oindex2'], how='inner')
-        new_pairs.drop(columns=['eindex2','oindex2'], inplace=True)
-        new_pairs.drop_duplicates(inplace=True)
-        #Add them to pairs if they are not already present
-        new_pairs.rename(columns={'eindex1':'eindex','oindex1':'oindex'}, inplace=True)
-        new_pairs = new_pairs.merge(new_pairs.rename(columns={'oindex':'eindex','eindex':'oindex'}), on=['oindex','eindex'], how='outer')
-        old_len = len(pairs)
-        pairs = pairs.merge(new_pairs, on=['oindex','eindex'], how='outer')
+        s = 1
+        branch_points = []
+        while len(branches):
+            # Remove pairs where branch 2 stops matching branch 1 at scaffold s 
+            branches = branches[(origins.loc[branches['oindex1'].values, [f'oscaf{s}',f'ostrand{s}',f'odist{s-1}']].values == origins.loc[branches['oindex2'].values, [f'oscaf{s}',f'ostrand{s}',f'odist{s-1}']].values).all(axis=1)].copy()
+            # Add a branch point for the branches 1 that now have less pairs
+            nbranches['nbranches_new'] = nbranches[['oindex1']].merge(branches.groupby(['oindex1'], sort=False).size().reset_index(name='nbranches'), on=['oindex1'], how='left')['nbranches'].fillna(0).astype(int).values
+            branch_points.append( nbranches.loc[nbranches['nbranches_new'] < nbranches['nbranches'], ['oindex1']].rename(columns={'oindex1':'oindex'}) )
+            branch_points[-1]['pos'] = s
+            # Remove the branches that do not have further branch points
+            nbranches['nbranches'] = nbranches['nbranches_new']
+            nbranches.drop(columns=['nbranches_new'], inplace=True)
+            branches = branches[np.isin(branches['oindex1'], nbranches.loc[nbranches['nbranches'] == 1, 'oindex1'].values) == False].copy() # With only one matching branch the branches do not have a branch point
+            nbranches = nbranches[nbranches['nbranches'] > 1].copy()
+            # Prepare next round
+            s += 1
+        branch_points = pd.concat(branch_points, ignore_index=True)
+        branch_points.sort_values(['oindex','pos'], ascending=[True,False], inplace=True)
+        # Get all the valid extensions for a given origin possible origin-extension-pairs and count how long they match
+        pairs = origins[['scaf0','strand0']].reset_index().rename(columns={'index':'oindex'}).merge(extensions[['scaf0','strand0']].reset_index().rename(columns={'index':'eindex'}), on=['scaf0','strand0'], how='inner').drop(columns=['scaf0','strand0'])
+        pairs[['scaf1','strand1','dist1']] = extensions.loc[pairs['eindex'].values, ['scaf1','strand1','dist1']].values
+        while len(branch_points):
+            # Get the furthest branch_point and find extensions starting from there
+            highest_bp = branch_points.groupby(['oindex']).first().reset_index()
+            cur_ext = []
+            for bp in np.unique(highest_bp['pos']):
+                cur = origins.loc[highest_bp.loc[highest_bp['pos'] == bp, 'oindex'].values].rename(columns={**{'scaf0':f'scaf{bp}','strand0':f'strand{bp}','odist0':f'dist{bp}'}, **{f'o{n}{s}':f'{n}{bp-s}' for s in range(1,bp+1) for n in ['scaf','strand','dist']}})
+                cur.drop(columns=['olength']+[col for col in cur.columns if col[:5] == "oscaf" or col[:7] == "ostrand" or col[:5] == "odist"], inplace=True)
+                cur.drop(columns=['dist0'], inplace=True, errors='ignore') # dist0 does not exist for a branch point at the highest position in scaffold_graph
+                cur.reset_index(inplace=True)
+                cur.rename(columns={'index':'oindex','scaf0':'from','strand0':'from_side'}, inplace=True)
+                cur['from_side'] = np.where(cur['from_side'] == '+', 'r', 'l')
+                cur = cur.merge(scaffold_graph[scaffold_graph['length'] > bp+1], on=[col for col in cur if col != 'oindex'], how='inner')
+                if len(cur):
+                    # Trim cur to only contain the extensions
+                    cur.drop(columns=['from','from_side']+[f'{n}{s}' for s in range(1,bp+1) for n in ['scaf','strand','dist']], inplace=True)
+                    cur = RemoveEmptyColumns(cur)
+                    cur.rename(columns={f'{n}{s}':f'{n}{s-bp}' for s in range(bp+1,cur['length'].max()) for n in ['scaf','strand','dist']}, inplace=True)
+                    cur['length'] -= bp
+                    cur_ext.append(cur)
+            if len(cur_ext):
+                cur = pd.concat(cur_ext, ignore_index=True)
+                del cur_ext
+                if len(cur):
+                    # Check whether they map until the end
+                    cur_pairs = cur[['oindex','length','scaf1','strand1','dist1']].reset_index().rename(columns={'index':'cindex'}).merge(pairs[['oindex','eindex','scaf1','strand1','dist1']], on=['oindex','scaf1','strand1','dist1'], how='inner').drop(columns=['scaf1','strand1','dist1'])
+                    cur_pairs['matches'] = 1
+                    for s in range(2, cur['length'].max()):
+                        comp = (cur_pairs['matches'] == s-1) & (cur_pairs['length'] > s)
+                        cur_pairs.loc[comp,'matches'] += (cur.loc[cur_pairs.loc[comp, 'cindex'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values == extensions.loc[cur_pairs.loc[comp, 'eindex'].values, [f'scaf{s}',f'strand{s}',f'dist{s}']].values).all(axis=1).astype(int)
+                    cur_pairs['end'] = cur_pairs['matches']+1 == cur_pairs['length']
+                    # Check if the extension matches at least one of the possible extensions of origin (An origin can have multiple scaffold_graph entries that extend it and extensions are compared to each of them)
+                    cur_pairs = cur_pairs.groupby(['oindex','eindex'])[['end']].max().reset_index()
+                    # Add a end=False for every extension/origin pair that should have been checked, but was not, because already scaf1 did not match and they never went into cur_pairs
+                    cur_pairs = pairs[['oindex','eindex']].merge(cur[['oindex']].drop_duplicates(), on=['oindex'], how='inner').merge(cur_pairs, on=['oindex','eindex'], how='left')
+                    cur_pairs['end'] = cur_pairs['end'].fillna(False)
+                    # Remove pairs that do not match until the end
+                    pairs.drop(pairs[pairs[['oindex','eindex']].merge(cur_pairs, on=['oindex','eindex'], how='left')['end'].values == False].index.values, inplace=True)
+            branch_points = branch_points[branch_points.merge(highest_bp, on=['oindex','pos'], how='left', indicator=True)['_merge'].values == "left_only"].copy()
+        pairs.drop(columns=['scaf1','strand1','dist1'], inplace=True)
+        # Add everything also in the other direction
+        pairs = pairs.merge(pairs.rename(columns={'oindex':'eindex','eindex':'oindex'}), on=['oindex','eindex'], how='outer')
         pairs.sort_values(['oindex','eindex'], inplace=True)
-        if old_len == len(pairs):
-            break
-    # Get continuations of origins to reduce computations later
-    ocont = []
-    missing_cont = pairs[['oindex']].rename(columns={'oindex':'oindex1'}) # All origins that have an extension must have a following origin in the direction of extension
-    missing_cont[['nscaf','nstrand','ndist']] = extensions.loc[pairs['eindex'].values, ['scaf1','strand1','dist1']].values
-    missing_cont[['nscaf','ndist']] = missing_cont[['nscaf','ndist']].astype(int)
-    missing_cont.drop_duplicates(inplace=True)
-    if len(missing_cont):
-        for cut in range(origins['olength'].max()-1): # If we do not find a following origin for a given origin look for the longest match by cutting away scaffolds
-            for l in np.unique(origins.loc[origins['olength'] > cut+1, 'olength'].values):
+        # Get continuations of origins and extensions to make neighbours consistent
+        ocont = []
+        for l in np.unique(origins.loc[origins['olength'] > 1, 'olength'].values):
                 cur = origins[origins['olength'] == l].reset_index()
-                cur.rename(columns={**{'index':'oindex2','scaf0':'nscaf','strand0':'nstrand','odist0':'ndist'}, **{f'{n}{s}':f'{n}{s-1}' for s in range(1,l-cut) for n in ['oscaf','ostrand','odist']}}, inplace=True)
-                cur.rename(columns={'oscaf0':'scaf0','ostrand0':'strand0'}, inplace=True)
-                cur.drop(columns=['olength'] + [f'{n}{s}' for s in range(l-cut,l) for n in ['oscaf','ostrand']] + [f'odist{s}' for s in range(l-cut,l-1)], inplace=True)
-                cur = RemoveEmptyColumns(cur)
-                mcols = ['scaf0','strand0'] + [f'{n}{s}' for s in range(1,l-cut-1) for n in ['oscaf','ostrand']] + [f'odist{s}' for s in range(l-cut-2)]
-                cur = cur.merge(origins.loc[np.isin(origins.index.values, np.unique(missing_cont['oindex1'])), mcols].reset_index().rename(columns={'index':'oindex1'}), on=mcols, how='inner').drop(columns=mcols)
-                if cut > 0:
-                    cur = cur.merge(missing_cont, on=['oindex1','nscaf','nstrand','ndist'], how='inner') # Do not use this for perfect matches, because sometimes an extension gets lost due to the simplification from all reads to the scaffold_graph
-                cur['matches'] = l-cut
-                ocont.append(cur)
-            if cut == 0:
-                # no cut means we have perfect matches, so we cannot improve on them anymore, so remove them from missing cont (For other cut values, we might cut away more from a longer origin and still achieve more matches, thus we cannnot only use it for perfect matches)
-                ocont = pd.concat(ocont, ignore_index=True)
-                mcols = ['oindex1','nscaf','nstrand','ndist']
-                missing_cont = missing_cont[ missing_cont.merge(ocont[mcols].drop_duplicates(), on=mcols, how='left', indicator=True)['_merge'].values == "left_only" ].copy()
-                perfect_ocont = ocont.drop(columns=['matches','nscaf','nstrand','ndist'])
-                ocont = [ ocont ]
-    if len(ocont):
-        ocont = pd.concat(ocont, ignore_index=True)[['oindex1','oindex2','nscaf','nstrand','ndist','matches']]
-        mcols = ['oindex1','nscaf','nstrand','ndist']
-        ocont = ocont[ocont['matches'] == ocont[mcols].merge(ocont.groupby(mcols)['matches'].max().reset_index(), on=mcols, how='left')['matches'].values].copy()
-        ocont.drop(columns=['matches'], inplace=True)
-        ocont.sort_values(['oindex1','oindex2'], inplace=True)
-    else:
-        ocont = pd.DataFrame({'oindex1':[],'oindex2':[],'nscaf':[],'nstrand':[],'ndist':[]})
+                if len(cur):
+                    cur.rename(columns={**{'index':'oindex2','scaf0':'nscaf','strand0':'nstrand','odist0':'ndist'}, **{f'{n}{s}':f'{n}{s-1}' for s in range(1,l) for n in ['oscaf','ostrand','odist']}}, inplace=True)
+                    cur.rename(columns={'oscaf0':'scaf0','ostrand0':'strand0'}, inplace=True)
+                    cur.drop(columns=['olength'] + [f'{n}{s}' for s in range(l,l) for n in ['oscaf','ostrand']] + [f'odist{s}' for s in range(l,l-1)], inplace=True)
+                    cur = RemoveEmptyColumns(cur)
+                    mcols = ['scaf0','strand0'] + [f'{n}{s}' for s in range(1,l-1) for n in ['oscaf','ostrand']] + [f'odist{s}' for s in range(l-2)]
+                    cur = cur.merge(origins[mcols].reset_index().rename(columns={'index':'oindex1'}), on=mcols, how='inner').drop(columns=mcols)
+                    ocont.append(cur)
+        perfect_ocont = pd.concat(ocont, ignore_index=True).drop(columns=['nscaf','nstrand','ndist'])
+        econt = []
+        for l in np.unique(extensions['length'].values):
+            cur = extensions[extensions['length'] == l].reset_index()
+            cur.drop(columns=['scaf0','strand0','dist1','length'], inplace=True)
+            cur = RemoveEmptyColumns(cur)
+            cur.rename(columns={**{'index':'eindex1'}, **{f'{n}{s}':f'{n}{s-1}' for s in range(1,l) for n in ['scaf','strand','dist']}}, inplace=True)
+            mcols = ['scaf0','strand0'] + [f'{n}{s}' for s in range(1,l-1) for n in ['scaf','strand','dist']]
+            cur = cur.merge(extensions[mcols].reset_index().rename(columns={'index':'eindex2'}), on=mcols, how='inner').drop(columns=mcols)
+            econt.append(cur)
+        if len(econt):
+            econt = pd.concat(econt, ignore_index=True)
+            econt.sort_values(['eindex1','eindex2'], inplace=True)
+        else:
+            econt = pd.DataFrame({'eindex1':[],'eindex2':[]})
+        # Check that neighbours have consistent pairs
+        while True:
+            # Extend the extension to the next scaffold and then propagate back the origins to get the extension/origin pairs that should be there based on the neighbours
+            new_pairs = econt.copy()
+            new_pairs[['oscaf1','ostrand1','odist0']] = extensions.loc[new_pairs['eindex1'].values, ['scaf0','strand0','dist1']].values
+            pairs[['oscaf1','ostrand1','odist0']] = origins.loc[pairs['oindex'].values, ['oscaf1','ostrand1','odist0']].values
+            new_pairs = new_pairs.merge(pairs.rename(columns={'eindex':'eindex2','oindex':'oindex2'}), on=['eindex2','oscaf1','ostrand1','odist0'], how='inner').drop(columns=['oscaf1','ostrand1','odist0'])
+            pairs.drop(columns=['oscaf1','ostrand1','odist0'], inplace=True)
+            new_pairs = new_pairs.merge(perfect_ocont, on=['oindex2'], how='inner')
+            new_pairs.drop(columns=['eindex2','oindex2'], inplace=True)
+            new_pairs.drop_duplicates(inplace=True)
+            #Add them to pairs if they are not already present
+            new_pairs.rename(columns={'eindex1':'eindex','oindex1':'oindex'}, inplace=True)
+            new_pairs = new_pairs.merge(new_pairs.rename(columns={'oindex':'eindex','eindex':'oindex'}), on=['oindex','eindex'], how='outer')
+            old_len = len(pairs)
+            pairs = pairs.merge(new_pairs, on=['oindex','eindex'], how='outer')
+            pairs.sort_values(['oindex','eindex'], inplace=True)
+            if old_len == len(pairs):
+                break
+        # Get continuations of origins to reduce computations later
+        ocont = []
+        missing_cont = pairs[['oindex']].rename(columns={'oindex':'oindex1'}) # All origins that have an extension must have a following origin in the direction of extension
+        missing_cont[['nscaf','nstrand','ndist']] = extensions.loc[pairs['eindex'].values, ['scaf1','strand1','dist1']].values
+        missing_cont[['nscaf','ndist']] = missing_cont[['nscaf','ndist']].astype(int)
+        missing_cont.drop_duplicates(inplace=True)
+        if len(missing_cont):
+            for cut in range(origins['olength'].max()-1): # If we do not find a following origin for a given origin look for the longest match by cutting away scaffolds
+                for l in np.unique(origins.loc[origins['olength'] > cut+1, 'olength'].values):
+                    cur = origins[origins['olength'] == l].reset_index()
+                    cur.rename(columns={**{'index':'oindex2','scaf0':'nscaf','strand0':'nstrand','odist0':'ndist'}, **{f'{n}{s}':f'{n}{s-1}' for s in range(1,l-cut) for n in ['oscaf','ostrand','odist']}}, inplace=True)
+                    cur.rename(columns={'oscaf0':'scaf0','ostrand0':'strand0'}, inplace=True)
+                    cur.drop(columns=['olength'] + [f'{n}{s}' for s in range(l-cut,l) for n in ['oscaf','ostrand']] + [f'odist{s}' for s in range(l-cut,l-1)], inplace=True)
+                    cur = RemoveEmptyColumns(cur)
+                    mcols = ['scaf0','strand0'] + [f'{n}{s}' for s in range(1,l-cut-1) for n in ['oscaf','ostrand']] + [f'odist{s}' for s in range(l-cut-2)]
+                    cur = cur.merge(origins.loc[np.isin(origins.index.values, np.unique(missing_cont['oindex1'])), mcols].reset_index().rename(columns={'index':'oindex1'}), on=mcols, how='inner').drop(columns=mcols)
+                    if cut > 0:
+                        cur = cur.merge(missing_cont, on=['oindex1','nscaf','nstrand','ndist'], how='inner') # Do not use this for perfect matches, because sometimes an extension gets lost due to the simplification from all reads to the scaffold_graph
+                    cur['matches'] = l-cut
+                    ocont.append(cur)
+                if cut == 0:
+                    # no cut means we have perfect matches, so we cannot improve on them anymore, so remove them from missing cont (For other cut values, we might cut away more from a longer origin and still achieve more matches, thus we cannnot only use it for perfect matches)
+                    ocont = pd.concat(ocont, ignore_index=True)
+                    mcols = ['oindex1','nscaf','nstrand','ndist']
+                    missing_cont = missing_cont[ missing_cont.merge(ocont[mcols].drop_duplicates(), on=mcols, how='left', indicator=True)['_merge'].values == "left_only" ].copy()
+                    perfect_ocont = ocont.drop(columns=['matches','nscaf','nstrand','ndist'])
+                    ocont = [ ocont ]
+        if len(ocont):
+            ocont = pd.concat(ocont, ignore_index=True)[['oindex1','oindex2','nscaf','nstrand','ndist','matches']]
+            mcols = ['oindex1','nscaf','nstrand','ndist']
+            ocont = ocont[ocont['matches'] == ocont[mcols].merge(ocont.groupby(mcols)['matches'].max().reset_index(), on=mcols, how='left')['matches'].values].copy()
+            ocont.drop(columns=['matches'], inplace=True)
+            ocont.sort_values(['oindex1','oindex2'], inplace=True)
+        else:
+            ocont = pd.DataFrame({'oindex1':[],'oindex2':[],'nscaf':[],'nstrand':[],'ndist':[]})
     # Combine it into one dictionary for easier passing as parameter
     graph_ext = {}
     graph_ext['org'] = origins
@@ -2655,78 +2678,92 @@ def FollowUniquePathsThroughGraph(graph_ext):
     origins = graph_ext['org']
     extensions = graph_ext['ext']
     pairs = graph_ext['pairs'].copy()
-    pairs[['oscaf1','ostrand1','scaf0','strand0','odist0']] = origins.loc[pairs['oindex'], ['oscaf1','ostrand1','scaf0','strand0','odist0']].values
-    pairs[['scaf1','strand1','dist1']] = extensions.loc[pairs['eindex'], ['scaf1','strand1','dist1']].values
-    pairs[['oscaf1','scaf0','odist0','scaf1','dist1']] = pairs[['oscaf1','scaf0','odist0','scaf1','dist1']].astype(int)
-    # Group pairs that share origins/extensions
-    pairs['group'] = np.minimum(pairs['oindex'],pairs['eindex'])
-    while True:
-        pairs['min_group'] = np.minimum( pairs[['oindex']].merge(pairs.groupby(['oindex'])['group'].min().reset_index(), on=['oindex'], how='left')['group'].values,
-                                         pairs[['eindex']].merge(pairs.groupby(['eindex'])['group'].min().reset_index(), on=['eindex'], how='left')['group'].values )
-        pairs['new_group'] = pairs[['group']].merge(pairs.groupby(['group'])['min_group'].min().reset_index(), on=['group'], how='left')['min_group'].values
-        if np.sum(pairs['group'] != pairs['new_group']) == 0:
-            break
+    if len(pairs) == 0:
+        path_ext = []
+    else:
+        pairs[['oscaf1','ostrand1','scaf0','strand0','odist0']] = origins.loc[pairs['oindex'], ['oscaf1','ostrand1','scaf0','strand0','odist0']].values
+        pairs[['scaf1','strand1','dist1']] = extensions.loc[pairs['eindex'], ['scaf1','strand1','dist1']].values
+        pairs[['oscaf1','scaf0','odist0','scaf1','dist1']] = pairs[['oscaf1','scaf0','odist0','scaf1','dist1']].astype(int)
+        # Group pairs that share origins/extensions
+        pairs['group'] = np.minimum(pairs['oindex'],pairs['eindex'])
+        while True:
+            pairs['min_group'] = np.minimum( pairs[['oindex']].merge(pairs.groupby(['oindex'])['group'].min().reset_index(), on=['oindex'], how='left')['group'].values,
+                                             pairs[['eindex']].merge(pairs.groupby(['eindex'])['group'].min().reset_index(), on=['eindex'], how='left')['group'].values )
+            pairs['new_group'] = pairs[['group']].merge(pairs.groupby(['group'])['min_group'].min().reset_index(), on=['group'], how='left')['min_group'].values
+            if np.sum(pairs['group'] != pairs['new_group']) == 0:
+                break
+            else:
+                pairs['group'] = pairs['new_group']
+        pairs.drop(columns=['min_group','new_group'], inplace=True)
+        # For path extension we can only use the "unique" origin-extension pairs in that sense that all grouped pairs connect the same first scaffold in the origin with the same first scaffold in the extension
+        alternatives = pairs[['group','strand0','oscaf1','ostrand1','odist0','scaf1','strand1','dist1']].drop_duplicates().groupby(['group','strand0']).size().reset_index(name='alternatives')
+        alternatives = alternatives.groupby(['group'])['alternatives'].max().reset_index()
+        path_ext = pairs[['oindex','scaf1','strand1','dist1','group','strand0']].drop_duplicates().merge(alternatives.loc[alternatives['alternatives'] == 1, ['group']], on=['group'], how='inner')
+    if len(path_ext):
+        # Check if a group can be extended even further
+        ocont = graph_ext['ocont']
+        if len(ocont):
+            path_ext.rename(columns={'strand0':'strand','scaf1':'nscaf','strand1':'nstrand','dist1':'ndist'}, inplace=True)
+            path_ext = path_ext.merge(ocont[np.isin(ocont['oindex2'], path_ext['oindex'].values)].rename(columns={'oindex1':'oindex'}), on=['oindex','nscaf','nstrand','ndist'], how='left')
         else:
-            pairs['group'] = pairs['new_group']
-    pairs.drop(columns=['min_group','new_group'], inplace=True)
-    # For path extension we can only use the "unique" origin-extension pairs in that sense that all grouped pairs connect the same first scaffold in the origin with the same first scaffold in the extension
-    alternatives = pairs[['group','strand0','oscaf1','ostrand1','odist0','scaf1','strand1','dist1']].drop_duplicates().groupby(['group','strand0']).size().reset_index(name='alternatives')
-    alternatives = alternatives.groupby(['group'])['alternatives'].max().reset_index()
-    path_ext = pairs[['oindex','scaf1','strand1','dist1','group','strand0']].drop_duplicates().merge(alternatives.loc[alternatives['alternatives'] == 1, ['group']], on=['group'], how='inner')
-    # Check if a group can be extended even further
-    ocont = graph_ext['ocont']
-    path_ext.rename(columns={'strand0':'strand','scaf1':'nscaf','strand1':'nstrand','dist1':'ndist'}, inplace=True)
-    path_ext = path_ext.merge(ocont[np.isin(ocont['oindex2'], path_ext['oindex'].values)].rename(columns={'oindex1':'oindex'}), on=['oindex','nscaf','nstrand','ndist'], how='left')
-    # Make sure extensions in groups are consistent (if one cannot extend, all others are also not allowed to extend)
-    inconsistency = path_ext.groupby(['group','strand'])['oindex2'].agg(['size','count'])
-    inconsistency = inconsistency[(inconsistency['count'] != 0) & (inconsistency['count'] != inconsistency['size'])].reset_index()[['group','strand']]
-    other_side = path_ext[['group','strand','oindex2']].merge(inconsistency, on=['group','strand'], how='inner')[['oindex2']].rename(columns={'oindex2':'oindex'}).merge(path_ext[['group','strand','oindex']])[['group','strand']].drop_duplicates()
-    other_side['strand'] = np.where(other_side['strand'] == '+', '-', '+')
-    path_ext.loc[ path_ext[['group','strand']].merge(pd.concat([inconsistency, other_side], ignore_index=True).drop_duplicates(), on=['group','strand'], how='left', indicator=True)['_merge'].values == "both" , 'oindex2'] = np.nan
-    # Prevent separate path from merging into one
-    inconsistency = path_ext.loc[np.isnan(path_ext['oindex2']) == False, ['group','strand','oindex2']].rename(columns={'oindex2':'oindex'}).merge(path_ext[['oindex','group','strand']].rename(columns={'group':'ngroup','strand':'nstrand'}), on='oindex', how='left')
-    inconsistency.drop(columns='oindex', inplace=True)
-    inconsistency.drop_duplicates(inplace=True)
-    inconsistency['nalt'] = inconsistency[['ngroup','nstrand']].merge( inconsistency.groupby(['ngroup','nstrand']).size().reset_index(name='nalt'), on=['ngroup','nstrand'], how='left')['nalt'].values
-    inconsistency = inconsistency.loc[inconsistency['nalt'] > 1].drop(columns='nalt')
-    inconsistency['nstrand'] = np.where(inconsistency['nstrand'] == '+', '-', '+') # For the next group we need to block extension in the other direction, because their origins are duplicated not their extensions
-    inconsistency = pd.concat([ inconsistency[['group','strand']], inconsistency[['ngroup','nstrand']].rename(columns={'ngroup':'group', 'nstrand':'strand'}) ], ignore_index=True).drop_duplicates()
-    path_ext.loc[ path_ext[['group','strand']].merge(inconsistency, on=['group','strand'], how='left', indicator=True)['_merge'].values == "both" , 'oindex2'] = np.nan
-    # Find the path ends to start from there (starting on both sides will duplicate all paths, but is less effort then linearly going through all the paths to prevent this)
-    path_ends = path_ext.groupby(['group','strand'])['oindex2'].agg(['count']).reset_index()
-    path_ends = path_ends[path_ends['count'] == 0].drop(columns=['count'])
-    path_ends['strand'] = np.where(path_ends['strand'] == '+', '-', '+') # Reverse the direction of the ends to point in the direction that is not ending
-    path_ends = pairs.drop(columns=['oindex','eindex']).drop_duplicates().merge(path_ends.rename(columns={'strand':'strand0'}), on=['group','strand0'], how='inner')
+            path_ext['oindex2'] = np.nan
+        # Make sure extensions in groups are consistent (if one cannot extend, all others are also not allowed to extend)
+        inconsistency = path_ext.groupby(['group','strand'])['oindex2'].agg(['size','count'])
+        inconsistency = inconsistency[(inconsistency['count'] != 0) & (inconsistency['count'] != inconsistency['size'])].reset_index()[['group','strand']]
+        other_side = path_ext[['group','strand','oindex2']].merge(inconsistency, on=['group','strand'], how='inner')[['oindex2']].rename(columns={'oindex2':'oindex'}).merge(path_ext[['group','strand','oindex']])[['group','strand']].drop_duplicates()
+        other_side['strand'] = np.where(other_side['strand'] == '+', '-', '+')
+        path_ext.loc[ path_ext[['group','strand']].merge(pd.concat([inconsistency, other_side], ignore_index=True).drop_duplicates(), on=['group','strand'], how='left', indicator=True)['_merge'].values == "both" , 'oindex2'] = np.nan
+    if len(path_ext):
+        # Prevent separate path from merging into one
+        inconsistency = path_ext.loc[np.isnan(path_ext['oindex2']) == False, ['group','strand','oindex2']].rename(columns={'oindex2':'oindex'}).merge(path_ext[['oindex','group','strand']].rename(columns={'group':'ngroup','strand':'nstrand'}), on='oindex', how='left')
+        inconsistency.drop(columns='oindex', inplace=True)
+        inconsistency.drop_duplicates(inplace=True)
+        inconsistency['nalt'] = inconsistency[['ngroup','nstrand']].merge( inconsistency.groupby(['ngroup','nstrand']).size().reset_index(name='nalt'), on=['ngroup','nstrand'], how='left')['nalt'].values
+        inconsistency = inconsistency.loc[inconsistency['nalt'] > 1].drop(columns='nalt')
+        inconsistency['nstrand'] = np.where(inconsistency['nstrand'] == '+', '-', '+') # For the next group we need to block extension in the other direction, because their origins are duplicated not their extensions
+        inconsistency = pd.concat([ inconsistency[['group','strand']], inconsistency[['ngroup','nstrand']].rename(columns={'ngroup':'group', 'nstrand':'strand'}) ], ignore_index=True).drop_duplicates()
+        path_ext.loc[ path_ext[['group','strand']].merge(inconsistency, on=['group','strand'], how='left', indicator=True)['_merge'].values == "both" , 'oindex2'] = np.nan
+    if len(path_ext) == 0:
+        path_ends = []
+    else:
+        # Find the path ends to start from there (starting on both sides will duplicate all paths, but is less effort then linearly going through all the paths to prevent this)
+        path_ends = path_ext.groupby(['group','strand'])['oindex2'].agg(['count']).reset_index()
+        path_ends = path_ends[path_ends['count'] == 0].drop(columns=['count'])
+        path_ends['strand'] = np.where(path_ends['strand'] == '+', '-', '+') # Reverse the direction of the ends to point in the direction that is not ending
+        path_ends = pairs.drop(columns=['oindex','eindex']).drop_duplicates().merge(path_ends.rename(columns={'strand':'strand0'}), on=['group','strand0'], how='inner')
     # Start all possible paths
-    path_ends['pid'] = np.arange(len(path_ends))
     scaffold_paths = []
-    scaffold_paths.append( path_ends[['pid','oscaf1','ostrand1']].rename(columns={'oscaf1':'scaf','ostrand1':'strand'}) )
-    scaffold_paths[-1].insert(1, 'pos', 0)
-    scaffold_paths[-1]['dist'] = 0
-    scaffold_paths.append( path_ends[['pid','scaf0','strand0','odist0']].rename(columns={'scaf0':'scaf','strand0':'strand','odist0':'dist'}) )
-    scaffold_paths[-1].insert(1, 'pos', 1)
-    scaffold_paths.append( path_ends[['pid','scaf1','strand1','dist1']].rename(columns={'scaf1':'scaf','strand1':'strand','dist1':'dist'}) )
-    scaffold_paths[-1].insert(1, 'pos', 2)
-    next_org = path_ext.merge( path_ends[['group','strand0','pid']].drop_duplicates().rename(columns={'strand0':'strand'}), on=['group','strand'], how='inner' )[['pid','oindex2']].drop_duplicates()
-    # Continue along all paths as long as supported
-    p = 3
-    while len(next_org):
-        # Remove the groups that do not have enough support to continue
-        test = next_org.groupby(['pid'])['oindex2'].agg(['size','count']).reset_index()
-        next_org = next_org[np.isin(next_org['pid'], test.loc[test['size'] == test['count'], 'pid'].values)].copy()
-        if len(next_org):
-            # Add the next scaffold to scaffold_paths
-            cur_ext = path_ext.merge(next_org.rename(columns={'oindex2':'oindex'}), on='oindex', how='inner')
-            scaffold_paths.append( cur_ext[['pid','nscaf','nstrand','ndist']].drop_duplicates().rename(columns={'nscaf':'scaf','nstrand':'strand','ndist':'dist'}) )
-            scaffold_paths[-1].insert(1, 'pos', p)
-            p += 1
-            # Find next origins to continue
-            next_org = path_ext[['group','strand','oindex2']].merge( cur_ext[['group','strand','pid']].drop_duplicates(), on=['group','strand'], how='inner' )[['pid','oindex2']].drop_duplicates()
-    # Finalize paths
-    scaffold_paths = pd.concat(scaffold_paths, ignore_index=True)
-    scaffold_paths.rename(columns={'scaf':'scaf0','strand':'strand0','dist':'dist0'}, inplace=True)
-    scaffold_paths.sort_values(['pid','pos'], inplace=True)
-    handled_origins = np.sort(path_ext['oindex'].values)
+    if len(path_ends):
+        path_ends['pid'] = np.arange(len(path_ends))
+        scaffold_paths.append( path_ends[['pid','oscaf1','ostrand1']].rename(columns={'oscaf1':'scaf','ostrand1':'strand'}) )
+        scaffold_paths[-1].insert(1, 'pos', 0)
+        scaffold_paths[-1]['dist'] = 0
+        scaffold_paths.append( path_ends[['pid','scaf0','strand0','odist0']].rename(columns={'scaf0':'scaf','strand0':'strand','odist0':'dist'}) )
+        scaffold_paths[-1].insert(1, 'pos', 1)
+        scaffold_paths.append( path_ends[['pid','scaf1','strand1','dist1']].rename(columns={'scaf1':'scaf','strand1':'strand','dist1':'dist'}) )
+        scaffold_paths[-1].insert(1, 'pos', 2)
+        next_org = path_ext.merge( path_ends[['group','strand0','pid']].drop_duplicates().rename(columns={'strand0':'strand'}), on=['group','strand'], how='inner' )[['pid','oindex2']].drop_duplicates()
+        # Continue along all paths as long as supported
+        p = 3
+        while len(next_org):
+            # Remove the groups that do not have enough support to continue
+            test = next_org.groupby(['pid'])['oindex2'].agg(['size','count']).reset_index()
+            next_org = next_org[np.isin(next_org['pid'], test.loc[test['size'] == test['count'], 'pid'].values)].copy()
+            if len(next_org):
+                # Add the next scaffold to scaffold_paths
+                cur_ext = path_ext.merge(next_org.rename(columns={'oindex2':'oindex'}), on='oindex', how='inner')
+                scaffold_paths.append( cur_ext[['pid','nscaf','nstrand','ndist']].drop_duplicates().rename(columns={'nscaf':'scaf','nstrand':'strand','ndist':'dist'}) )
+                scaffold_paths[-1].insert(1, 'pos', p)
+                p += 1
+                # Find next origins to continue
+                next_org = path_ext[['group','strand','oindex2']].merge( cur_ext[['group','strand','pid']].drop_duplicates(), on=['group','strand'], how='inner' )[['pid','oindex2']].drop_duplicates()
+        # Finalize paths
+        scaffold_paths = pd.concat(scaffold_paths, ignore_index=True)
+        scaffold_paths.rename(columns={'scaf':'scaf0','strand':'strand0','dist':'dist0'}, inplace=True)
+        scaffold_paths.sort_values(['pid','pos'], inplace=True)
+        handled_origins = np.sort(path_ext['oindex'].values)
+    else:
+        handled_origins = []
 #
     return scaffold_paths, handled_origins
 
@@ -4099,14 +4136,19 @@ def AddUntraversedConnectedPaths(scaffold_paths, graph_ext, handled_origins, han
 
 def AddUnconnectedPaths(scaffold_paths, scaffolds, scaffold_graph):
     # All the scaffolds that are not in scaffold_graph, because they do not have connections are inserted as their own knot
-    unconn_path = scaffolds[['scaffold']].rename(columns={'scaffold':'scaf0'}).merge(scaffold_graph[['from']].rename(columns={'from':'scaf0'}), on=['scaf0'], how='left', indicator=True)
-    unconn_path = unconn_path.loc[unconn_path['_merge'] == "left_only", ['scaf0']].copy()
+    unconn_path = scaffolds[['scaffold']].rename(columns={'scaffold':'scaf0'})
+    if len(scaffold_graph):
+        unconn_path = unconn_path[ unconn_path.merge(scaffold_graph[['from']].drop_duplicates().rename(columns={'from':'scaf0'}), on=['scaf0'], how='left', indicator=True)['_merge'].values == "left_only" ].copy()
     unconn_path['strand0'] = '+'
     unconn_path['dist0'] = 0
-    unconn_path['pid'] = np.arange(len(unconn_path)) + 1 + scaffold_paths['pid'].max()
+    unconn_path['pid'] = np.arange(len(unconn_path)) + 1 + (scaffold_paths['pid'].max() if len(scaffold_paths) else 0)
     unconn_path['pos'] = 0
+    unconn_path = unconn_path[['pid','pos','scaf0','strand0','dist0']].copy()
 
-    scaffold_paths = pd.concat([scaffold_paths, unconn_path[['pid','pos','scaf0','strand0','dist0']]], ignore_index=True)
+    if len(scaffold_paths):
+        scaffold_paths = pd.concat([scaffold_paths, unconn_path], ignore_index=True)
+    else:
+        scaffold_paths = unconn_path
 
     return scaffold_paths
 
@@ -6307,67 +6349,70 @@ def CombineOnMatchingExtensions(scaffold_paths, graph_ext, scaffold_graph, scaf_
         cols = ['length']+[f'{n}{s}' for s in range(1,graph_ext['ext']['length'].max()) for n in ['scaf','strand','dist']]
         extensions[cols] = graph_ext['ext'].loc[extensions['eindex'].values, cols].values
         extensions.sort_values(['apid','aside'], inplace=True)
-        # Get consistent part of extensions
-        con_ext = extensions.groupby(['apid','aside'], sort=False)['length'].min().reset_index()
-        con_ext.rename(columns={'length':'max_len'}, inplace=True) # This is the maximum length it can be consistent (cannot be longer consistent as the shortest extension is long)
-        con_ext['max_len'] = np.minimum( con_ext['max_len'], con_ext[['apid','aside']].merge(extendable_sides, on=['apid','aside'], how='left')['max_len'].values ) # Only allow to extend as long as a single read spans it starting from the unextended path end
-        con_ext['len'] = 1
-        for s in range(1,con_ext['max_len'].max()):
-            cur_ext = extensions[['apid','aside',f'scaf{s}',f'strand{s}',f'dist{s}']].drop_duplicates()
-            cur_ext = cur_ext[((cur_ext[['apid','aside']] == cur_ext[['apid','aside']].shift(1)).all(axis=1) == False) & ((cur_ext[['apid','aside']] == cur_ext[['apid','aside']].shift(-1)).all(axis=1) == False)].copy()
-            if len(cur_ext) == 0:
-                con_ext = con_ext[con_ext['len'] > 1].copy()
-                break
-            else:
-                con_ext[[f'scaf{s}',f'strand{s}',f'dist{s}']] = con_ext[['apid','aside']].merge(cur_ext, on=['apid','aside'], how='left')[[f'scaf{s}',f'strand{s}',f'dist{s}']].values
-                con_ext[[f'scaf{s}',f'dist{s}']] = con_ext[[f'scaf{s}',f'dist{s}']].astype(float)
-                con_ext.loc[np.isnan(con_ext[f'scaf{s}']) == False, 'len'] += 1
-                if s==1:
-                    # Only keep the sides that have any consistent extension at all
+        if len(extensions) == 0:
+            extendable_sides = []
+        else:
+            # Get consistent part of extensions
+            con_ext = extensions.groupby(['apid','aside'], sort=False)['length'].min().reset_index()
+            con_ext.rename(columns={'length':'max_len'}, inplace=True) # This is the maximum length it can be consistent (cannot be longer consistent as the shortest extension is long)
+            con_ext['max_len'] = np.minimum( con_ext['max_len'], con_ext[['apid','aside']].merge(extendable_sides, on=['apid','aside'], how='left')['max_len'].values ) # Only allow to extend as long as a single read spans it starting from the unextended path end
+            con_ext['len'] = 1
+            for s in range(1,con_ext['max_len'].max()):
+                cur_ext = extensions[['apid','aside',f'scaf{s}',f'strand{s}',f'dist{s}']].drop_duplicates()
+                cur_ext = cur_ext[((cur_ext[['apid','aside']] == cur_ext[['apid','aside']].shift(1)).all(axis=1) == False) & ((cur_ext[['apid','aside']] == cur_ext[['apid','aside']].shift(-1)).all(axis=1) == False)].copy()
+                if len(cur_ext) == 0:
                     con_ext = con_ext[con_ext['len'] > 1].copy()
-                # Filter the extensions for next round
-                extensions = extensions.merge( cur_ext[['apid','aside']].merge(con_ext.loc[con_ext['max_len'] > s+1, ['apid','aside']], on=['apid','aside'], how='inner'), on=['apid','aside'], how='inner')
-                if len(extensions) == 0:
                     break
-        con_ext.drop(columns=['max_len'], inplace=True)
-        # Extend scaffold_paths by one scaffold in each direction according to con_ext (do not extend for more in a single iteration to make sure we do not miss any alternatives)
-        con_ext['phase'] = con_ext[['apid','aside']].merge(ext_phase, on=['apid','aside'], how='left')['phase'].values
-        if len(con_ext):
-            new_paths = []
-            if np.sum(con_ext['aside'] == 'l'):
-                cur_ext = con_ext[con_ext['aside'] == 'l'].copy()
-                # Enter the distance at first position
-                scaffold_paths['new_dist'] = scaffold_paths[['pid']].merge(cur_ext[['apid','dist1']].rename(columns={'apid':'pid'}), on='pid', how='left')['dist1'].values
-                scaffold_paths.loc[(scaffold_paths['pos'] == 0) & (np.isnan(scaffold_paths['new_dist']) == False), 'dist0'] = scaffold_paths.loc[(scaffold_paths['pos'] == 0) & (np.isnan(scaffold_paths['new_dist']) == False), 'new_dist'].astype(int).values
-                # Shift existing scaffolds to make space
-                scaffold_paths['pos'] += np.where(np.isnan(scaffold_paths['new_dist']), 0, 1)
-                scaffold_paths.drop(columns=['new_dist'], inplace=True)
-                # Prepare the new scaffolds on the left
-                new_paths = cur_ext[['apid','phase','scaf1','strand1']].rename(columns={'apid':'pid','phase':'phase0','scaf1':'scaf0','strand1':'strand0'})
-                new_paths['dist0'] = 0 # First scaffold in path always has dist 0 (if we later extend more to it, we will fix it then)
-                new_paths['pos'] = 0
-                # The left extensions need to be inverted
-                new_paths['strand0'] = np.where(new_paths['strand0'] == '+', '-', '+')
-                new_paths = [new_paths]
-            if np.sum(con_ext['aside'] == 'r'):
-                cur_ext = con_ext[con_ext['aside'] == 'r'].copy()
-                # Get position in path for extensions
-                cur_ext['pos'] = cur_ext[['apid']].rename(columns={'apid':'pid'}).merge(scaffold_paths.groupby(['pid'])['pos'].max().reset_index(), on='pid', how='left')['pos'].values + 1
-                # Prepare the new scaffolds on the right
-                new_paths.append( cur_ext[['apid','pos','phase','scaf1','strand1','dist1']].rename(columns={'apid':'pid','phase':'phase0','scaf1':'scaf0','strand1':'strand0','dist1':'dist0'}) )
-            # Add missing columns and convert to int
-            new_paths = pd.concat(new_paths, ignore_index=True)
-            for h in range(1, ploidy):
-                new_paths[f'phase{h}'] = -new_paths['phase0']
-                new_paths[[f'scaf{h}',f'strand{h}',f'dist{h}']] = [-1, '', 0]
-            new_paths[[f'{n}{h}' for h in range(ploidy) for n in ['scaf','dist']]] = new_paths[[f'{n}{h}' for h in range(ploidy) for n in ['scaf','dist']]].astype(int).values
-            # Join new_paths with scaffold_paths
-            scaffold_paths = pd.concat([scaffold_paths, new_paths], ignore_index=True)
-            scaffold_paths.sort_values(['pid','pos'], inplace=True)
-        # Next round we only need to look for extensions for sides that could be extended this round and we keep track here how long it is allowed to be extended so we do not exceed the reach of the longest read starting from the unextended paths
-        extendable_sides = con_ext[['apid','aside','len']].rename(columns={'len':'max_len'})
-        extendable_sides['max_len'] -= 1
-        extendable_sides = extendable_sides[extendable_sides['max_len'] > 1].copy() # Remove unextendible ones already here
+                else:
+                    con_ext[[f'scaf{s}',f'strand{s}',f'dist{s}']] = con_ext[['apid','aside']].merge(cur_ext, on=['apid','aside'], how='left')[[f'scaf{s}',f'strand{s}',f'dist{s}']].values
+                    con_ext[[f'scaf{s}',f'dist{s}']] = con_ext[[f'scaf{s}',f'dist{s}']].astype(float)
+                    con_ext.loc[np.isnan(con_ext[f'scaf{s}']) == False, 'len'] += 1
+                    if s==1:
+                        # Only keep the sides that have any consistent extension at all
+                        con_ext = con_ext[con_ext['len'] > 1].copy()
+                    # Filter the extensions for next round
+                    extensions = extensions.merge( cur_ext[['apid','aside']].merge(con_ext.loc[con_ext['max_len'] > s+1, ['apid','aside']], on=['apid','aside'], how='inner'), on=['apid','aside'], how='inner')
+                    if len(extensions) == 0:
+                        break
+            con_ext.drop(columns=['max_len'], inplace=True)
+            # Extend scaffold_paths by one scaffold in each direction according to con_ext (do not extend for more in a single iteration to make sure we do not miss any alternatives)
+            con_ext['phase'] = con_ext[['apid','aside']].merge(ext_phase, on=['apid','aside'], how='left')['phase'].values
+            if len(con_ext):
+                new_paths = []
+                if np.sum(con_ext['aside'] == 'l'):
+                    cur_ext = con_ext[con_ext['aside'] == 'l'].copy()
+                    # Enter the distance at first position
+                    scaffold_paths['new_dist'] = scaffold_paths[['pid']].merge(cur_ext[['apid','dist1']].rename(columns={'apid':'pid'}), on='pid', how='left')['dist1'].values
+                    scaffold_paths.loc[(scaffold_paths['pos'] == 0) & (np.isnan(scaffold_paths['new_dist']) == False), 'dist0'] = scaffold_paths.loc[(scaffold_paths['pos'] == 0) & (np.isnan(scaffold_paths['new_dist']) == False), 'new_dist'].astype(int).values
+                    # Shift existing scaffolds to make space
+                    scaffold_paths['pos'] += np.where(np.isnan(scaffold_paths['new_dist']), 0, 1)
+                    scaffold_paths.drop(columns=['new_dist'], inplace=True)
+                    # Prepare the new scaffolds on the left
+                    new_paths = cur_ext[['apid','phase','scaf1','strand1']].rename(columns={'apid':'pid','phase':'phase0','scaf1':'scaf0','strand1':'strand0'})
+                    new_paths['dist0'] = 0 # First scaffold in path always has dist 0 (if we later extend more to it, we will fix it then)
+                    new_paths['pos'] = 0
+                    # The left extensions need to be inverted
+                    new_paths['strand0'] = np.where(new_paths['strand0'] == '+', '-', '+')
+                    new_paths = [new_paths]
+                if np.sum(con_ext['aside'] == 'r'):
+                    cur_ext = con_ext[con_ext['aside'] == 'r'].copy()
+                    # Get position in path for extensions
+                    cur_ext['pos'] = cur_ext[['apid']].rename(columns={'apid':'pid'}).merge(scaffold_paths.groupby(['pid'])['pos'].max().reset_index(), on='pid', how='left')['pos'].values + 1
+                    # Prepare the new scaffolds on the right
+                    new_paths.append( cur_ext[['apid','pos','phase','scaf1','strand1','dist1']].rename(columns={'apid':'pid','phase':'phase0','scaf1':'scaf0','strand1':'strand0','dist1':'dist0'}) )
+                # Add missing columns and convert to int
+                new_paths = pd.concat(new_paths, ignore_index=True)
+                for h in range(1, ploidy):
+                    new_paths[f'phase{h}'] = -new_paths['phase0']
+                    new_paths[[f'scaf{h}',f'strand{h}',f'dist{h}']] = [-1, '', 0]
+                new_paths[[f'{n}{h}' for h in range(ploidy) for n in ['scaf','dist']]] = new_paths[[f'{n}{h}' for h in range(ploidy) for n in ['scaf','dist']]].astype(int).values
+                # Join new_paths with scaffold_paths
+                scaffold_paths = pd.concat([scaffold_paths, new_paths], ignore_index=True)
+                scaffold_paths.sort_values(['pid','pos'], inplace=True)
+            # Next round we only need to look for extensions for sides that could be extended this round and we keep track here how long it is allowed to be extended so we do not exceed the reach of the longest read starting from the unextended paths
+            extendable_sides = con_ext[['apid','aside','len']].rename(columns={'len':'max_len'})
+            extendable_sides['max_len'] -= 1
+            extendable_sides = extendable_sides[extendable_sides['max_len'] > 1].copy() # Remove unextendible ones already here
     # Remove duplicates and try to combine paths
     scaffold_paths = RemoveDuplicates(scaffold_paths, True, ploidy)
     scaffold_paths = CombinePathOnUniqueOverlap(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges, ploidy)
@@ -6567,10 +6612,11 @@ def TestPrint(scaffold_paths):
 
 def TraverseScaffoldGraph(scaffolds, scaffold_graph, graph_ext, scaf_bridges, org_scaf_conns, ploidy, max_loop_units):
     # Get phased haplotypes
-    scaffold_paths, handled_origins = FollowUniquePathsThroughGraph(graph_ext)
-    scaffold_paths, handled_scaf_conns = AddPathThroughLoops(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges, org_scaf_conns, ploidy, max_loop_units)
-    scaffold_paths, handled_scaf_conns = AddPathThroughInvertedRepeats(scaffold_paths, handled_scaf_conns, scaffold_graph, scaf_bridges, ploidy)
-    scaffold_paths = AddUntraversedConnectedPaths(scaffold_paths, graph_ext, handled_origins, handled_scaf_conns)
+    if len(scaffold_graph):
+        scaffold_paths, handled_origins = FollowUniquePathsThroughGraph(graph_ext)
+        scaffold_paths, handled_scaf_conns = AddPathThroughLoops(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges, org_scaf_conns, ploidy, max_loop_units)
+        scaffold_paths, handled_scaf_conns = AddPathThroughInvertedRepeats(scaffold_paths, handled_scaf_conns, scaffold_graph, scaf_bridges, ploidy)
+        scaffold_paths = AddUntraversedConnectedPaths(scaffold_paths, graph_ext, handled_origins, handled_scaf_conns)
     scaffold_paths = AddUnconnectedPaths(scaffold_paths, scaffolds, scaffold_graph)
 #
     # Turn them into full path with ploidy
@@ -6581,56 +6627,58 @@ def TraverseScaffoldGraph(scaffolds, scaffold_graph, graph_ext, scaf_bridges, or
         scaffold_paths[f'strand{h}'] = ''
         scaffold_paths[f'dist{h}'] = 0
     CheckScaffoldPathsConsistency(scaffold_paths)
-    CheckIfScaffoldPathsFollowsValidBridges(scaffold_paths, scaf_bridges, ploidy)
+    if len(scaf_bridges):
+        CheckIfScaffoldPathsFollowsValidBridges(scaffold_paths, scaf_bridges, ploidy)
 #
     # Combine paths as much as possible
-    print("Start")
-    print(len(np.unique(scaffold_paths['pid'].values)))
-    TestPrint(scaffold_paths)
-    old_nscaf = 0
-    for i in range(3):
-        n = 1
-        while old_nscaf != len(np.unique(scaffold_paths['pid'].values)):
-            time0 = process_time()
-            print(f"Iteration {n}")
-            n+=1
-             # First Merge then Combine to not accidentially merge a haplotype, where the other haplotype of the paths is not compatible and thus joining wrong paths
-            scaffold_paths = MergeHaplotypes(scaffold_paths, graph_ext, scaf_bridges, ploidy)
-            time1 = process_time()
-            print(str(timedelta(seconds=time1-time0)), len(np.unique(scaffold_paths['pid'].values)))
-            TestPrint(scaffold_paths)
-            old_nscaf = len(np.unique(scaffold_paths['pid'].values))
-            scaffold_paths = CombinePathOnUniqueOverlap(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges, ploidy)
-            print(str(timedelta(seconds=process_time()-time1)), len(np.unique(scaffold_paths['pid'].values)))
-            TestPrint(scaffold_paths)
-            CheckScaffoldPathsConsistency(scaffold_paths)
-            CheckIfScaffoldPathsFollowsValidBridges(scaffold_paths, scaf_bridges, ploidy)
-        if i==0:
-            print("RemoveDuplicates")
-            scaffold_paths = RemoveDuplicates(scaffold_paths, True, ploidy)
-        elif i==1:
-            print("PlaceUnambigouslyPlaceables")
-            scaffold_paths = PlaceUnambigouslyPlaceablePathsAsAlternativeHaplotypes(scaffold_paths, graph_ext, scaffold_graph, scaf_bridges, ploidy)
-            scaffold_paths = RemoveNearlyDuplicatedPaths(scaffold_paths, ploidy)
-        if i != 2:
-            print(len(np.unique(scaffold_paths['pid'].values)))
-            TestPrint(scaffold_paths)
-            CheckScaffoldPathsConsistency(scaffold_paths)
-            CheckIfScaffoldPathsFollowsValidBridges(scaffold_paths, scaf_bridges, ploidy)
-    print("CombineOnMatchingExtensions")
-    scaffold_paths = CombineOnMatchingExtensions(scaffold_paths, graph_ext, scaffold_graph, scaf_bridges, ploidy)
-    print(len(np.unique(scaffold_paths['pid'].values)))
-    TestPrint(scaffold_paths)
-    print("TrimAmbiguousOverlap")
-    scaffold_paths = TrimAmbiguousOverlap(scaffold_paths, scaffold_graph, ploidy)
-    print(len(np.unique(scaffold_paths['pid'].values)))
-    TestPrint(scaffold_paths)
-    print("TrimCircularPaths")
-    scaffold_paths = TrimCircularPaths(scaffold_paths, ploidy)
-    print(len(np.unique(scaffold_paths['pid'].values)))
-    TestPrint(scaffold_paths)
-    CheckScaffoldPathsConsistency(scaffold_paths)
-    CheckIfScaffoldPathsFollowsValidBridges(scaffold_paths, scaf_bridges, ploidy)
+    if len(scaffold_graph):
+        print("Start")
+        print(len(np.unique(scaffold_paths['pid'].values)))
+        TestPrint(scaffold_paths)
+        old_nscaf = 0
+        for i in range(3):
+            n = 1
+            while old_nscaf != len(np.unique(scaffold_paths['pid'].values)):
+                time0 = process_time()
+                print(f"Iteration {n}")
+                n+=1
+                 # First Merge then Combine to not accidentially merge a haplotype, where the other haplotype of the paths is not compatible and thus joining wrong paths
+                scaffold_paths = MergeHaplotypes(scaffold_paths, graph_ext, scaf_bridges, ploidy)
+                time1 = process_time()
+                print(str(timedelta(seconds=time1-time0)), len(np.unique(scaffold_paths['pid'].values)))
+                TestPrint(scaffold_paths)
+                old_nscaf = len(np.unique(scaffold_paths['pid'].values))
+                scaffold_paths = CombinePathOnUniqueOverlap(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges, ploidy)
+                print(str(timedelta(seconds=process_time()-time1)), len(np.unique(scaffold_paths['pid'].values)))
+                TestPrint(scaffold_paths)
+                CheckScaffoldPathsConsistency(scaffold_paths)
+                CheckIfScaffoldPathsFollowsValidBridges(scaffold_paths, scaf_bridges, ploidy)
+            if i==0:
+                print("RemoveDuplicates")
+                scaffold_paths = RemoveDuplicates(scaffold_paths, True, ploidy)
+            elif i==1:
+                print("PlaceUnambigouslyPlaceables")
+                scaffold_paths = PlaceUnambigouslyPlaceablePathsAsAlternativeHaplotypes(scaffold_paths, graph_ext, scaffold_graph, scaf_bridges, ploidy)
+                scaffold_paths = RemoveNearlyDuplicatedPaths(scaffold_paths, ploidy)
+            if i != 2:
+                print(len(np.unique(scaffold_paths['pid'].values)))
+                TestPrint(scaffold_paths)
+                CheckScaffoldPathsConsistency(scaffold_paths)
+                CheckIfScaffoldPathsFollowsValidBridges(scaffold_paths, scaf_bridges, ploidy)
+        print("CombineOnMatchingExtensions")
+        scaffold_paths = CombineOnMatchingExtensions(scaffold_paths, graph_ext, scaffold_graph, scaf_bridges, ploidy)
+        print(len(np.unique(scaffold_paths['pid'].values)))
+        TestPrint(scaffold_paths)
+        print("TrimAmbiguousOverlap")
+        scaffold_paths = TrimAmbiguousOverlap(scaffold_paths, scaffold_graph, ploidy)
+        print(len(np.unique(scaffold_paths['pid'].values)))
+        TestPrint(scaffold_paths)
+        print("TrimCircularPaths")
+        scaffold_paths = TrimCircularPaths(scaffold_paths, ploidy)
+        print(len(np.unique(scaffold_paths['pid'].values)))
+        TestPrint(scaffold_paths)
+        CheckScaffoldPathsConsistency(scaffold_paths)
+        CheckIfScaffoldPathsFollowsValidBridges(scaffold_paths, scaf_bridges, ploidy)
 
     return scaffold_paths
 
@@ -6904,8 +6952,10 @@ def PhaseScaffolds(scaffold_paths, graph_ext, scaf_bridges, ploidy):
         scaffold_paths[f'phase{h}'] = np.sign(scaffold_paths[f'phase{h}']) * (scaffold_paths['new_phase'] * ploidy + 1 + h)
     scaffold_paths.drop(columns=['polyploid','new_phase'], inplace=True)
 #
-    scaffold_paths = PhaseScaffoldsWithScafBridges(scaffold_paths, scaf_bridges, ploidy)
-    scaffold_paths = PhaseScaffoldsWithScaffoldGraph(scaffold_paths, graph_ext, ploidy)
+    if len(scaf_bridges):
+        scaffold_paths = PhaseScaffoldsWithScafBridges(scaffold_paths, scaf_bridges, ploidy)
+        if len(graph_ext['org']):
+            scaffold_paths = PhaseScaffoldsWithScaffoldGraph(scaffold_paths, graph_ext, ploidy)
 #
     # Merge phases, where no other phase has a break
     while True:
@@ -7663,9 +7713,8 @@ def MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploi
 def CountResealedBreaks(result_info, scaffold_paths, contig_parts, ploidy):
     ## Get resealed breaks (Number of total contig_parts - minimum number of scaffold chunks needed to have them all included in the proper order)
     broken_contigs = contig_parts.reset_index().rename(columns={'index':'conpart'}).loc[(contig_parts['part'] > 0) | (contig_parts['part'].shift(-1) > 0), ['contig','part','conpart']]
-    if len(broken_contigs) == 0:
-        result_info['breaks']['resealed'] = 0
-    else:
+    result_info['breaks']['resealed'] = 0
+    if len(broken_contigs):
         # For this treat haplotypes as different scaffolds
         resealed_breaks = scaffold_paths.loc[np.repeat(scaffold_paths.index.values, ploidy), ['scaf','pos']+[f'{n}{h}' for h in range(ploidy) for n in ['phase','con','strand']]]
         if len(resealed_breaks):
