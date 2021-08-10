@@ -37,7 +37,7 @@ def GaplessSplit(fa_file,o_file=False,min_n=False):
         os.remove(o_file)
 
     with open(o_file, 'w') as fout:
-        with gzip.open(fa_file, 'rt') if 'gz' == fa_file.rsplit('.',1)[-1] else open(fa_file, 'rU') as fin:
+        with gzip.open(fa_file, 'rt') if 'gz' == fa_file.rsplit('.',1)[-1] else open(fa_file, 'r') as fin:
             for record in SeqIO.parse(fin, "fasta"):
                 # Split scaffolds into contigs
                 contigs=re.split('([nN]+)',str(record.seq))
@@ -2251,7 +2251,8 @@ def DisconnectRepeatedContigsWithConnectionsOnBothSides(scaffold_graph, scaf_rep
             accepted = dup_combs.groupby(['sindex1'])['del'].min().reset_index()
             accepted = accepted[accepted['del']].copy()
             found_dup = found_dup[np.isin(found_dup['sindex'], accepted['sindex1'].values)].copy()
-        dup_combs.drop(columns=['del'], inplace=True)
+        if len(found_dup):
+            dup_combs.drop(columns=['del'], inplace=True)
     if len(found_dup):
         # Remove indexes where the target index is definitely not removed and indexes grouping with them
         remindex = np.unique(found_dup.loc[np.isin(found_dup['tindex'], found_dup['sindex'].values) == False, 'sindex'].values)
@@ -3354,12 +3355,7 @@ def AddPathThroughLoops(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges,
                 loops.drop(cur['lindex2'].values, inplace=True)
                 loop_conns = loop_conns[loop_conns['append'] == False].copy()
                 loop_conns['new_index'] = loop_conns[['lindex1']].merge(cur[['lindex1','lindex2']].rename(columns={'lindex1':'new_index','lindex2':'lindex1'}), on=['lindex1'], how='left')['new_index'].values
-                try:
-                    loop_conns.loc[np.isnan(loop_conns['new_index']) == False, 'lindex1'] = loop_conns.loc[np.isnan(loop_conns['new_index']) == False, 'new_index'].astype(int)
-                except TypeError:
-                    print(loop_conns.dtypes)
-                    print(loop_conns)
-                    raise
+                loop_conns.loc[np.isnan(loop_conns['new_index']) == False, 'lindex1'] = loop_conns.loc[np.isnan(loop_conns['new_index']) == False, 'new_index'].astype(int)
         CheckConsistencyOfVerticalPaths(loops)
 #
     # Get exits for the repeats
@@ -3510,9 +3506,10 @@ def AddPathThroughLoops(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges,
             cur = direct_conns['sfrom'] == sfrom
             direct_conns.loc[cur, 'match'] = ( (direct_conns.loc[cur, [f'scaf{sfrom}',f'strand{sfrom}']].values == direct_conns.loc[cur, ['rscaf0','rstrand0']].values).all(axis=1) &
                                                (direct_conns.loc[cur, 'length'] < direct_conns.loc[cur, 'sfrom'] + direct_conns.loc[cur, 'rlength']) ) # Otherwise we would have bridged the loop
-            for s in range(sfrom+1, direct_conns.loc[direct_conns['match'], 'length'].max()):
-                cur = direct_conns['match'] & (direct_conns['sfrom'] == sfrom) & (direct_conns['length'] > s)
-                direct_conns.loc[cur, 'match'] = (direct_conns.loc[cur, [f'scaf{s}',f'strand{s}',f'dist{s}']].values == direct_conns.loc[cur, [f'rscaf{s-sfrom}',f'rstrand{s-sfrom}',f'rdist{s-sfrom}']].values).all(axis=1)
+            if np.sum(direct_conns['match']):
+                for s in range(sfrom+1, direct_conns.loc[direct_conns['match'], 'length'].max()):
+                    cur = direct_conns['match'] & (direct_conns['sfrom'] == sfrom) & (direct_conns['length'] > s)
+                    direct_conns.loc[cur, 'match'] = (direct_conns.loc[cur, [f'scaf{s}',f'strand{s}',f'dist{s}']].values == direct_conns.loc[cur, [f'rscaf{s-sfrom}',f'rstrand{s-sfrom}',f'rdist{s-sfrom}']].values).all(axis=1)
             direct_conns.loc[direct_conns['match'] == False, 'sfrom'] += 1
         direct_conns = direct_conns[direct_conns['match']].drop(columns=['match'])
     if len(direct_conns):
@@ -7095,6 +7092,7 @@ def OrderByUnbrokenOriginalScaffolds(scaffold_paths, contig_parts, ploidy):
     org_cons = org_cons.loc[(org_cons['from_side'] == 'l') & (org_cons['from']-1 == org_cons['to']), :]
     scaffold_paths['sdist_left'] = -1
     scaffold_paths.loc[np.isin(scaffold_paths['scaf'], org_cons['from'].values) & (scaffold_paths['pos'] == 0), 'sdist_left'] = org_cons['distance'].values
+    scaffold_paths['sdist_left'] = scaffold_paths['sdist_left'].astype(int)
     scaffold_paths['sdist_right'] = scaffold_paths['sdist_left'].shift(-1, fill_value=-1)
 
     return scaffold_paths
@@ -8539,7 +8537,7 @@ def GaplessFinish(assembly_file, read_file, read_format, scaffold_file, output_f
 #
     print( str(timedelta(seconds=process_time())), "Loading assembly from: {}".format(assembly_file))
     contigs = {}
-    with gzip.open(assembly_file, 'rt') if 'gz' == assembly_file.rsplit('.',1)[-1] else open(assembly_file, 'rU') as fin:
+    with gzip.open(assembly_file, 'rt') if 'gz' == assembly_file.rsplit('.',1)[-1] else open(assembly_file, 'r') as fin:
         for record in SeqIO.parse(fin, "fasta"):
             contigs[ record.description.split(' ', 1)[0] ] = record.seq
 #
@@ -8551,7 +8549,7 @@ def GaplessFinish(assembly_file, read_file, read_format, scaffold_file, output_f
             read_format = "fasta"
         else:
             read_format = "fastq"
-    with gzip.open(read_file, 'rt') if 'gz' == read_file.rsplit('.',1)[-1] else open(read_file, 'rU') as fin:
+    with gzip.open(read_file, 'rt') if 'gz' == read_file.rsplit('.',1)[-1] else open(read_file, 'r') as fin:
         for record in SeqIO.parse(fin, read_format):
             reads[ record.description.split(' ', 1)[0] ] = record.seq
     
@@ -8660,48 +8658,54 @@ def GaplessFinish(assembly_file, read_file, read_format, scaffold_file, output_f
         scaf_len = outpaths.groupby(['scaf'])['length'].agg(['sum','size'])
         outpaths = outpaths[np.repeat(scaf_len['sum'].values >= min_length, scaf_len['size'].values)].copy()
         outpaths.loc[(outpaths['meta'] != outpaths['meta'].shift(-1)), 'sdist_right'] = -1
+        # Make sure sdist_right is int
+        outpaths['sdist_right'] = outpaths['sdist_right'].astype(int)
         # Write to file
-        with gzip.open(outfile, 'wb') if 'gz' == outfile.rsplit('.',1)[-1] else open(outfile, 'w') as fout:
-            meta = ''
-            seq = []
-            for row in outpaths.itertuples(index=False):
-                # Check if scaffold changed
-                if meta != row.meta:
-                    if meta != '':
-                        # Write scaffold to disc
-                        fout.write('>')
-                        fout.write(meta)
-                        fout.write('\n')
-                        fout.write(''.join(seq))
-                        fout.write('\n')
-                    # Start new scaffold
-                    meta = row.meta
-                    seq = []
+        try:
+            with gzip.open(outfile, 'wb') if 'gz' == outfile.rsplit('.',1)[-1] else open(outfile, 'w') as fout:
+                meta = ''
+                seq = []
+                for row in outpaths.itertuples(index=False):
+                    # Check if scaffold changed
+                    if meta != row.meta:
+                        if meta != '':
+                            # Write scaffold to disc
+                            fout.write('>')
+                            fout.write(meta)
+                            fout.write('\n')
+                            fout.write(''.join(seq))
+                            fout.write('\n')
+                        # Start new scaffold
+                        meta = row.meta
+                        seq = []
 #
-                # Add sequences to scaffold
-                if 'contig' == row.type:
-                    if row.strand == '-':
-                        seq.append(str(contigs[row.name][row.start:row.end].reverse_complement()))
-                    else:
-                        seq.append(str(contigs[row.name][row.start:row.end]))
-                elif 'read' == row.type:
-                    if row.strand == '-':
-                        seq.append(str(reads[row.name][row.start:row.end].reverse_complement()))
-                    else:
-                        seq.append(str(reads[row.name][row.start:row.end]))
+                    # Add sequences to scaffold
+                    if 'contig' == row.type:
+                        if row.strand == '-':
+                            seq.append(str(contigs[row.name][row.start:row.end].reverse_complement()))
+                        else:
+                            seq.append(str(contigs[row.name][row.start:row.end]))
+                    elif 'read' == row.type:
+                        if row.strand == '-':
+                            seq.append(str(reads[row.name][row.start:row.end].reverse_complement()))
+                        else:
+                            seq.append(str(reads[row.name][row.start:row.end]))
 #
-                # Add N's to separate contigs
-                if 0 <= row.sdist_right:
-                    seq.append( 'N' * row.sdist_right )
+                    # Add N's to separate contigs
+                    if 0 <= row.sdist_right:
+                        seq.append( 'N' * row.sdist_right )
 #
-            # Write out last scaffold
-            fout.write('>')
-            fout.write(meta)
-            fout.write('\n')
-            fout.write(''.join(seq))
-            fout.write('\n')
-        
-        print( str(timedelta(seconds=process_time())), "Finished" )
+                # Write out last scaffold
+                fout.write('>')
+                fout.write(meta)
+                fout.write('\n')
+                fout.write(''.join(seq))
+                fout.write('\n')
+        except:
+            # Make sure we do not leave an invalid output file, before crashing
+            os.remove(outfile)
+            raise
+    print( str(timedelta(seconds=process_time())), "Finished" )
 
 def GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length, keep_all_subreads, alignment_precision, min_length_contig_break, max_dist_contig_end):
     mappings = ReadPaf(mapping_file)
