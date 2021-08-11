@@ -167,6 +167,9 @@ do
     fi
     env time -v -o pass${i}/timing/racon.txt racon -t $threads "${org_path}/${reads}" pass${i}/gapless_consensus.paf pass${i}/gapless_raw.fa > pass${i}/gapless.fa 2>pass${i}/logs/racon.log &&\
     rm -f pass${i}/gapless_consensus.paf pass${i}/gapless_raw.fa pass${i}/gapless_split.fa
+    if [ -f pass${i}/gapless_raw.fa ]; then
+		rm -f pass${i}/gapless.fa # In case of an error remove final output file to avoid going into the next round
+    fi
     if [ ! -f pass${i}/gapless.fa ]; then
       echo "pipeline crashed: consensus"
       exit 1
