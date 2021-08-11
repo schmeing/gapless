@@ -1240,20 +1240,25 @@ def FilterBridges(bridges, bridge_extlen, borderline_removal, min_factor_alterna
         cur_extlen.rename(columns={f'{e}_extlen':'extlen'}, inplace=True)
         cur_max = cur_extlen.loc[cur_extlen['extlen'] == cur_extlen['max_extlen'], ['from','from_side','to','to_side','mean_dist', 'counts']].copy()
         cur_extlen = cur_extlen[cur_extlen['extlen'] < cur_extlen['max_extlen']].drop(columns=['max_extlen']) # If the bridge has the longest mapping it cannot end prematurely
-        gaplen = bridge_extlen[['from','from_side','to','to_side','mean_dist',f'{e}_extlen',f'{e}_gaplen']].rename(columns={f'{e}_extlen':'extlen',f'{e}_gaplen':'gaplen'}).merge(cur_extlen[['from','from_side','to','to_side','mean_dist','extlen']].reset_index(), on=['from','from_side','to','to_side','mean_dist','extlen'], how='inner')
-        gaplen = gaplen.groupby(['index'])['gaplen'].max().reset_index()
-        cur_extlen.loc[gaplen['index'].values, 'gaplen'] = gaplen['gaplen'].values
-        cur_extlen.rename(columns={col:f'test_{col}' for col in ['to','to_side','mean_dist','counts']}, inplace=True)
-        cur_extlen = cur_extlen.merge(cur_max, on=['from','from_side'], how='left') # If multiple longest extensions exist test against all of them
-        longer_extensions = cur_extlen[['from','from_side','to','to_side','mean_dist','extlen','gaplen']].drop_duplicates().merge(bridge_extlen[['from','from_side','to','to_side','mean_dist',f'{e}_extlen',f'{e}_gaplen']], on=['from','from_side','to','to_side','mean_dist'], how='left')
-        longer_extensions = longer_extensions[longer_extensions['extlen'] + np.maximum(0, longer_extensions['gaplen']-longer_extensions[f'{e}_gaplen']) < longer_extensions[f'{e}_extlen']].groupby(['from','from_side','to','to_side','mean_dist','extlen','gaplen']).size().reset_index(name='longer')
-        cur_extlen['longer'] = cur_extlen[['from','from_side','to','to_side','mean_dist','extlen','gaplen']].merge(longer_extensions, on=['from','from_side','to','to_side','mean_dist','extlen','gaplen'], how='left')['longer'].fillna(0).astype(int)
-        cur_extlen.drop(columns=['extlen','gaplen','to','to_side','mean_dist'], inplace=True)
-        cur_extlen['premat_prob'] = GetPrematureStopProb(cur_extlen['test_counts'], cur_extlen['counts'], cur_extlen['longer'])
-        cur_extlen = cur_extlen.groupby(['from','from_side','test_to','test_to_side','test_mean_dist'])['premat_prob'].min().reset_index()  # Since we tested against all longest mappings, take the lowest probability
-        cur_extlen.rename(columns={f'test_{col}':col for col in ['to','to_side','mean_dist']}, inplace=True)
-        bridges[f'same_from_premat' if e == 'from' else f'diff_from_premat'] = bridges[['from','from_side','to','to_side','mean_dist']].merge(cur_extlen, on=['from','from_side','to','to_side','mean_dist'], how='left')['premat_prob'].fillna(1.0).values
-        bridges[f'same_to_premat' if e == 'from' else f'diff_to_premat'] = bridges[['from','from_side','to','to_side','mean_dist']].merge(cur_extlen.rename(columns={'from':'to','to':'from','from_side':'to_side','to_side':'from_side'}), on=['from','from_side','to','to_side','mean_dist'], how='left')['premat_prob'].fillna(1.0).values
+        if len(cur_extlen):
+            gaplen = bridge_extlen[['from','from_side','to','to_side','mean_dist',f'{e}_extlen',f'{e}_gaplen']].rename(columns={f'{e}_extlen':'extlen',f'{e}_gaplen':'gaplen'}).merge(cur_extlen[['from','from_side','to','to_side','mean_dist','extlen']].reset_index(), on=['from','from_side','to','to_side','mean_dist','extlen'], how='inner')
+            gaplen = gaplen.groupby(['index'])['gaplen'].max().reset_index()
+            cur_extlen.loc[gaplen['index'].values, 'gaplen'] = gaplen['gaplen'].values
+            cur_extlen.rename(columns={col:f'test_{col}' for col in ['to','to_side','mean_dist','counts']}, inplace=True)
+            cur_extlen = cur_extlen.merge(cur_max, on=['from','from_side'], how='left') # If multiple longest extensions exist test against all of them
+            longer_extensions = cur_extlen[['from','from_side','to','to_side','mean_dist','extlen','gaplen']].drop_duplicates().merge(bridge_extlen[['from','from_side','to','to_side','mean_dist',f'{e}_extlen',f'{e}_gaplen']], on=['from','from_side','to','to_side','mean_dist'], how='left')
+            longer_extensions = longer_extensions[longer_extensions['extlen'] + np.maximum(0, longer_extensions['gaplen']-longer_extensions[f'{e}_gaplen']) < longer_extensions[f'{e}_extlen']].groupby(['from','from_side','to','to_side','mean_dist','extlen','gaplen']).size().reset_index(name='longer')
+            cur_extlen['longer'] = cur_extlen[['from','from_side','to','to_side','mean_dist','extlen','gaplen']].merge(longer_extensions, on=['from','from_side','to','to_side','mean_dist','extlen','gaplen'], how='left')['longer'].fillna(0).astype(int)
+            cur_extlen.drop(columns=['extlen','gaplen','to','to_side','mean_dist'], inplace=True)
+            cur_extlen['premat_prob'] = GetPrematureStopProb(cur_extlen['test_counts'], cur_extlen['counts'], cur_extlen['longer'])
+            cur_extlen = cur_extlen.groupby(['from','from_side','test_to','test_to_side','test_mean_dist'])['premat_prob'].min().reset_index()  # Since we tested against all longest mappings, take the lowest probability
+            cur_extlen.rename(columns={f'test_{col}':col for col in ['to','to_side','mean_dist']}, inplace=True)
+        if len(cur_extlen):
+            bridges[f'same_from_premat' if e == 'from' else f'diff_from_premat'] = bridges[['from','from_side','to','to_side','mean_dist']].merge(cur_extlen, on=['from','from_side','to','to_side','mean_dist'], how='left')['premat_prob'].fillna(1.0).values
+            bridges[f'same_to_premat' if e == 'from' else f'diff_to_premat'] = bridges[['from','from_side','to','to_side','mean_dist']].merge(cur_extlen.rename(columns={'from':'to','to':'from','from_side':'to_side','to_side':'from_side'}), on=['from','from_side','to','to_side','mean_dist'], how='left')['premat_prob'].fillna(1.0).values
+        else:
+            bridges[f'same_from_premat' if e == 'from' else f'diff_from_premat'] = 1.0
+            bridges[f'same_to_premat' if e == 'from' else f'diff_to_premat'] = 1.0
 #
     # Remove prematurely ending bridges (if this would remove all bridges from both sides keep the ones with the highest probability)
     premat_cols = ['same_from_premat','same_to_premat','diff_from_premat','diff_to_premat']
@@ -1305,6 +1310,14 @@ def FilterBridges(bridges, bridge_extlen, borderline_removal, min_factor_alterna
 #
     return bridges
 
+def CheckBridgeConsistency(bridges):
+    mcols = ['from','from_side','to','to_side','mean_dist']
+    inconsistencies = bridges[mcols].merge(bridges[mcols].rename(columns={'from':'to','from_side':'to_side','to':'from','to_side':'from_side'}), on=mcols, how='outer', indicator=True)
+    inconsistencies = inconsistencies[inconsistencies['_merge'] != "both"].copy()
+    if len(inconsistencies):
+        print(inconsistencies)
+        raise RuntimeError("Bridges are inconsistent.")
+
 def GetBridges(mappings, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, cov_probs, prob_factor, min_mapping_length, min_distance_tolerance, rel_distance_tolerance, prematurity_threshold, max_dist_contig_end, pdf):
     # Get bridges
     for s in ['left','right']:
@@ -1339,6 +1352,7 @@ def GetBridges(mappings, borderline_removal, min_factor_alternatives, min_num_re
     bridges = CreateBridges(left_bridge, right_bridge, min_distance_tolerance, rel_distance_tolerance)
     bridge_extlen = PrepareBridgeExtLen(bridge_extlen, bridges)
     bridges = FilterBridges(bridges, bridge_extlen, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, cov_probs, prob_factor, min_mapping_length, contig_parts, prematurity_threshold, pdf)
+    CheckBridgeConsistency(bridges)
 
     return bridges
 
@@ -1554,6 +1568,9 @@ def LiftBridgesFromContigsToScaffolds(bridges, scaffolds):
     scaf_bridges['to'] = np.where(np.isnan(scaf_bridges['lscaf']), scaf_bridges['rscaf'], scaf_bridges['lscaf']).astype(int)
     scaf_bridges['to_side'] = np.where(np.isnan(scaf_bridges['lscaf']), 'r', 'l')
     scaf_bridges.drop(columns=['lscaf','rscaf'], inplace=True)
+    
+    # Check consistency
+    CheckBridgeConsistency(scaf_bridges)
 
     return scaf_bridges
 
@@ -1611,8 +1628,8 @@ def GetLongRangeConnections(bridges, mappings, contig_parts, max_dist_contig_end
         long_range_connections['lextlen'] = np.where(long_range_connections['strand'] == '+', long_range_connections['read_end']-long_range_connections['read_to'], long_range_connections['read_from']-long_range_connections['read_start']) + (long_range_connections['maplen'] + long_range_connections['con_from'])
         long_range_connections['rextlen'] = np.where(long_range_connections['strand'] == '-', long_range_connections['read_end']-long_range_connections['read_to'], long_range_connections['read_from']-long_range_connections['read_start']) + (long_range_connections['maplen'] + long_range_connections['con_to'])
         long_range_connections.drop(columns=['con_from','con_to','read_start','read_end','read_from','read_to','maplen'], inplace=True)
-        long_range_connections.loc[long_range_connections['left_con'] < 0, ['lgaplen','lextlen']] = 0
-        long_range_connections.loc[long_range_connections['right_con'] < 0, ['rgaplen','rextlen']] = 0
+        #long_range_connections.loc[long_range_connections['left_con'] < 0, ['lgaplen','lextlen']] = 0
+        #long_range_connections.loc[long_range_connections['right_con'] < 0, ['rgaplen','rextlen']] = 0
     else:
         long_range_connections = []
 #
@@ -1679,8 +1696,8 @@ def GetLongRangeConnections(bridges, mappings, contig_parts, max_dist_contig_end
         long_range_connections.rename(columns={f'{b}{n}':f'{a}{n}' for n in ['gaplen','extlen'] for b,a in [['l','p'],['r','n']]}, inplace=True)
         long_range_connections.loc[long_range_connections['strand'] == '-', [f'{s}{n}' for n in ['gaplen','extlen'] for s in ['p','n']]] = long_range_connections.loc[long_range_connections['strand'] == '-', [f'{s}{n}' for n in ['gaplen','extlen'] for s in ['n','p']]].values
         # Make sure that reads look similar independent if they were trimmed or not
-        long_range_connections.loc[long_range_connections['pos'] == 0, ['prev_alt','prev_dist','pgaplen','pextlen']] = 0
-        long_range_connections.loc[long_range_connections['pos'] == long_range_connections['size']-1, ['next_alt','next_dist','ngaplen','nextlen']] = 0
+        long_range_connections.loc[long_range_connections['pos'] == 0, ['prev_alt','prev_dist']] = 0 #,'pgaplen','pextlen'
+        long_range_connections.loc[long_range_connections['pos'] == long_range_connections['size']-1, ['next_alt','next_dist']] = 0 #,'ngaplen','nextlen'
 #
         # Add all connections also in the reverse direction
         long_range_connections = long_range_connections.loc[np.repeat(long_range_connections.index.values, 2)].copy()
@@ -1754,7 +1771,9 @@ def FilterLongRangeConnections(long_range_connections, long_range_extlen, scaffo
                 cons = long_range_connections.loc[long_range_connections['pos'] + l <= long_range_connections['size'], ['scaffold','strand','count']].reset_index()
                 cons.rename(columns={'index':'cindex', 'scaffold':'scaf0', 'strand':'strand0'}, inplace=True)
                 for i in range(1,l):
-                    cons[[f'scaf{i}',f'strand{i}',f'dist{i}']] = long_range_connections.loc[cons['cindex']+i, ['scaffold','strand','prev_dist']].values
+                    cons[f'scaf{i}'] = long_range_connections.loc[cons['cindex']+i, 'scaffold'].values
+                    cons[f'strand{i}'] = long_range_connections.loc[cons['cindex']+i, 'strand'].values
+                    cons[f'dist{i}'] = long_range_connections.loc[cons['cindex']+i, 'prev_dist'].values
                 mcols = ['scaf0','strand0']+[f'{n}{s}' for s in range(1,l) for n in ['scaf','strand','dist']]
                 if cfilter == 'prematurity':
                     cons[['conn_id', 'pos']] = long_range_connections.loc[cons['cindex'].values, ['conn_id', 'pos']].values
@@ -1816,19 +1835,26 @@ def FilterLongRangeConnections(long_range_connections, long_range_extlen, scaffo
                     counts['pdel'] = (counts['probability']*prob_factor < counts['pmax_prob']) | counts[mcols].merge(one_sided_dels, on=mcols, how='left')['pdel'].fillna(False).values
                     counts = counts[counts['ndel'] & counts['pdel']].drop(columns=['count','min_length','probability','nmax_prob','pmax_prob','ndel','pdel'])
                     cons = cons.merge(counts, on=mcols, how='inner')
+                # Split long_range_connections at deleted connections
                 split_index = np.concatenate([cons['cindex'].values, cons['cindex'].values+l-2])
                 long_range_connections['split'] = long_range_connections['conn_id'] != long_range_connections['conn_id'].shift(-1)
                 long_range_connections.loc[split_index, 'split'] = True
                 long_range_connections['split'] = long_range_connections['split'].shift(1, fill_value=True)
-                long_range_connections['conn_id'] = long_range_connections['split'].cumsum()
-                long_range_connections['pos'] = long_range_connections.groupby(['conn_id']).cumcount()
-                con_size = long_range_connections.groupby(['conn_id'], sort=False).size().values
+                long_range_connections['new_conn_id'] = long_range_connections['split'].cumsum()
+                long_range_connections['new_pos'] = long_range_connections.groupby(['new_conn_id']).cumcount()
+                con_size = long_range_connections.groupby(['new_conn_id'], sort=False).size().values
                 long_range_connections['size'] = np.repeat(con_size, con_size)
                 long_range_connections = long_range_connections[long_range_connections['size'] > 2].drop(columns=['split'])
-                long_range_connections.loc[long_range_connections['pos'] == 0, ['prev_alt','prev_dist']] = 0
-                long_range_connections.loc[long_range_connections['pos'] == long_range_connections['size']-1, ['next_alt','next_dist']] = 0
+                long_range_connections.loc[long_range_connections['new_pos'] == 0, ['prev_alt','prev_dist']] = 0
+                long_range_connections.loc[long_range_connections['new_pos'] == long_range_connections['size']-1, ['next_alt','next_dist']] = 0
+                # Update long_range_extlen according to changes in long_range_connections
+                long_range_extlen = long_range_extlen.merge(long_range_connections[['conn_id','pos','new_conn_id','new_pos']], on=['conn_id','pos'], how='inner')
+                long_range_extlen[['conn_id','pos']] = long_range_extlen[['new_conn_id','new_pos']].values
+                long_range_extlen.drop(columns=['new_conn_id','new_pos'], inplace=True)
+                long_range_connections[['conn_id','pos']] = long_range_connections[['new_conn_id','new_pos']].values
+                long_range_connections.drop(columns=['new_conn_id','new_pos'], inplace=True)
 #
-    return long_range_connections
+    return long_range_connections, long_range_extlen
 
 def RemoveRedundantEntriesInScaffoldGraph(scaffold_graph):
     # Now remove all the paths that overlap a longer one (for equally long ones just take one of them)
@@ -1858,6 +1884,61 @@ def RemoveRedundantEntriesInScaffoldGraph(scaffold_graph):
 #        scaffold_graph.drop(columns=['rep_len'], inplace=True)
 
     return scaffold_graph
+
+def ReverseVerticalPaths(vpaths):
+    reverse_vpaths = []
+    for l in np.unique(vpaths['length']):
+        reverse_vpaths.append( vpaths.loc[vpaths['length'] == l, ['length','scaf0','strand0']+[f'{n}{s}' for s in range(1,l) for n in ['scaf','strand','dist']]].rename(columns={**{f'{n}{s}':f'{n}{l-s-1}' for s in range(l) for n in ['scaf','strand']}, **{f'dist{s+1}':f'dist{l-s-1}' for s in range(l)}}).reset_index() )
+    reverse_vpaths = pd.concat(reverse_vpaths, ignore_index=True, sort=False)
+    reverse_vpaths = reverse_vpaths[['index','length','scaf0','strand0']+[f'{n}{s}' for s in range(1,reverse_vpaths['length'].max()) for n in ['scaf','strand','dist']]].copy()
+    for s in range(reverse_vpaths['length'].max()):
+        reverse_vpaths.loc[reverse_vpaths['length'] > s, f'strand{s}'] = np.where(reverse_vpaths.loc[reverse_vpaths['length'] > s, f'strand{s}'] == '+', '-', '+')
+    reverse_vpaths.rename(columns={'index':'lindex'}, inplace=True)
+#
+    return reverse_vpaths
+
+def RemoveEmptyColumns(df):
+    # Clean up columns with all NaN
+    cols = df.count()
+    df.drop(columns=cols[cols == 0].index.values,inplace=True)
+    return df
+
+def CheckScaffoldGraphConsistency(scaffold_graph):
+    # Check if all entries are also present in the reverse (might be longer, because we remove redundaent entries)
+    reverse_graph = scaffold_graph.rename(columns={'from':'scaf0','from_side':'strand0'})
+    reverse_graph['strand0'] = np.where(reverse_graph['strand0'] == 'r', '+', '-')
+    reverse_graph = ReverseVerticalPaths(reverse_graph).drop(columns='lindex')
+    reverse_graph.rename(columns={'scaf0':'from','strand0':'from_side'}, inplace=True)
+    reverse_graph['from_side'] = np.where(reverse_graph['from_side'] == '+', 'r', 'l')
+    inconsistencies = []
+    for l in np.unique(reverse_graph['length']):
+        mcols = ['from','from_side'] + [f'{n}{s}' for s in range(1,l) for n in ['scaf','strand','dist']]
+        inconsistencies.append( reverse_graph.loc[reverse_graph['length'] == l, mcols].merge(scaffold_graph[mcols], on=mcols, how='left', indicator=True) )
+        inconsistencies[-1] = inconsistencies[-1][ inconsistencies[-1]['_merge'] != "both" ].copy()
+    inconsistencies = pd.concat(inconsistencies, ignore_index=True)
+    if len(inconsistencies):
+        inconsistencies = RemoveEmptyColumns(inconsistencies)
+        print(inconsistencies)
+        raise RuntimeError("Scaffold graph is inconsistent: Not all reverse entries are present.")
+#
+    # Check that also the entries at all intermediate starting points are present (we only need to check with the first entry removed, because if that one exists it itself checks the next shorter one)
+    test_graph = scaffold_graph[scaffold_graph['length'] > 2].copy()
+    test_graph.drop(columns=['from','from_side','dist1'], inplace=True)
+    test_graph.rename(columns={f'{n}{s}':f'{n}{s-1}' for s in range(1,test_graph['length'].max()) for n in ['scaf','strand','dist']}, inplace=True)
+    test_graph['length'] -= 1
+    test_graph.rename(columns={'scaf0':'from','strand0':'from_side'}, inplace=True)
+    test_graph['from_side'] = np.where(test_graph['from_side'] == '+', 'r', 'l')
+    inconsistencies = []
+    for l in np.unique(test_graph['length']):
+        mcols = ['from','from_side'] + [f'{n}{s}' for s in range(1,l) for n in ['scaf','strand','dist']]
+        inconsistencies.append( test_graph.loc[test_graph['length'] == l, mcols].merge(scaffold_graph[mcols], on=mcols, how='left', indicator=True) )
+        inconsistencies[-1] = inconsistencies[-1][ inconsistencies[-1]['_merge'] != "both" ].copy()
+    if len(inconsistencies):
+        inconsistencies = pd.concat(inconsistencies, ignore_index=True)
+    if len(inconsistencies):
+        inconsistencies = RemoveEmptyColumns(inconsistencies)
+        print(inconsistencies)
+        raise RuntimeError("Scaffold graph is inconsistent: Not all intermediate starting points are present.")
 
 def BuildScaffoldGraph(long_range_connections, scaf_bridges):
     # First start from every contig and extend in both directions on valid reads
@@ -1890,6 +1971,7 @@ def BuildScaffoldGraph(long_range_connections, scaf_bridges):
 #
         # Remove redundant entries
         scaffold_graph = RemoveRedundantEntriesInScaffoldGraph(scaffold_graph)
+        CheckScaffoldGraphConsistency(scaffold_graph)
 
     return scaffold_graph
 
@@ -1975,6 +2057,7 @@ def DropRemovedScaffoldsFromRepeats(onesided_reps, remindex):
     return onesided_reps
 
 def DeleteIndexInScaffoldGraph(scaffold_graph, remindex, fullrem):
+    # Find all the entries that need to be removed/trimmed
     trim_graph = scaffold_graph.loc[remindex].copy()
     scaffold_graph.drop(remindex, inplace=True)
     trim_graph.rename(columns={'from':'scaf0','from_side':'strand0'}, inplace=True)
@@ -1991,15 +2074,28 @@ def DeleteIndexInScaffoldGraph(scaffold_graph, remindex, fullrem):
     trim_graph.drop(columns=['lindex'], inplace=True)
     trim_graph.rename(columns={'scaf0':'from','strand0':'from_side'}, inplace=True)
     trim_graph['from_side'] = np.where(trim_graph['from_side'] == '+', 'r', 'l')
+    # Trim/remove entries
     scaffold_graph['trim'] = scaffold_graph[trim_graph.columns].merge(trim_graph, on=list(trim_graph.columns), how='left', indicator=True)['_merge'].values == "both"
     if fullrem:
         scaffold_graph = scaffold_graph[scaffold_graph['trim'] == False].drop(columns=['trim'])
     else:
+        # Trim entries
         scaffold_graph = scaffold_graph[(scaffold_graph['trim'] == False) | (scaffold_graph['length'] > 2)].copy()
         for l in np.unique(scaffold_graph.loc[scaffold_graph['trim'], 'length'].values): # The increasing order provided by np.unique is important here
             scaffold_graph.loc[scaffold_graph['trim'] & (scaffold_graph['length'] == l), [f'scaf{l-1}',f'strand{l-1}',f'dist{l-1}']] = np.nan
             scaffold_graph.loc[scaffold_graph['trim'] & (scaffold_graph['length'] == l), 'length'] -= 1
         scaffold_graph.drop(columns=['trim'], inplace=True)
+        scaffold_graph = RemoveRedundantEntriesInScaffoldGraph(scaffold_graph)
+    # Reconstruct entries, where we removed too much (because another long paths shared parts with a removed/trimmed paths)
+    for l in range(scaffold_graph['length'].max(), 2, -1):
+        cur = scaffold_graph.loc[scaffold_graph['length'] == l].drop(columns=['from','from_side','dist1'])
+        cur = RemoveEmptyColumns(cur)
+        cur.rename(columns={f'{n}{s}':f'{n}{s-1}' for s in range(1,l) for n in ['scaf','strand','dist']}, inplace=True)
+        cur.rename(columns={'scaf0':'from','strand0':'from_side'}, inplace=True)
+        cur['from_side'] = np.where(cur['from_side'] == '+', 'r', 'l')
+        cur[['scaf1','dist1']] = cur[['scaf1','dist1']].astype(int)
+        cur['length'] -= 1
+        scaffold_graph = pd.concat([scaffold_graph, cur], ignore_index=True)
         scaffold_graph = RemoveRedundantEntriesInScaffoldGraph(scaffold_graph)
 #
     return scaffold_graph
@@ -2049,8 +2145,9 @@ def DisconnectRepeatedContigsWithConnectionsOnOneSide(scaffold_graph, scaf_reps,
         # If the target is also in scaffold_graph remove the one with fewer bridging reads
         if len(onesided_reps):
             for q in ['s','t']:
-                onesided_reps[[f'{q}to',f'{q}to_side',f'{q}dist']] = scaffold_graph.loc[onesided_reps[f'{q}index'].values, ['scaf1','strand1','dist1']].values
-                onesided_reps[f'{q}to_side'] = np.where(onesided_reps[f'{q}to_side'] == '+', 'l', 'r')
+                onesided_reps[f'{q}to'] = scaffold_graph.loc[onesided_reps[f'{q}index'].values, 'scaf1'].values
+                onesided_reps[f'{q}to_side'] = np.where(scaffold_graph.loc[onesided_reps[f'{q}index'].values, 'strand1'].values == '+', 'l', 'r')
+                onesided_reps[f'{q}dist'] = scaffold_graph.loc[onesided_reps[f'{q}index'].values, 'dist1'].values
             onesided_reps['scount'] = onesided_reps[['scaffold','side','sto','sto_side','sdist']].rename(columns={'scaffold':'from','side':'from_side','sto':'to','sto_side':'to_side','sdist':'mean_dist'}).merge(scaf_bridges[['from','from_side','to','to_side','mean_dist','bcount']], on=['from','from_side','to','to_side','mean_dist'], how='left')['bcount'].values
             onesided_reps['tcount'] = onesided_reps[['t_con','tside','tto','tto_side','tdist']].rename(columns={'t_con':'from','tside':'from_side','tto':'to','tto_side':'to_side','tdist':'mean_dist'}).merge(scaf_bridges[['from','from_side','to','to_side','mean_dist','bcount']], on=['from','from_side','to','to_side','mean_dist'], how='left')['bcount'].values
             remindex.append( onesided_reps.loc[onesided_reps['tcount'] > onesided_reps['scount'], ['scaffold','sindex','rep_side']].drop_duplicates() )
@@ -2066,17 +2163,11 @@ def DisconnectRepeatedContigsWithConnectionsOnOneSide(scaffold_graph, scaf_reps,
     if len(trim_repeats):
         trim_repeats.drop(columns='sindex', inplace=True)
         trim_repeats.drop_duplicates(inplace=True)
-        # Remove all scaffolds which are fully duplicated (including the repeats on it that are not)
+        # Remove all scaffolds which are fully duplicated from trim_repeats (including the repeats on it that are not), because if they are scheduled for trimming they are also scheduled for deletion 
         trim_repeats = trim_repeats[np.isin(trim_repeats['scaffold'], trim_repeats.loc[trim_repeats['rep_side'] == 'lr', 'scaffold'].values) == False].copy()
         trim_repeats.rename(columns={'scaffold':'q_con'}, inplace=True)
 #
     return scaffold_graph, trim_repeats
-
-def RemoveEmptyColumns(df):
-    # Clean up columns with all NaN
-    cols = df.count()
-    df.drop(columns=cols[cols == 0].index.values,inplace=True)
-    return df
 
 def ApplyDistancesToDuplicationAlternative(cur, lpot, alt_graph, scaf_bridges, s):
     cur[f'side{s}'] = np.where(cur[f'strand{s}'] == '+', 'r', 'l')
@@ -2304,16 +2395,6 @@ def DisconnectRepeatedContigsWithConnectionsOnBothSides(scaffold_graph, scaf_rep
         remindex = np.concatenate([remindex, remindex2])
         # Apply the removal and reconstruct entries, where we removed too much
         scaffold_graph = DeleteIndexInScaffoldGraph(scaffold_graph, remindex, True)
-        for l in range(scaffold_graph['length'].max(), 2, -1):
-            cur = scaffold_graph.loc[scaffold_graph['length'] == l].drop(columns=['from','from_side','dist1'])
-            cur = RemoveEmptyColumns(cur)
-            cur.rename(columns={f'{n}{s}':f'{n}{s-1}' for s in range(1,l) for n in ['scaf','strand','dist']}, inplace=True)
-            cur.rename(columns={'scaf0':'from','strand0':'from_side'}, inplace=True)
-            cur['from_side'] = np.where(cur['from_side'] == '+', 'r', 'l')
-            cur[['scaf1','dist1']] = cur[['scaf1','dist1']].astype(int)
-            cur['length'] -= 1
-            scaffold_graph = pd.concat([scaffold_graph, cur], ignore_index=True)
-            scaffold_graph = RemoveRedundantEntriesInScaffoldGraph(scaffold_graph)
 #
     return scaffold_graph
 
@@ -2323,6 +2404,7 @@ def DeduplicateScaffoldsInGraph(scaffold_graph, repeats, scaffold_parts, scaf_br
         end_reps = FindSingleContigScaffoldsWithOneDuplicatedUnconnectedEnd(scaffold_parts, repeats, scaffold_graph)
         scaffold_graph, trim_repeats = DisconnectRepeatedContigsWithConnectionsOnOneSide(scaffold_graph, scaf_reps, end_reps, scaf_bridges)
         scaffold_graph = DisconnectRepeatedContigsWithConnectionsOnBothSides(scaffold_graph, scaf_reps, scaf_bridges)
+        CheckScaffoldGraphConsistency(scaffold_graph)
     else:
         trim_repeats = []
 #
@@ -2335,6 +2417,8 @@ def UpdateScafBridgesAccordingToScaffoldGraph(scaf_bridges, scaffold_graph):
         valid_bridges['to_side'] = np.where(valid_bridges['to_side'] == '+', 'l', 'r')
         scaf_bridges = scaf_bridges.merge(valid_bridges, on=['from','from_side','to','to_side','mean_dist'], how='inner')
         scaf_bridges = CountAlternatives(scaf_bridges)
+#
+    CheckBridgeConsistency(scaf_bridges)
 #
     return scaf_bridges
 
@@ -2864,18 +2948,6 @@ def FindLoopExits(loop_scafs, scaffold_graph):
         exit_graph = exit_graph.merge(loop_scafs.loc[loop_scafs['inside'] == loop_scafs['exit'], ['scaf','loop']].rename(columns={'scaf':'from'}), on=['from','loop'], how='inner')
 #
     return loop_scafs
-
-def ReverseVerticalPaths(loops):
-    reverse_loops = []
-    for l in np.unique(loops['length']):
-        reverse_loops.append( loops.loc[loops['length'] == l, ['length','scaf0','strand0']+[f'{n}{s}' for s in range(1,l) for n in ['scaf','strand','dist']]].rename(columns={**{f'{n}{s}':f'{n}{l-s-1}' for s in range(l) for n in ['scaf','strand']}, **{f'dist{s+1}':f'dist{l-s-1}' for s in range(l)}}).reset_index() )
-    reverse_loops = pd.concat(reverse_loops, ignore_index=True, sort=False)
-    reverse_loops = reverse_loops[['index','length','scaf0','strand0']+[f'{n}{s}' for s in range(1,reverse_loops['length'].max()) for n in ['scaf','strand','dist']]].copy()
-    for s in range(reverse_loops['length'].max()):
-        reverse_loops.loc[reverse_loops['length'] > s, f'strand{s}'] = np.where(reverse_loops.loc[reverse_loops['length'] > s, f'strand{s}'] == '+', '-', '+')
-    reverse_loops.rename(columns={'index':'lindex'}, inplace=True)
-#
-    return reverse_loops
 
 def GetLoopUnits(loop_scafs, scaffold_graph, max_loop_units):
     # Get loops by extending the inside scaffolds until we find an exit or they have multiple options after finding the starting scaffold again
@@ -6649,6 +6721,8 @@ def TraverseScaffoldGraph(scaffolds, scaffold_graph, graph_ext, scaf_bridges, or
         scaffold_paths, handled_scaf_conns = AddPathThroughLoops(scaffold_paths, scaffold_graph, graph_ext, scaf_bridges, org_scaf_conns, ploidy, max_loop_units)
         scaffold_paths, handled_scaf_conns = AddPathThroughInvertedRepeats(scaffold_paths, handled_scaf_conns, scaffold_graph, scaf_bridges, ploidy)
         scaffold_paths = AddUntraversedConnectedPaths(scaffold_paths, graph_ext, handled_origins, handled_scaf_conns)
+    else:
+        scaffold_paths = []
     scaffold_paths = AddUnconnectedPaths(scaffold_paths, scaffolds, scaffold_graph)
 #
     # Turn them into full path with ploidy
@@ -7151,7 +7225,7 @@ def ScaffoldContigs(contig_parts, bridges, mappings, cov_probs, repeats, prob_fa
     long_range_connections = GetLongRangeConnections(bridges, mappings, contig_parts, max_dist_contig_end)
     long_range_connections = TransformContigConnectionsToScaffoldConnections(long_range_connections, scaffold_parts)
     long_range_connections, long_range_extlen = SummarizeLongRangeConnections(long_range_connections)
-    long_range_connections = FilterLongRangeConnections(long_range_connections, long_range_extlen, scaffold_parts, contig_parts, cov_probs, prob_factor, min_mapping_length, prematurity_threshold)
+    long_range_connections, long_range_extlen = FilterLongRangeConnections(long_range_connections, long_range_extlen, scaffold_parts, contig_parts, cov_probs, prob_factor, min_mapping_length, prematurity_threshold)
     scaffold_graph = BuildScaffoldGraph(long_range_connections, scaf_bridges)
     scaffold_graph, trim_repeats = DeduplicateScaffoldsInGraph(scaffold_graph, repeats, scaffold_parts, scaf_bridges)
     scaf_bridges = UpdateScafBridgesAccordingToScaffoldGraph(scaf_bridges, scaffold_graph)
