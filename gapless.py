@@ -21,6 +21,9 @@ import seaborn as sns
 import sys
 from time import process_time
 
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
 def GaplessSplit(fa_file,o_file=False,min_n=False):
     if False == o_file:
         if ".gz" == fa_file[-3:len(fa_file)]:
@@ -36,9 +39,12 @@ def GaplessSplit(fa_file,o_file=False,min_n=False):
     if os.path.exists(o_file):
         os.remove(o_file)
 
+    input_scaffolds = 0
+    output_contigs = 0
     with open(o_file, 'w') as fout:
         with gzip.open(fa_file, 'rt') if 'gz' == fa_file.rsplit('.',1)[-1] else open(fa_file, 'r') as fin:
             for record in SeqIO.parse(fin, "fasta"):
+                input_scaffolds += 1
                 # Split scaffolds into contigs
                 contigs=re.split('([nN]+)',str(record.seq))
                 # Split identifier and further description
@@ -47,7 +53,7 @@ def GaplessSplit(fa_file,o_file=False,min_n=False):
                     seqid[1] = " " + seqid[1] # Add the space here, so in case seqid[1] is empty no trailing space is in the sequence identifier
                 else:
                     seqid.append("")
-                
+
                 # Combine sequences that do not reach minimum of N's at split sites, attach start and end position to seq id and print it
                 start_pos = 0
                 seq = ""
@@ -70,6 +76,7 @@ def GaplessSplit(fa_file,o_file=False,min_n=False):
                         else:
                             # Split valid: Print contig
                             if len(seq): # Ignore potentially empty sequences, when scaffold starts or ends with N
+                                output_contigs += 1
                                 fout.write(">{0}_chunk{1}-{2}{3}\n".format(seqid[0],start_pos+1,start_pos+len(seq), seqid[1]))
                                 fout.write(seq)
                                 fout.write('\n')
@@ -77,15 +84,22 @@ def GaplessSplit(fa_file,o_file=False,min_n=False):
                             start_pos += len(seq) + num_n
                             seq = contig
                         num_n = -1
-                
+
                 # Print final sequence
                 if len(seq):
+                    output_contigs += 1
                     if len(seq)==len(record.seq):
                         fout.write(">{0}\n".format(record.description))
                     else:
                         fout.write(">{0}_chunk{1}-{2}{3}\n".format(seqid[0],start_pos+1,start_pos+len(seq), seqid[1]))
                     fout.write(seq)
                     fout.write('\n')
+
+    if 0 == output_contigs:
+        os.remove(o_file)
+        raise RuntimeError("No contigs found in input. Either the input file is empty or only contains ambiguous bases.")
+    else:
+        eprint(f"Split {input_scaffolds} scaffolds into {output_contigs} contigs and wrote it to: {o_file}")
 
 def ReadContigs(assembly_file):
     # Create contig table of assembly
