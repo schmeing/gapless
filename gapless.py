@@ -1906,19 +1906,29 @@ def RemoveEmptyColumns(df):
     df.drop(columns=cols[cols == 0].index.values,inplace=True)
     return df
 
-def CheckScaffoldGraphConsistency(scaffold_graph):
-    # Check if all entries are also present in the reverse (might be longer, because we remove redundaent entries)
+def ReverseScaffoldGraph(scaffold_graph):
     reverse_graph = scaffold_graph.rename(columns={'from':'scaf0','from_side':'strand0'})
     reverse_graph['strand0'] = np.where(reverse_graph['strand0'] == 'r', '+', '-')
-    reverse_graph = ReverseVerticalPaths(reverse_graph).drop(columns='lindex')
+    reverse_graph = ReverseVerticalPaths(reverse_graph).rename(columns={'lindex':'sindex'})
     reverse_graph.rename(columns={'scaf0':'from','strand0':'from_side'}, inplace=True)
     reverse_graph['from_side'] = np.where(reverse_graph['from_side'] == '+', 'r', 'l')
+#
+    return reverse_graph
+    
+def FindMissingReverseEntriesInScaffoldGraph(scaffold_graph):
+    reverse_graph = ReverseScaffoldGraph(scaffold_graph)
     inconsistencies = []
     for l in np.unique(reverse_graph['length']):
         mcols = ['from','from_side'] + [f'{n}{s}' for s in range(1,l) for n in ['scaf','strand','dist']]
-        inconsistencies.append( reverse_graph.loc[reverse_graph['length'] == l, mcols].merge(scaffold_graph[mcols], on=mcols, how='left', indicator=True) )
+        inconsistencies.append( reverse_graph.loc[reverse_graph['length'] == l, ['sindex']+mcols].merge(scaffold_graph[mcols], on=mcols, how='left', indicator=True) )
         inconsistencies[-1] = inconsistencies[-1][ inconsistencies[-1]['_merge'] != "both" ].copy()
     inconsistencies = pd.concat(inconsistencies, ignore_index=True)
+#
+    return inconsistencies
+
+def CheckScaffoldGraphConsistency(scaffold_graph):
+    # Check if all entries are also present in the reverse (might be longer, because we remove redundaent entries)
+    inconsistencies = FindMissingReverseEntriesInScaffoldGraph(scaffold_graph)
     if len(inconsistencies):
         inconsistencies = RemoveEmptyColumns(inconsistencies)
         print(inconsistencies)
@@ -2101,6 +2111,11 @@ def DeleteIndexInScaffoldGraph(scaffold_graph, remindex, fullrem):
             cur['length'] -= 1
             scaffold_graph = pd.concat([scaffold_graph, cur], ignore_index=True)
             scaffold_graph = RemoveRedundantEntriesInScaffoldGraph(scaffold_graph)
+        # In rare cases we still have an inconsistent scaffold graph, because we trimmed both scaffold at the ends, but in different entries
+        if fullrem == False:
+            # Solve this situation by keeping only the entries that still have the reverse
+            inconsistencies = FindMissingReverseEntriesInScaffoldGraph(scaffold_graph)
+            scaffold_graph.drop(np.unique(inconsistencies['sindex'].values), inplace=True)
 #
     return scaffold_graph
 
@@ -3535,18 +3550,22 @@ def InsertStartInformationIntoExitConns(exit_conns, start_units, bidi_loops, sca
         start_units = start_units[start_units['sfrom'] == np.repeat(first_match['min'].values, first_match['size'].values)].copy()
         # Remove loop units that do not exceed the exit path
         start_units = start_units[exit_conns.loc[start_units['eindex'].values, 'length'].values < start_units['sfrom'] + bidi_loops.loc[start_units['bindex'].values, 'length'].values].copy()
-        # Add loop unit information and try to reduce to ploidy alternatives
-        start_units[['loop','from','from_side','length']] = bidi_loops.loc[ start_units['bindex'].values, ['loop','scaf0','strand0','length']].values
-        start_units['from_side'] = np.where(start_units['from_side'] == '+', 'r', 'l')
-        cols = [f'{n}{s}' for s in range(1,start_units['length'].max()) for n in ['scaf','strand','dist']]
-        start_units[cols] = bidi_loops.loc[ start_units['bindex'].values, cols].values
-        start_units['group'] = start_units['eindex']
-        start_units = TryReducingAlternativesToPloidy(start_units, scaf_bridges, ploidy)
-        start_units.drop(columns=['group'], inplace=True)
-        # Remove exit_conns with more than ploidy units
-        nalts = start_units.groupby(['eindex']).size().reset_index(name='nalts')
-        exit_conns.loc[nalts['eindex'].values, 'from_units'] = nalts['nalts'].values
-        exit_conns = exit_conns[exit_conns['from_units'] <= ploidy].copy()
+        if len(start_units):
+            # Add loop unit information and try to reduce to ploidy alternatives
+            start_units[['loop','from','from_side','length']] = bidi_loops.loc[ start_units['bindex'].values, ['loop','scaf0','strand0','length']].values
+            start_units['from_side'] = np.where(start_units['from_side'] == '+', 'r', 'l')
+            start_units[['loop','from','length']] = start_units[['loop','from','length']].astype(int)
+            cols = [f'{n}{s}' for s in range(1,start_units['length'].max()) for n in ['scaf','strand','dist']]
+            start_units[cols] = bidi_loops.loc[ start_units['bindex'].values, cols].values
+            cols = [f'{n}{s}' for s in range(1,start_units['length'].max()) for n in ['scaf','dist']]
+            start_units[cols] = start_units[cols].astype(float)
+            start_units['group'] = start_units['eindex']
+            start_units = TryReducingAlternativesToPloidy(start_units, scaf_bridges, ploidy)
+            start_units.drop(columns=['group'], inplace=True)
+            # Remove exit_conns with more than ploidy units
+            nalts = start_units.groupby(['eindex']).size().reset_index(name='nalts')
+            exit_conns.loc[nalts['eindex'].values, 'from_units'] = nalts['nalts'].values
+            exit_conns = exit_conns[exit_conns['from_units'] <= ploidy].copy()
     exit_conns['ifrom'] = exit_conns.index.values
     exit_conns = exit_conns.merge( exit_conns[['loop','from','from_side','to','to_side','distance','from_alts','from_units','ifrom']].rename(columns={'from':'to','from_side':'to_side','to':'from','to_side':'from_side','from_alts':'to_alts','from_units':'to_units','ifrom':'ito'}), on=['loop','from','from_side','to','to_side','distance'], how='inner')
     exit_conns.drop_duplicates(inplace=True)
