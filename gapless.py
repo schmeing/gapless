@@ -4561,19 +4561,69 @@ def RequireContinuousDirectionForDuplications(duplications):
     ext = duplications[['cid']].reset_index()
     alternatives = []
     if len(ext):
+        # Find no conflicting extensions for every index
         cur_alts = ext.rename(columns={'index':'i0'})
         ext = ext.rename(columns={'index':'index1'}).merge(ext.rename(columns={'index':'index2'}), on=['cid'], how='left')
         ext = ext[ext['index1'] < ext['index2']].copy() # Only allow increasing index to avoid duplications, because the order is arbitrary
         ext = ext[ ext[['cid','index1','index2']].merge(conflicts[['cid','index1','index2']], on=['cid','index1','index2'], how='left', indicator=True)['_merge'].values == "left_only" ].copy()
+        # Get all possible extension for a given alternative
+        cur_alts['id'] = np.arange(len(cur_alts))
+        valid_ext = cur_alts[['id','cid','i0']].rename(columns={'i0':'index1'}).merge(ext, on=['cid','index1'], how='inner')
+        valid_ext.drop(columns=['index1'], inplace=True)
+        valid_ext.rename(columns={'index2':'index1'}, inplace=True)
+        # Iteratively extend
         s=1
         while len(cur_alts):
-            new_alts = cur_alts.merge(ext.rename(columns={'index1':f'i{s-1}','index2':f'i{s}'}), on=['cid',f'i{s-1}'], how='inner')
-            # Remove conflicts
-            for s2 in range(s-1):
-                new_alts = new_alts[ new_alts[['cid',f'i{s2}',f'i{s}']].rename(columns={f'i{s2}':'index1',f'i{s}':'index2'}).merge(conflicts[['cid','index1','index2']], on=['cid','index1','index2'], how='left', indicator=True)['_merge'].values == "left_only" ].copy()
-            alternatives.append( cur_alts[np.isin(cur_alts['cid'].values, np.unique(new_alts['cid'].values)) == False].copy() )
+            # Store alternatives if no alternative for this conflict has an extension anymore
+            alternatives.append( cur_alts[np.isin(cur_alts['cid'].values, valid_ext['cid'].values) == False].drop(columns='id') )
             alternatives[-1]['len'] = s
-            cur_alts = new_alts
+            # Add valid extension to all paths
+            valid_ext['new_id'] = np.arange(len(valid_ext))
+            cur_alts = cur_alts.merge(valid_ext.rename(columns={'index1':f'i{s}'}), on=['cid','id'], how='inner')
+            cur_alts['id'] = cur_alts['new_id']
+            cur_alts.drop(columns='new_id', inplace=True)
+            # Find next possible extensions for the alternatives
+            valid_ext = valid_ext.merge(valid_ext[['id','cid','index1']].rename(columns={'index1':'index2'}), on=['id','cid'], how='inner') # Must not have a conflict with all index in the path before this round
+            valid_ext['id'] = valid_ext['new_id']
+            valid_ext.drop(columns='new_id', inplace=True)
+            valid_ext = valid_ext.merge(ext, on=['cid','index1','index2'], how='inner') # Must not have a conflict with the index added to the path this round
+            valid_ext.drop(columns=['index1'], inplace=True)
+            valid_ext.rename(columns={'index2':'index1'}, inplace=True)
+            if len(valid_ext):
+                # Get maximum number of extensions still possible to add (without checking for conflicts within the possible extensions)
+                valid_ext['max_ext'] = valid_ext[['id']].merge(valid_ext.groupby('id').size().reset_index(name='max_ext'), on='id', how='left')['max_ext'].values
+                # Perform greedy extension to get minimum number of achievable extensions
+                greedy_ext = valid_ext.copy()
+                min_ext = []
+                e = 1
+                while len(greedy_ext):
+                    # Get best candidate for extension
+                    greedy_ext = greedy_ext[ greedy_ext['max_ext'] == greedy_ext[['cid']].merge(greedy_ext.groupby('cid')['max_ext'].max().reset_index(), on='cid', how='left')['max_ext'].values ].drop(columns=['max_ext'])
+                    greedy_ext = greedy_ext[ greedy_ext['id'] == greedy_ext[['cid']].merge( greedy_ext.groupby(['cid'])['id'].min().reset_index(), on='cid', how='left')['id'].values ].copy()
+                    greedy_ext['id'] = np.arange(len(greedy_ext))
+                    # Find next possible extensions
+                    greedy_ext = greedy_ext.merge(greedy_ext[['cid','index1']].rename(columns={'index1':'index2'}), on=['cid'], how='left') # Must not have a conflict with all index in the path before this round
+                    cur_cids = greedy_ext[['cid']].drop_duplicates()
+                    greedy_ext = greedy_ext.merge(ext, on=['cid','index1','index2'], how='inner') # Must not have a conflict with the index added to the path this round
+                    greedy_ext.drop(columns=['index1'], inplace=True)
+                    greedy_ext.rename(columns={'index2':'index1'}, inplace=True)
+                    # Add information for cids that are not extendible anymore
+                    cur_cids = cur_cids[np.isin(cur_cids['cid'], greedy_ext['cid']) == False].copy()
+                    cur_cids['min_ext'] = e
+                    min_ext.append(cur_cids)
+                    # Get maximum number of extensions still possible to add (without checking for conflicts within the possible extensions)
+                    greedy_ext['max_ext'] = greedy_ext[['id']].merge(greedy_ext.groupby('id').size().reset_index(name='max_ext'), on='id', how='left')['max_ext'].values
+                    # Prepare next iteration
+                    e += 1
+                min_ext = pd.concat(min_ext, ignore_index=True)
+                valid_ext['min_ext'] = valid_ext[['cid']].merge(min_ext, on='cid', how='left')['min_ext'].values
+                # Filter extensions that cannot be the ones with most matches
+                valid_ext = valid_ext[ valid_ext['max_ext'] >= valid_ext['min_ext'] ].copy()
+                valid_ext[['apos','bpos']] = duplications.loc[valid_ext['index1'].values, ['apos','bpos']].values
+                valid_ext['max_ext'] = np.minimum( valid_ext[['id']].merge( valid_ext[['id','apos']].drop_duplicates().groupby('id').size().reset_index(name='max_ext'), on='id', how='left')['max_ext'].values,
+                                                   valid_ext[['id']].merge( valid_ext[['id','bpos']].drop_duplicates().groupby('id').size().reset_index(name='max_ext'), on='id', how='left')['max_ext'].values )
+                valid_ext = valid_ext[ valid_ext['max_ext'] >= valid_ext['min_ext'] ].drop(columns={'max_ext','min_ext','apos','bpos'})
+            # Prepare next iteration
             s += 1
         alternatives = pd.concat(alternatives, ignore_index=True)
     if len(alternatives):
