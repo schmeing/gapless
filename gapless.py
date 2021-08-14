@@ -3305,8 +3305,8 @@ def TryReducingAlternativesToPloidy(alternatives, scaf_bridges, ploidy):
                 pairs.loc[pairs['match'] == False, 'scaf_miss'] = True
                 pairs = pairs[ pairs['s2'] < pairs['len2'] ].copy()
             reducible.append( pairs.loc[ s1+1 == pairs['len1'], ['index1','index2','scaf_miss'] ].copy() )
-            pairs = pairs[ s1+1 < pairs['len1'] ].copy()
             pairs['s2'] += 1
+            pairs = pairs[ (s1+1 < pairs['len1']) & (pairs['s2'] < pairs['len2']) ].copy()
         reducible = pd.concat(reducible, ignore_index=True)
         # Get bridge support for reducible alternatives
         bsupp_indexes = reducible[['index1']].copy()
