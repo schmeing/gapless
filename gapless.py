@@ -3204,9 +3204,12 @@ def GetReducedLoopUnits(loop_scafs, graph_ext, scaffold_graph, max_loop_units):
             loops = loops[ loops.merge(multi_repeat, on=list(multi_repeat.columns.values), how='left', indicator=True)['_merge'].values == "left_only" ].copy()
         # Find connections between loop units
         loop_conns = FindConnectionsBetweenLoopUnits(loops, graph_ext, scaffold_graph, False)
-        loop_conns['loop'] = loops.loc[loop_conns['lindex1'].values, 'loop'].values
-        # Remove loop units that are not connected to another loop unit (including itself, thus we do not have a loop)
-        loops = loops[np.isin(loops['loop'], np.unique(loop_conns['loop']))].copy()
+        if len(loop_conns):
+            loop_conns['loop'] = loops.loc[loop_conns['lindex1'].values, 'loop'].values
+            # Remove loop units that are not connected to another loop unit (including itself, thus we do not have a loop)
+            loops = loops[np.isin(loops['loop'], np.unique(loop_conns['loop']))].copy()
+        else:
+            loops = []
     else:
         loop_conns = []
     if len(loop_conns):
@@ -11887,13 +11890,6 @@ def TestTraverseScaffoldGraph():
         'strand0':  [    '+',    '+',    '+',    '-',    '+',    '+',    '+',    '+'],
         'dist0':    [      0,    179,    965,      4,   -519,     43,     55,     87]
         }) )
-    result_loops.append( pd.DataFrame({
-        'pid':      [    600,    600,    600,    600,    600,    600,    600,    600,    600,    600,    600,    600,    600],
-        'pos':      [      0,      1,      2,      3,      4,      5,      6,      7,      8,      9,     10,     11,     12],
-        'scaf0':    [   9064, 123226, 123238, 123225, 123231, 123227, 123236, 123226, 123237, 123227, 123230, 123225, 123229],
-        'strand0':  [    '-',    '+',    '+',    '+',    '+',    '+',    '+',    '+',    '+',    '+',    '+',    '+',    '+'],
-        'dist0':    [      0,     -5,      3,    -42,    -42,    549,    224,      2,      0,    542,    196,    -40,    -42]
-        }) )
     result_untraversed.append( pd.DataFrame({
         'pid':      [    600,    600],
         'pos':      [      0,      1],
@@ -11914,6 +11910,20 @@ def TestTraverseScaffoldGraph():
         'scaf0':    [ 123230, 123229],
         'strand0':  [    '+',    '+'],
         'dist0':    [      0,    590]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    603,    603],
+        'pos':      [      0,      1],
+        'scaf0':    [   9064, 123226],
+        'strand0':  [    '-',    '+'],
+        'dist0':    [      0,     -5]
+        }) )
+    result_untraversed.append( pd.DataFrame({
+        'pid':      [    604,    604],
+        'pos':      [      0,      1],
+        'scaf0':    [ 123226, 123238],
+        'strand0':  [    '+',    '+'],
+        'dist0':    [      0,      3]
         }) )
 #
     # Test 7
@@ -12076,6 +12086,7 @@ def TestTraverseScaffoldGraph():
 #
             if len(res_paths) == 0:
                 obtained_paths = scaf_paths
+                correct_paths = []
             else:
                 if test_func == "TraverseScaffoldGraph":
                     ploidy = org_ploidy
