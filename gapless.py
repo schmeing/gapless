@@ -1950,22 +1950,23 @@ def CheckScaffoldGraphConsistency(scaffold_graph):
 #
     # Check that also the entries at all intermediate starting points are present (we only need to check with the first entry removed, because if that one exists it itself checks the next shorter one)
     test_graph = scaffold_graph[scaffold_graph['length'] > 2].copy()
-    test_graph.drop(columns=['from','from_side','dist1'], inplace=True)
-    test_graph.rename(columns={f'{n}{s}':f'{n}{s-1}' for s in range(1,test_graph['length'].max()) for n in ['scaf','strand','dist']}, inplace=True)
-    test_graph['length'] -= 1
-    test_graph.rename(columns={'scaf0':'from','strand0':'from_side'}, inplace=True)
-    test_graph['from_side'] = np.where(test_graph['from_side'] == '+', 'r', 'l')
-    inconsistencies = []
-    for l in np.unique(test_graph['length']):
-        mcols = ['from','from_side'] + [f'{n}{s}' for s in range(1,l) for n in ['scaf','strand','dist']]
-        inconsistencies.append( test_graph.loc[test_graph['length'] == l, mcols].merge(scaffold_graph[mcols], on=mcols, how='left', indicator=True) )
-        inconsistencies[-1] = inconsistencies[-1][ inconsistencies[-1]['_merge'] != "both" ].copy()
-    if len(inconsistencies):
-        inconsistencies = pd.concat(inconsistencies, ignore_index=True)
-    if len(inconsistencies):
-        inconsistencies = RemoveEmptyColumns(inconsistencies)
-        print(inconsistencies)
-        raise RuntimeError("Scaffold graph is inconsistent: Not all intermediate starting points are present.")
+    if len(test_graph):
+        test_graph.drop(columns=['from','from_side','dist1'], inplace=True)
+        test_graph.rename(columns={f'{n}{s}':f'{n}{s-1}' for s in range(1,test_graph['length'].max()) for n in ['scaf','strand','dist']}, inplace=True)
+        test_graph['length'] -= 1
+        test_graph.rename(columns={'scaf0':'from','strand0':'from_side'}, inplace=True)
+        test_graph['from_side'] = np.where(test_graph['from_side'] == '+', 'r', 'l')
+        inconsistencies = []
+        for l in np.unique(test_graph['length']):
+            mcols = ['from','from_side'] + [f'{n}{s}' for s in range(1,l) for n in ['scaf','strand','dist']]
+            inconsistencies.append( test_graph.loc[test_graph['length'] == l, mcols].merge(scaffold_graph[mcols], on=mcols, how='left', indicator=True) )
+            inconsistencies[-1] = inconsistencies[-1][ inconsistencies[-1]['_merge'] != "both" ].copy()
+        if len(inconsistencies):
+            inconsistencies = pd.concat(inconsistencies, ignore_index=True)
+        if len(inconsistencies):
+            inconsistencies = RemoveEmptyColumns(inconsistencies)
+            print(inconsistencies)
+            raise RuntimeError("Scaffold graph is inconsistent: Not all intermediate starting points are present.")
 
 def BuildScaffoldGraph(long_range_connections, scaf_bridges):
     # First start from every contig and extend in both directions on valid reads
@@ -3379,39 +3380,40 @@ def GetLoopUnitsInBothDirections(loops):
     return bidi_loops
 
 def RemoveUnrepeatedLoopUnits(bidi_loops, exit_conns, scaffold_graph, loop_scafs):
-    ## If a scaffold(veto) within a loop unit connects with all paths to an exit we remove the loop unit, because it is not repeated
-    # Find all scaffolds in exit_conns that are potentially vetos
-    vetos = []
-    for s in range(1,exit_conns['length'].max()):
-        vetos.append( exit_conns.loc[np.isnan(exit_conns[f'scaf{s}']) == False, ['loop',f'scaf{s}']].rename(columns={f'scaf{s}':'scaf'}) )
-    vetos = pd.concat(vetos, ignore_index=True).drop_duplicates()
-    vetos['scaf'] = vetos['scaf'].astype(int)
-    # Find all the scaffold graph entries for the vetos and check if they connect to an exit
-    veto_graph = vetos.merge( scaffold_graph[['from','length']+[f'scaf{s}' for s in range(1,scaffold_graph['length'].max())]].reset_index().rename(columns={'index':'sindex','from':'scaf'}), on='scaf', how='inner' )
-    vetos = []
-    for s in range(1,veto_graph['length'].max()):
-        vetos.append( veto_graph.loc[np.isnan(veto_graph[f'scaf{s}']) == False, ['loop','scaf','sindex',f'scaf{s}']].rename(columns={f'scaf{s}':'escaf'}) )
-    vetos = pd.concat(vetos, ignore_index=True).drop_duplicates()
-    vetos['escaf'] = vetos['escaf'].astype(int)
-    vetos['exit'] = vetos[['loop','escaf']].merge(loop_scafs.loc[loop_scafs['exit'], ['loop','scaf']].rename(columns={'scaf':'escaf'}), on=['loop','escaf'], how='left', indicator=True)['_merge'].values == "both"
-    vetos = vetos.groupby(['loop','scaf','sindex'])['exit'].max().reset_index() # Does the scaffold graph entry (sindex) has an exit in it
-    # Only keep vetos, where all graph entries connect to an exit
-    vetos = vetos.groupby(['loop','scaf'])['exit'].min().reset_index() # Do all scaffold graph entries for a scaffold have an exit in them
-    vetos = vetos.loc[vetos['exit'], ['loop','scaf']].drop_duplicates()
-    veto_units = []
-    # Find and remove the loop units containing the veto
-    if len(vetos):
-        possible_vetos = bidi_loops[np.isin(bidi_loops['loop'], vetos['loop'].values)].copy()
-        s=1
-        while len(possible_vetos):
-            veto_units.append( possible_vetos[['loop',f'scaf{s}']].reset_index().rename(columns={f'scaf{s}':'scaf'}).merge(vetos, on=['loop','scaf'], how='inner')['index'].values )
-            possible_vetos.drop(veto_units[-1], inplace=True)
-            s += 1
-            possible_vetos = possible_vetos[possible_vetos['length'] > s].copy()
-        if len(veto_units):
-            veto_units = np.concatenate(veto_units)
-        if len(veto_units):
-            bidi_loops.drop(veto_units, inplace=True)
+    if len(exit_conns):
+        ## If a scaffold(veto) within a loop unit connects with all paths to an exit we remove the loop unit, because it is not repeated
+        # Find all scaffolds in exit_conns that are potentially vetos
+        vetos = []
+        for s in range(1,exit_conns['length'].max()):
+            vetos.append( exit_conns.loc[np.isnan(exit_conns[f'scaf{s}']) == False, ['loop',f'scaf{s}']].rename(columns={f'scaf{s}':'scaf'}) )
+        vetos = pd.concat(vetos, ignore_index=True).drop_duplicates()
+        vetos['scaf'] = vetos['scaf'].astype(int)
+        # Find all the scaffold graph entries for the vetos and check if they connect to an exit
+        veto_graph = vetos.merge( scaffold_graph[['from','length']+[f'scaf{s}' for s in range(1,scaffold_graph['length'].max())]].reset_index().rename(columns={'index':'sindex','from':'scaf'}), on='scaf', how='inner' )
+        vetos = []
+        for s in range(1,veto_graph['length'].max()):
+            vetos.append( veto_graph.loc[np.isnan(veto_graph[f'scaf{s}']) == False, ['loop','scaf','sindex',f'scaf{s}']].rename(columns={f'scaf{s}':'escaf'}) )
+        vetos = pd.concat(vetos, ignore_index=True).drop_duplicates()
+        vetos['escaf'] = vetos['escaf'].astype(int)
+        vetos['exit'] = vetos[['loop','escaf']].merge(loop_scafs.loc[loop_scafs['exit'], ['loop','scaf']].rename(columns={'scaf':'escaf'}), on=['loop','escaf'], how='left', indicator=True)['_merge'].values == "both"
+        vetos = vetos.groupby(['loop','scaf','sindex'])['exit'].max().reset_index() # Does the scaffold graph entry (sindex) has an exit in it
+        # Only keep vetos, where all graph entries connect to an exit
+        vetos = vetos.groupby(['loop','scaf'])['exit'].min().reset_index() # Do all scaffold graph entries for a scaffold have an exit in them
+        vetos = vetos.loc[vetos['exit'], ['loop','scaf']].drop_duplicates()
+        veto_units = []
+        # Find and remove the loop units containing the veto
+        if len(vetos):
+            possible_vetos = bidi_loops[np.isin(bidi_loops['loop'], vetos['loop'].values)].copy()
+            s=1
+            while len(possible_vetos):
+                veto_units.append( possible_vetos[['loop',f'scaf{s}']].reset_index().rename(columns={f'scaf{s}':'scaf'}).merge(vetos, on=['loop','scaf'], how='inner')['index'].values )
+                possible_vetos.drop(veto_units[-1], inplace=True)
+                s += 1
+                possible_vetos = possible_vetos[possible_vetos['length'] > s].copy()
+            if len(veto_units):
+                veto_units = np.concatenate(veto_units)
+            if len(veto_units):
+                bidi_loops.drop(veto_units, inplace=True)
 #
     return bidi_loops
 
