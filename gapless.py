@@ -3226,7 +3226,7 @@ def GetReducedLoopUnits(loop_scafs, graph_ext, scaffold_graph, max_loop_units):
                     loop_conns[f'len{i}'] = loops.loc[loop_conns[f'lindex{i}'].values, 'length'].values
                 for l in np.unique(loop_conns.loc[loop_conns['append'], 'len1']):
                     cur = loop_conns[loop_conns['append'] & (loop_conns['len1'] == l)]
-                    loops.loc[cur['lindex1'].values, [f'{n}{s}' for s in range(l,l+cur['len2'].max()) for n in ['scaf','strand','dist']]] = loops.loc[cur['lindex2'].values, [f'{n}{s}' for s in range(1,1+cur['len2'].max()) for n in ['scaf','strand','dist']]].values
+                    loops.loc[cur['lindex1'].values, [f'{n}{s}' for s in range(l,l+cur['len2'].max()-1) for n in ['scaf','strand','dist']]] = loops.loc[cur['lindex2'].values, [f'{n}{s}' for s in range(1,cur['len2'].max()) for n in ['scaf','strand','dist']]].values
                 cur = loop_conns[loop_conns['append']].copy()
                 loops.loc[cur['lindex1'].values, 'length'] += cur['len2'].values - 1
                 loop_conns.drop(columns=['len1','len2'], inplace=True) # Lengths change, so do not keep outdated information
@@ -7044,7 +7044,7 @@ def PhaseScaffoldsWithScafBridges(scaffold_paths, scaf_bridges, ploidy):
                 cur['deletion'] = cur['deletion'] | (cur['from'] == -1)
                 test_bridges.append( cur.loc[cur['update'] & (cur['from_phase'] > 0) & (cur['to_phase'] > 0) & (cur['to'] >= 0) & (cur['from'] >= 0) & (cur['from_phase'] != cur['to_phase']), ['pid','from_pos','from_hap','from_phase','from','from_side','to_pos','to_hap','to_phase','to','to_side','mean_dist']].copy() )
             s += 1
-            cur['update'] = cur['deletion']
+            cur['update'] = cur['update'] & cur['deletion']
     test_bridges = pd.concat(test_bridges, ignore_index=True)
     # Filter to have only valid bridges
     test_bridges = test_bridges.merge(scaf_bridges[['from','from_side','to','to_side','mean_dist']], on=['from','from_side','to','to_side','mean_dist'], how='inner')
