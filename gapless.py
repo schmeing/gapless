@@ -7307,7 +7307,9 @@ def ExpandScaffoldsWithContigs(scaffold_paths, scaffolds, scaffold_parts, ploidy
         not_first = scaffold_paths['mpos'].values != np.where(scaffold_paths[f'strand{h}'] == '+', 0, scaffold_paths[f'size{h}']-1)
         if h>0:
             # Remove alternatives that are the same except for distance for all position except the first, where we need the distance
-            scaffold_paths.loc[(scaffold_paths[f'scaf{h}'] == scaffold_paths['scaf0']) & (scaffold_paths[f'strand{h}'] == scaffold_paths['strand0']) & not_first, [f'phase{h}',f'scaf{h}',f'strand{h}',f'dist{h}']] = [-1,-1,'',0]
+            rem = (scaffold_paths[f'scaf{h}'] == scaffold_paths['scaf0']) & (scaffold_paths[f'strand{h}'] == scaffold_paths['strand0']) & not_first
+            scaffold_paths.loc[rem, f'phase{h}'] = -np.abs(scaffold_paths.loc[rem, f'phase{h}'].values)
+            scaffold_paths.loc[rem, [f'scaf{h}',f'strand{h}',f'dist{h}']] = [-1,'',0]
         scaffold_paths = scaffold_paths.merge(scaffold_parts.rename(columns={'scaffold':f'scaf{h}','pos':'mpos'}), on=[f'scaf{h}','mpos'], how='left')
         scaffold_paths.loc[np.isnan(scaffold_paths['conpart']), [f'scaf{h}',f'strand{h}',f'dist{h}']] = [-1,'',0] # Set positions that do not have a match (scaffold is shorter than for other haplotypes) to a deletion
         scaffold_paths.loc[np.isnan(scaffold_paths['conpart']) == False, f'scaf{h}'] = scaffold_paths.loc[np.isnan(scaffold_paths['conpart']) == False, 'conpart'].astype(int)
@@ -7935,18 +7937,26 @@ def MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploi
             break
         else:
             print( len(conn_cov[conn_cov['cov'] == 0]), "gaps were created for which no read for filling can be found. The connections will be broken up again.")
+            # Store scaffold_paths to later check if the deletion did not work
+            old_scaffold_paths = scaffold_paths.copy()
+            # Get the phase on the right side and if that is identical to main the one on the left side
+            rem_conns = conn_cov.loc[conn_cov['cov'] == 0, ['scaf','lpos','rpos','hap']].copy()
+            rem_conns[[f'phase{h}' for h in range(1,ploidy)]] = rem_conns[['scaf','rpos']].rename(columns={'rpos':'pos'}).merge(scaffold_paths[['scaf','pos']+[f'phase{h}' for h in range(1,ploidy)]], on=['scaf','pos'], how='inner')[[f'phase{h}' for h in range(1,ploidy)]].values
+            rem_conns[[f'lphase{h}' for h in range(1,ploidy)]] = rem_conns[['scaf','lpos']].rename(columns={'lpos':'pos'}).merge(scaffold_paths[['scaf','pos']+[f'phase{h}' for h in range(1,ploidy)]], on=['scaf','pos'], how='inner')[[f'phase{h}' for h in range(1,ploidy)]].values
+            rem_conns[[f'phase{h}' for h in range(1,ploidy)]] = np.where((rem_conns[[f'phase{h}' for h in range(1,ploidy)]].values < 0) & (rem_conns[[f'lphase{h}' for h in range(1,ploidy)]].values > 0), rem_conns[[f'lphase{h}' for h in range(1,ploidy)]].values, rem_conns[[f'phase{h}' for h in range(1,ploidy)]].values)
+            rem_conns.drop(columns=[f'lphase{h}' for h in range(1,ploidy)], inplace=True)
             # Start with alternative paths
             for h in range(1,ploidy):
-                rem = conn_cov.loc[(conn_cov['cov'] == 0) & (conn_cov['hap'] == h), ['scaf','rpos']].rename(columns={'rpos':'pos'}).merge(scaffold_paths[['scaf','pos',f'phase{h}']], on=['scaf','pos'], how='inner')[f'phase{h}'].values
-                rem = np.isin(scaffold_paths[f'phase{h}'], np.abs(rem))
+                rem = rem_conns.loc[rem_conns['hap'] == h, f'phase{h}']
+                rem = np.isin(scaffold_paths[f'phase{h}'], np.abs(rem.values))
                 if np.sum(rem):
                     scaffold_paths.loc[rem, [f'con{h}',f'strand{h}',f'dist{h}']] = [-1,'',0]
                     scaffold_paths.loc[rem, f'phase{h}'] = -scaffold_paths.loc[rem, f'phase{h}']
+            rem_conns = rem_conns[rem_conns['hap'] == 0].copy()
             # Continue with main paths that has alternatives
-            rem_conns = conn_cov[(conn_cov['cov'] == 0) & (conn_cov['hap'] == 0)].copy()
             for h in range(1,ploidy):
-                rem = rem_conns[['scaf','rpos']].reset_index().rename(columns={'rpos':'pos'}).merge(scaffold_paths.loc[scaffold_paths[f'phase{h}'] >= 0, ['scaf','pos',f'phase{h}']], on=['scaf','pos'], how='inner')
-                rem_conns.drop(rem['index'].values, inplace=True)
+                rem = rem_conns[rem_conns[f'phase{h}'] >= 0].copy()
+                rem_conns.drop(rem.index.values, inplace=True)
                 rem = np.isin(scaffold_paths[f'phase{h}'], rem[f'phase{h}'].values)
                 if np.sum(rem):
                     scaffold_paths.loc[rem, ['phase0','con0','strand0','dist0']] = scaffold_paths.loc[rem, [f'phase{h}',f'con{h}',f'strand{h}',f'dist{h}']].values
@@ -7961,6 +7971,11 @@ def MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploi
             scaffold_paths['pos'] = scaffold_paths.groupby(['scaf'], sort=False).cumcount()
             scaffold_paths.loc[scaffold_paths['pos'] == 0, 'dist0'] = 0
             mappings = org_mappings.copy()
+            # Check if we are in an endless loop
+            if len(old_scaffold_paths) == len(scaffold_paths):
+                if len(scaffold_paths.merge(old_scaffold_paths, on=list(scaffold_paths.columns), how='inner')) == len(scaffold_paths):
+                    print(conn_cov.loc[conn_cov['cov'] == 0, ['scaf','lpos','rpos','hap']])
+                    raise RuntimeError("Connections were not broken and we ran into an endless loop.")
     # Store the position of overlap_bridges
     if len(overlap_bridges):
         overlap_bridges = zero_cov.merge(overlap_bridges, on=['q_con','q_side','t_con','t_side'], how='inner')
