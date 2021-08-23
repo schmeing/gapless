@@ -112,9 +112,9 @@ do
     # Split
     if [ ! -f pass${i}/gapless_split.fa ] || [ $reset = true ]; then
       if [ $i -eq 1 ]; then
-        env time -v -o pass${i}/timing/gapless_split.txt gapless.py split -o pass1/gapless_split.fa "${org_path}/${asm}" >pass${i}/logs/gapless_split.log 2>&1
+        env time -v -o pass${i}/timing/gapless_split.txt gapless.py split -o pass1/gapless_split.fa "${org_path}/${asm}" >pass${i}/logs/gapless_split.log 2>&1 || rm -f pass1/gapless_split.fa
       else
-        env time -v -o pass${i}/timing/gapless_split.txt gapless.py split -o pass${i}/gapless_split.fa pass$(expr $i - 1)/gapless.fa >pass${i}/logs/gapless_split.log 2>&1
+        env time -v -o pass${i}/timing/gapless_split.txt gapless.py split -o pass${i}/gapless_split.fa pass$(expr $i - 1)/gapless.fa >pass${i}/logs/gapless_split.log 2>&1 || rm -f pass${i}/gapless_split.fa
       fi
       if [ ! -f pass${i}/gapless_split.fa ]; then
         echo "pipeline crashed: split"
@@ -124,15 +124,18 @@ do
     # Scaffold
     if [ ! -f pass${i}/gapless_scaffold_paths.csv ] || [ $reset = true ]; then
       if [ ! -f pass${i}/gapless_split_repeats.paf ] || [ $reset = true ]; then
-        env time -v -o pass${i}/timing/minimap2_repeats.txt minimap2 -t $threads -DP -k19 -w19 -m200 pass${i}/gapless_split.fa pass${i}/gapless_split.fa > pass${i}/gapless_split_repeats.paf 2>pass${i}/logs/minimap2_repeats.log
+        env time -v -o pass${i}/timing/minimap2_repeats.txt minimap2 -t $threads -DP -k19 -w19 -m200 pass${i}/gapless_split.fa pass${i}/gapless_split.fa > pass${i}/gapless_split_repeats.paf 2>pass${i}/logs/minimap2_repeats.log || rm -f pass${i}/gapless_split_repeats.paf
       fi
       if [ ! -f pass${i}/gapless_reads.paf ] || [ $reset = true ]; then
-        env time -v -o pass${i}/timing/minimap2_reads.txt minimap2 -t $threads -x $mm_map -c -N 5 --secondary=no pass${i}/gapless_split.fa "${org_path}/${reads}" > pass${i}/gapless_reads.paf 2>pass${i}/logs/minimap2_reads.log
-        #env time -v -o pass${i}/timing/minimap2_reads.txt minimap2 -t $threads -x $mm_map -N 5 --secondary=no pass${i}/gapless_split.fa "${org_path}/${reads}" > pass${i}/gapless_reads.paf 2>pass${i}/logs/minimap2_reads.log
+        env time -v -o pass${i}/timing/minimap2_reads.txt minimap2 -t $threads -x $mm_map -c -N 5 --secondary=no pass${i}/gapless_split.fa "${org_path}/${reads}" > pass${i}/gapless_reads.paf 2>pass${i}/logs/minimap2_reads.log || rm -f pass${i}/gapless_reads.paf
+        #env time -v -o pass${i}/timing/minimap2_reads.txt minimap2 -t $threads -x $mm_map -N 5 --secondary=no pass${i}/gapless_split.fa "${org_path}/${reads}" > pass${i}/gapless_reads.paf 2>pass${i}/logs/minimap2_reads.log || rm -f pass${i}/gapless_reads.paf
       fi
       rm -f pass${i}/gapless.fa # Remove the final file here, so that we can be certain that if it exists later it is the new one not an old one
       env time -v -o pass${i}/timing/gapless_scaffold.txt gapless.py scaffold -p pass${i}/gapless -s pass${i}/gapless_stats.pdf pass${i}/gapless_split.fa pass${i}/gapless_reads.paf pass${i}/gapless_split_repeats.paf >pass${i}/logs/gapless_scaffold.log 2>&1 &&\
       rm -f pass${i}/gapless_reads.paf pass${i}/gapless_split_repeats.paf
+      if [ -f pass${i}/gapless_reads.paf ]; then
+		rm -f pass${i}/gapless_scaffold_paths.csv
+	  fi
       if [ ! -f pass${i}/gapless_scaffold_paths.csv ]; then
         echo "pipeline crashed : scaffold"
         exit 1
@@ -144,10 +147,13 @@ do
         #mkfifo pipe
         #seqtk subseq "${org_path}/${reads}" pass${i}/gapless_extending_reads.lst | tee pipe | env time -v -o pass${i}/timing/minimap2_extension.txt minimap2 -t $threads -x $mm_ava - <(cat pipe) > pass${i}/gapless_extending_reads.paf 2>pass${i}/logs/minimap2_extension.log
         #rm -f pipe
-        env time -v -o pass${i}/timing/minimap2_extension.txt minimap2 -t $threads -x $mm_ava <(seqtk subseq "${org_path}/${reads}" pass${i}/gapless_extending_reads.lst) <(seqtk subseq "${org_path}/${reads}" pass${i}/gapless_extending_reads.lst) > pass${i}/gapless_extending_reads.paf 2>pass${i}/logs/minimap2_extension.log
+        env time -v -o pass${i}/timing/minimap2_extension.txt minimap2 -t $threads -x $mm_ava <(seqtk subseq "${org_path}/${reads}" pass${i}/gapless_extending_reads.lst) <(seqtk subseq "${org_path}/${reads}" pass${i}/gapless_extending_reads.lst) > pass${i}/gapless_extending_reads.paf 2>pass${i}/logs/minimap2_extension.log || rm -f pass${i}/gapless_extending_reads.paf
       fi
       env time -v -o pass${i}/timing/gapless_extend.txt gapless.py extend -p pass${i}/gapless pass${i}/gapless_extending_reads.paf >pass${i}/logs/gapless_extend.log 2>&1 &&\
       rm -f pass${i}/gapless_extending_reads.paf
+      if [ -f pass${i}/gapless_extending_reads.paf ]; then
+		rm -f pass${i}/gapless_extended_scaffold_paths.csv
+	  fi
       if [ ! -f pass${i}/gapless_extended_scaffold_paths.csv ]; then
         echo "pipeline crashed: extend"
         exit 1
@@ -155,7 +161,7 @@ do
     fi
     # Finish
     if [ ! -f pass${i}/gapless_raw.fa ] || [ $reset = true ]; then
-      env time -v -o pass${i}/timing/gapless_finish.txt gapless.py finish -o pass${i}/gapless_raw.fa -H 0 -s pass${i}/gapless_extended_scaffold_paths.csv pass${i}/gapless_split.fa <(seqtk subseq "${org_path}/${reads}" pass${i}/gapless_used_reads.lst) >pass${i}/logs/gapless_finish.log 2>&1 
+      env time -v -o pass${i}/timing/gapless_finish.txt gapless.py finish -o pass${i}/gapless_raw.fa -H 0 -s pass${i}/gapless_extended_scaffold_paths.csv pass${i}/gapless_split.fa <(seqtk subseq "${org_path}/${reads}" pass${i}/gapless_used_reads.lst) >pass${i}/logs/gapless_finish.log 2>&1 || rm -f pass${i}/gapless_raw.fa
       if [ ! -f pass${i}/gapless_raw.fa ]; then
         echo "pipeline crashed: finish"
         exit 1
@@ -163,7 +169,7 @@ do
     fi
 	# Consensus
 	if [ ! -f pass${i}/gapless_consensus.paf ] || [ $reset = true ]; then
-      env time -v -o pass${i}/timing/minimap2_consensus.txt minimap2 -t $threads -x $mm_map pass${i}/gapless_raw.fa "${org_path}/${reads}" > pass${i}/gapless_consensus.paf 2>pass${i}/logs/minimap2_consensus.log
+      env time -v -o pass${i}/timing/minimap2_consensus.txt minimap2 -t $threads -x $mm_map pass${i}/gapless_raw.fa "${org_path}/${reads}" > pass${i}/gapless_consensus.paf 2>pass${i}/logs/minimap2_consensus.log || rm -f pass${i}/gapless_consensus.paf
     fi
     env time -v -o pass${i}/timing/racon.txt racon -t $threads "${org_path}/${reads}" pass${i}/gapless_consensus.paf pass${i}/gapless_raw.fa > pass${i}/gapless.fa 2>pass${i}/logs/racon.log &&\
     rm -f pass${i}/gapless_consensus.paf pass${i}/gapless_raw.fa pass${i}/gapless_split.fa
