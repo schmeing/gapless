@@ -3263,8 +3263,9 @@ def HandleBridgedRepeats(exits, loop_scafs):
             bridged_repeats.append( exits.loc[exits['bridged'] & (exits['from'] < exits[f'scaf{s}']), ['loop','from','from_side']+[f'{n}{s}' for s in range(1,s+1) for n in ['scaf','strand','dist']]].drop_duplicates() )
             bridged_repeats[-1]['length'] = s+1
             exits = exits[exits['bridged'] == False].copy()
-        exits.drop(columns=['bridged'], inplace=True)
-        bridged_repeats = pd.concat(bridged_repeats, ignore_index=True, sort=False)
+        if len(bridged_repeats):
+            exits.drop(columns=['bridged'], inplace=True)
+            bridged_repeats = pd.concat(bridged_repeats, ignore_index=True, sort=False)
         if len(bridged_repeats):
             bridged_repeats.rename(columns={'from':'scaf0','from_side':'strand0'}, inplace=True)
             bridged_repeats['strand0'] = np.where(bridged_repeats['strand0'] == 'r', '+', '-')
