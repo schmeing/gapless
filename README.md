@@ -83,8 +83,8 @@ minimap2 -t {threads} -x {read_type} gapless_raw.fa {input_reads} > gapless_cons
 racon -t {threads} {input_reads} gapless_consensus.paf gapless_raw.fa > gapless.fa
 ```
 
-`{read_type}` is `map-pb`, `map-hifi` or `map-ont` depending on the type of long reads.
-`{read_type2}` is `ava-pb`, `map-hifi -X -e0 -m100` or `ava-ont` depending on the type of long reads.
+`{read_type}` is `map-pb`, `asm20` or `map-ont` depending on the type of long reads.
+`{read_type2}` is `ava-pb`, `ava-pb` or `ava-ont` depending on the type of long reads.
 
 ## <a name="parameter"></a>Parameter
 `gapless.sh [OPTIONS] {long_reads}.fq`
