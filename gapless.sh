@@ -1,4 +1,5 @@
 #!/bin/bash
+set -uo pipefail
 
 # Declare functions
 function echo_usage {
