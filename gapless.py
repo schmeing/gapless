@@ -7020,6 +7020,31 @@ def AssignNewPhases(scaffold_paths, phase_change_in, ploidy):
 #
     return scaffold_paths
 
+def AssignDeletionsToFollowingPhase(scaffold_paths, ploidy):
+    for h in range(ploidy):
+        scaffold_paths['deletion'] = np.where(scaffold_paths[f'phase{h}'] > 0, scaffold_paths[f'scaf{h}'], scaffold_paths['scaf0']) < 0
+        while True:
+            scaffold_paths['new_phase'] = np.where(scaffold_paths['deletion'], np.where(scaffold_paths['pid'] == scaffold_paths['pid'].shift(-1), np.sign(scaffold_paths[f'phase{h}'])*np.abs(scaffold_paths[f'phase{h}'].shift(-1, fill_value=0)), 0), scaffold_paths[f'phase{h}'])
+            if np.sum(scaffold_paths['new_phase'] != scaffold_paths[f'phase{h}']) == 0:
+                break
+            else:
+                scaffold_paths[f'phase{h}'] = scaffold_paths['new_phase']
+        # Make sure we do not have a phase equal to zero at the beginning of a paths (which would mean a paths purely formed by deletions)
+        all_del_paths = scaffold_paths.loc[(scaffold_paths['pid'] != scaffold_paths['pid'].shift(1, fill_value=-1)) & (scaffold_paths[f'phase{h}'] == 0), 'pid'].values
+        if len(all_del_paths):
+            all_del_paths = np.isin(scaffold_paths['pid'], all_del_paths)
+            scaffold_paths.loc[all_del_paths, f'phase{h}'] = scaffold_paths.loc[all_del_paths, 'phase0'].values
+            all_del_paths = scaffold_paths.loc[(scaffold_paths['pid'] != scaffold_paths['pid'].shift(1, fill_value=-1)) & (scaffold_paths[f'phase{h}'] == 0), 'pid'].values
+            if len(all_del_paths):
+                print( scaffold_paths[np.isin(scaffold_paths['pid'], all_del_paths)] )
+                raise RuntimeError("Mainpath purely formed out of deletions discovered.")
+        # We introduced zero phases, where the deletions were at the path end, now we have to assign the previous phase to them
+        while np.sum(scaffold_paths[f'phase{h}'] == 0):
+            scaffold_paths[f'phase{h}'] = np.where(scaffold_paths[f'phase{h}'] == 0, scaffold_paths[f'phase{h}'].shift(1, fill_value=0), scaffold_paths[f'phase{h}'])
+    scaffold_paths.drop(columns=['deletion','new_phase'], inplace=True)
+#
+    return scaffold_paths
+
 def PhaseScaffoldsWithScafBridges(scaffold_paths, scaf_bridges, ploidy):
     ## Combine phases where scaf_bridges leaves only one option
     # First get all bridges combining phases (ignoring deletions)
@@ -7056,73 +7081,8 @@ def PhaseScaffoldsWithScafBridges(scaffold_paths, scaf_bridges, ploidy):
     test_bridges['to_alts'] = test_bridges[['pid','to_pos','to_hap']].merge(test_bridges.groupby(['pid','to_pos','to_hap']).size().reset_index(name='alts'), on=['pid','to_pos','to_hap'], how='left')['alts'].values
     test_bridges = test_bridges.loc[(test_bridges['from_alts'] == 1) & (test_bridges['to_alts'] == 1), ['from_phase','to_phase']].copy()
     scaffold_paths = AssignNewPhases(scaffold_paths, test_bridges, ploidy)
-    # Handle deletions by assigning them to the following phase if that phase cannot connect to an alternative to going through the deletion
-    deletions = []
-    for h in range(ploidy):
-        scaffold_paths['deletion'] = np.where(scaffold_paths[f'phase{h}'] > 0, scaffold_paths[f'scaf{h}'], scaffold_paths['scaf0']) < 0
-        scaffold_paths['add'] = (scaffold_paths['deletion'] == False) & (scaffold_paths[f'phase{h}'] > 0)
-        s = 1
-        while True:
-            scaffold_paths['add'] = scaffold_paths['add'] & scaffold_paths['deletion'].shift(s) & (scaffold_paths['pid'] == scaffold_paths['pid'].shift(s))
-            scaffold_paths['from_phase'] = np.abs(scaffold_paths[f'phase{h}'].shift(s, fill_value=0)) # We need the phase of the deletion later, not the one of the checked connection, since we are looking for no valid connections
-            if np.sum(scaffold_paths['add']):
-                for h2 in range(ploidy):
-                    if h2 != h:
-                        for s2 in range(1,s+1):
-                            scaffold_paths['from'] = scaffold_paths[f'scaf{h2}'].shift(s2, fill_value=-1)
-                            scaffold_paths['from_side'] = scaffold_paths[f'strand{h2}'].shift(s2, fill_value='')
-                            deletions.append( scaffold_paths.loc[scaffold_paths['add'] & (scaffold_paths[f'phase{h2}'].shift(s2) > 0) & (scaffold_paths['from'] >= 0), ['pid','pos','from_phase','from','from_side',f'phase{h}',f'scaf{h}',f'strand{h}',f'dist{h}']].rename(columns={f'phase{h}':'to_phase',f'scaf{h}':'to',f'strand{h}':'to_side',f'dist{h}':'mean_dist'}) )
-                s += 1
-                scaffold_paths.drop(columns=['from','from_side'], inplace=True)
-            else:
-                break
-    scaffold_paths.drop(columns=['deletion','add','from_phase'], inplace=True)
-    if len(deletions):
-        deletions = pd.concat(deletions, ignore_index=True)
-    if len(deletions):
-        deletions['from_side'] = np.where(deletions['from_side'] == '+', 'r', 'l')
-        deletions['to_side'] = np.where(deletions['to_side'] == '+', 'l', 'r')
-        deletions['valid'] = deletions[['from','from_side','to','to_side','mean_dist']].merge(scaf_bridges[['from','from_side','to','to_side','mean_dist']], on=['from','from_side','to','to_side','mean_dist'], how='left', indicator=True)['_merge'].values == "both"
-        deletions.sort_values(['pid','pos','from_phase'], inplace=True)
-        valid = deletions.groupby(['pid','pos','from_phase'], sort=False)['valid'].agg(['max','size'])
-        deletions['valid'] = np.repeat(valid['max'].values, valid['size'].values)
-        deletions = deletions.loc[deletions['valid'] == False, ['from_phase','to_phase']].drop_duplicates()
-        deletions.rename(columns={'from_phase':'to_phase','to_phase':'from_phase'}, inplace=True) # We need to assign 'to_phase' to 'from_phase', because from_phase is unique, but to_phase not necessarily
-        scaffold_paths = AssignNewPhases(scaffold_paths, deletions, ploidy)
-    # Combine adjacent deletions if the previous phase has no connection into the deletion (to a position of the deletion that is not the first)
-    deletions = []
-    for h in range(ploidy):
-        scaffold_paths['deletion'] = np.where(scaffold_paths[f'phase{h}'] > 0, scaffold_paths[f'scaf{h}'], scaffold_paths['scaf0']) < 0
-        scaffold_paths['add'] = (scaffold_paths['deletion'] == False) & (scaffold_paths['deletion'].shift(-1) == True) & (scaffold_paths[f'phase{h}'] > 0)
-        scaffold_paths['from_phase'] = scaffold_paths[f'phase{h}'].shift(-1, fill_value=0)
-        s = 2
-        while True:
-            scaffold_paths['add'] = scaffold_paths['add'] & scaffold_paths['deletion'].shift(-s) & (scaffold_paths['pid'] == scaffold_paths['pid'].shift(-s))
-            scaffold_paths['to_phase'] = np.abs(scaffold_paths[f'phase{h}'].shift(-s, fill_value=0)) # We need the phase of the deletion later, not the one of the checked connection, since we are looking for no valid connections
-            if np.sum(scaffold_paths['add']):
-                for h2 in range(ploidy):
-                    if h2 != h:
-                        for s2 in range(2,s+1):
-                            scaffold_paths['to'] = scaffold_paths[f'scaf{h2}'].shift(-s2, fill_value=-1)
-                            scaffold_paths['to_side'] = scaffold_paths[f'strand{h2}'].shift(-s2, fill_value='')
-                            scaffold_paths['mean_dist'] = scaffold_paths[f'dist{h2}'].shift(-s2, fill_value=0)
-                            deletions.append( scaffold_paths.loc[scaffold_paths['add'] & (scaffold_paths[f'phase{h2}'].shift(-s2) > 0) & (scaffold_paths['to'] >= 0), ['pid','pos','from_phase',f'scaf{h}',f'strand{h}','to_phase','to','to_side','mean_dist']].rename(columns={f'scaf{h}':'from',f'strand{h}':'from_side'}) )
-                s += 1
-            else:
-                break
-    scaffold_paths.drop(columns=['deletion','add','from_phase','to_phase','to','to_side','mean_dist'], inplace=True, errors='ignore')
-    if len(deletions):
-        deletions = pd.concat(deletions, ignore_index=True)
-        deletions = deletions[deletions['from_phase'] != deletions['to_phase']].copy()
-    if len(deletions):
-        deletions['from_side'] = np.where(deletions['from_side'] == '+', 'r', 'l')
-        deletions['to_side'] = np.where(deletions['to_side'] == '+', 'l', 'r')
-        deletions['valid'] = deletions[['from','from_side','to','to_side','mean_dist']].merge(scaf_bridges[['from','from_side','to','to_side','mean_dist']], on=['from','from_side','to','to_side','mean_dist'], how='left', indicator=True)['_merge'].values == "both"
-        deletions.sort_values(['pid','pos','from_phase','to_phase'], inplace=True)
-        valid = deletions.groupby(['pid','pos','from_phase','to_phase'], sort=False)['valid'].agg(['max','size'])
-        deletions['valid'] = np.repeat(valid['max'].values, valid['size'].values)
-        deletions = deletions.loc[deletions['valid'] == False, ['from_phase','to_phase']].drop_duplicates()
-        scaffold_paths = AssignNewPhases(scaffold_paths, deletions, ploidy)
+    # Handle deletions by assigning them to the following phase (or the previous if they are at the end of the paths)
+    scaffold_paths = AssignDeletionsToFollowingPhase(scaffold_paths, ploidy)
 #
     return scaffold_paths
 
@@ -7407,8 +7367,9 @@ def OrderByUnbrokenOriginalScaffolds(scaffold_paths, contig_parts, ploidy):
     scaffold_paths = scaffold_paths.merge(meta_parts[['scaffold','reverse','new_scaf']].rename(columns={'scaffold':'scaf'}), on=['scaf'], how='left')
     scaffold_paths['scaf'] = scaffold_paths['new_scaf']
     col_rename = {**{'scaf':'pid'}, **{f'con{h}':f'scaf{h}' for h in range(ploidy)}}
-    scaffold_paths = ReverseScaffolds(scaffold_paths.rename(columns=col_rename), scaffold_paths['reverse'], ploidy).rename(columns={v: k for k, v in col_rename.items()})
+    scaffold_paths = ReverseScaffolds(scaffold_paths.rename(columns=col_rename), scaffold_paths['reverse'], ploidy)
     scaffold_paths.drop(columns=['reverse','new_scaf'], inplace=True)
+    scaffold_paths = AssignDeletionsToFollowingPhase(scaffold_paths, ploidy).rename(columns={v: k for k, v in col_rename.items()})
 
     # Set org_dist_left/right based on scaffold (not the contig anymore)
     org_cons = GetOriginalConnections(scaffold_paths, contig_parts, ploidy)
