@@ -7040,7 +7040,7 @@ def AssignDeletionsToFollowingPhase(scaffold_paths, ploidy):
                 raise RuntimeError("Mainpath purely formed out of deletions discovered.")
         # We introduced zero phases, where the deletions were at the path end, now we have to assign the previous phase to them
         while np.sum(scaffold_paths[f'phase{h}'] == 0):
-            scaffold_paths[f'phase{h}'] = np.where(scaffold_paths[f'phase{h}'] == 0, scaffold_paths[f'phase{h}'].shift(1, fill_value=0), scaffold_paths[f'phase{h}'])
+            scaffold_paths[f'phase{h}'] = np.where(scaffold_paths[f'phase{h}'] == 0, np.where((h > 0) & (scaffold_paths['scaf0'] < 0), -1, 1)*np.abs(scaffold_paths[f'phase{h}'].shift(1, fill_value=0)), scaffold_paths[f'phase{h}'])
     scaffold_paths.drop(columns=['deletion','new_phase'], inplace=True)
 #
     return scaffold_paths
@@ -7212,7 +7212,7 @@ def PhaseScaffoldsWithScaffoldGraph(scaffold_paths, graph_ext, ploidy):
         for s in ['l','r']:
             cols = ['pid','lpos','rpos','hap']
             phase_breaks[f'{s}alts'] = phase_breaks[cols].merge(test_conns.rename(columns={f'{s}hap':'hap'}).groupby(cols).size().reset_index(name='alts'), on=cols, how='left')['alts'].values
-        phase_breaks = phase_breaks[(phase_breaks['lalts'] == 1) & (phase_breaks['ralts'] == 1)].copy()
+        phase_breaks = phase_breaks[(phase_breaks['lalts'] == 1) | (phase_breaks['ralts'] == 1)].copy()
         phase_breaks[['from_phase','to_phase']] = 1
         for h in range(ploidy):
             phase_breaks.loc[phase_breaks['hap'] == h, 'from_phase'] = np.abs(phase_breaks.loc[phase_breaks['hap'] == h, ['pid','lpos']].rename(columns={'lpos':'pos'}).merge(scaffold_paths[['pid','pos',f'phase{h}']], on=['pid','pos'], how='left')[f'phase{h}'].values)
