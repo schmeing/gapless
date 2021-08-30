@@ -8430,7 +8430,12 @@ def LoadExtensions(prefix, min_extension):
     # Drop sides that do not fullfil min_extension
     mappings = mappings[min_extension <= mappings['ext']].reset_index(drop=True)
     
-    return mappings
+    # Assign ids
+    read_ids = mappings[['read_name']].drop_duplicates()
+    read_ids['read_id'] = np.arange(len(read_ids))
+    mappings['read_id'] = mappings[['read_name']].merge(read_ids, on='read_name', how='left')['read_id'].values
+    
+    return mappings, read_ids
 
 def RemoveDuplicatedReadMappings(extensions):
     # Minimap2 has sometimes two overlapping mappings: Remove the shorter mapping
@@ -8452,64 +8457,92 @@ def RemoveDuplicatedReadMappings(extensions):
 
     return extensions
 
-def LoadReads(all_vs_all_mapping_file, mappings, min_length_contig_break):
+def LoadReads(all_vs_all_mapping_file, mappings, read_ids, min_length_contig_break, read_in_chunks):
     # Load all vs. all mappings for extending reads
-    reads = ReadPaf(all_vs_all_mapping_file)
-    reads.drop(columns=['matches','alignment_length','mapq'], inplace=True) # We don't need those columns
+    ext_list = []
+    merger_list = []
+    for reads in pd.read_csv(all_vs_all_mapping_file, sep='\t', header=None, usecols=range(9), names=['q_name','q_len','q_start','q_end','strand','t_name','t_len','t_start','t_end'], dtype={'q_name':object, 'q_len':np.int32, 'q_start':np.int32, 'q_end':np.int32, 'strand':str, 't_name':object, 't_len':np.int32, 't_start':np.int32, 't_end':np.int32}, chunksize=read_in_chunks):
+        reads['q_name'] = reads[['q_name']].merge(read_ids.rename(columns={'read_name':'q_name'}), on='q_name', how='left')['read_id'].fillna(-1).astype(int).values
+        reads['t_name'] = reads[['t_name']].merge(read_ids.rename(columns={'read_name':'t_name'}), on='t_name', how='left')['read_id'].fillna(-1).astype(int).values
+        reads.rename(columns={'q_name':'q_id','t_name':'t_id'}, inplace=True)
 #
-    # Get valid pairings on a smaller dataframe
-    extensions = reads[['q_name','t_name']].drop_duplicates()
-    extensions = extensions.merge(mappings[['read_name','read_start','scaf','side']].reset_index().rename(columns={'index':'q_index', 'read_name':'q_name', 'read_start':'q_read_start'}), on=['q_name'], how='inner')
-    extensions = extensions.merge(mappings[['read_name','read_start','scaf','side']].reset_index().rename(columns={'index':'t_index', 'read_name':'t_name', 'read_start':'t_read_start'}), on=['t_name','scaf','side'], how='inner')
-    extensions.drop(extensions.index[(extensions['q_name'] == extensions['t_name']) & (extensions['q_read_start'] == extensions['t_read_start'])].values, inplace=True) # remove reads that map to itself
+        # Get valid pairings on a smaller dataframe
+        extensions = reads[['q_id','t_id']].drop_duplicates()
+        extensions = extensions.merge(mappings[['read_id','read_start','scaf','side']].reset_index().rename(columns={'index':'q_index', 'read_id':'q_id', 'read_start':'q_read_start'}), on=['q_id'], how='inner')
+        extensions = extensions.merge(mappings[['read_id','read_start','scaf','side']].reset_index().rename(columns={'index':'t_index', 'read_id':'t_id', 'read_start':'t_read_start'}), on=['t_id','scaf','side'], how='inner')
+        extensions.drop(extensions.index[(extensions['q_id'] == extensions['t_id']) & (extensions['q_read_start'] == extensions['t_read_start'])].values, inplace=True) # remove reads that map to itself
 #
-    # Keep only reads that are part of a valid pairings
-    extensions.drop(columns=['scaf','side','q_read_start', 't_read_start'], inplace=True)
-    reads = reads.merge(extensions, on=['q_name','t_name'], how='inner')
-    extensions = reads
-    del reads
-    extensions.drop(columns=['q_name','t_name'], inplace=True)
+        # Keep only reads that are part of a valid pairings
+        extensions.drop(columns=['scaf','side','q_read_start','t_read_start'], inplace=True)
+        reads = reads.merge(extensions, on=['q_id','t_id'], how='inner')
+        extensions = reads
+        del reads
 #
-    # Add scaffold and side to which the query reads belong to
-    extensions.reset_index(drop=True, inplace=True)
-    extensions = pd.concat([extensions, mappings.loc[extensions['q_index'].values, ['read_start','read_end','read_from','read_to','scaf','side','hap','strand']].reset_index(drop=True).rename(columns={'read_from':'q_read_from', 'read_to':'q_read_to', 'hap':'q_hap', 'strand':'q_strand'})], axis=1)
+        # Check which extensions are valid, before using the full dataframe
+        extensions.reset_index(drop=True, inplace=True)
+        valid_ext = extensions[['q_index','t_index']].reset_index()
+        valid_ext.rename(columns={'index':'e_index'}, inplace=True)
+        # Remove reads where the all vs. all mapping is not in the gap for the scaffold belonging to the query (query)
+        comp = mappings.loc[valid_ext['q_index'].values, ['strand','side','read_from','read_to','read_start','read_end']].reset_index(drop=True)
+        valid_ext = valid_ext[np.where(np.logical_xor('+' == comp['strand'], 'l' == comp['side']), extensions['q_end'] > comp['read_to'], extensions['q_start'] < comp['read_from']) & (extensions['q_start'] < comp['read_end']) & (extensions['q_end'] > comp['read_start'])].copy()
+        del comp
+        # Remove reads where the all vs. all mapping is not in the gap for the scaffold belonging to the query (target)
+        comp1 = extensions.loc[valid_ext['e_index'].values, ['t_start','t_end']].reset_index(drop=True)
+        comp2 = mappings.loc[valid_ext['t_index'].values, ['strand','side','read_from','read_to','read_start','read_end']].reset_index(drop=True)
+        valid_ext.reset_index(drop=True, inplace=True)
+        valid_ext = valid_ext[np.where(np.logical_xor('+' == comp2['strand'], 'l' == comp2['side']), comp1['t_end'] > comp2['read_to'], comp1['t_start'] < comp2['read_from']) & (comp1['t_start'] < comp2['read_end']) & (comp1['t_end'] > comp2['read_start'])].copy()
+        del comp1, comp2
+        # Extensions: Remove reads that somehow do not fullfil strand rules and remove superfluous strand column
+        valid_ext = valid_ext[ np.where(mappings.loc[valid_ext['q_index'].values, 'strand'].values == mappings.loc[valid_ext['t_index'].values, 'strand'].values, '+', '-') == extensions.loc[valid_ext['e_index'].values, 'strand'].values ].copy()
 #
-    # Remove reads where the all vs. all mapping is not in the gap for the scaffold belonging to the query
-    extensions.drop(extensions.index[np.where(np.logical_xor('+' == extensions['q_strand'], 'l' == extensions['side']), extensions['q_end'] <= extensions['q_read_to'], extensions['q_start'] >= extensions['q_read_from']) | (extensions['q_read_from'] >= extensions['read_end']) | (extensions['q_read_to'] <= extensions['read_start'])].values, inplace=True)
-    extensions.drop(columns=['read_start','read_end'], inplace=True)
+        # Split off hap_merger 
+        hap_merger = valid_ext[mappings.loc[valid_ext['q_index'].values, 'hap'].values != mappings.loc[valid_ext['t_index'].values, 'hap'].values].copy()
+        valid_ext.drop(hap_merger.index, inplace=True)
+        hap_merger = pd.concat([ hap_merger.drop(columns=['e_index']).reset_index(drop=True),
+                                 mappings.loc[hap_merger['q_index'].values, ['scaf','side','hap','strand','read_from','read_to']].reset_index(drop=True).rename(columns={'hap':'q_hap', 'strand':'q_strand', 'read_from':'q_read_from', 'read_to':'q_read_to'}),
+                                 extensions.loc[hap_merger['e_index'].values, ['q_len','q_start','q_end','t_len','t_start','t_end']].reset_index(drop=True),
+                                 mappings.loc[hap_merger['t_index'].values, ['hap','strand','read_from','read_to']].reset_index(drop=True).rename(columns={'hap':'t_hap', 'strand':'t_strand', 'read_from':'t_read_from', 'read_to':'t_read_to'}) ], axis=1)
+        hap_merger = hap_merger[['scaf','side','q_hap','q_index','q_strand','q_read_from','q_read_to','q_len','q_start','q_end','t_hap','t_index','t_strand','t_read_from','t_read_to','t_len','t_start','t_end']].copy()
+        merger_list.append(hap_merger)
 #
-    # Repeat the last two steps for the target reads
-    extensions.reset_index(drop=True, inplace=True)
-    extensions = pd.concat([extensions, mappings.loc[extensions['t_index'].values, ['read_start','read_end','read_from','read_to','hap','strand']].reset_index(drop=True).rename(columns={'read_from':'t_read_from', 'read_to':'t_read_to', 'hap':'t_hap', 'strand':'t_strand'})], axis=1)
-    extensions.drop(extensions.index[np.where(np.logical_xor('+' == extensions['t_strand'], 'l' == extensions['side']), extensions['t_end'] <= extensions['t_read_to'], extensions['t_start'] >= extensions['t_read_from']) | (extensions['t_read_from'] >= extensions['read_end']) | (extensions['t_read_to'] <= extensions['read_start'])].values, inplace=True)
-    extensions.drop(columns=['read_start','read_end'], inplace=True)
+        # Filter extensions where the all vs. all mapping does not touch the the contig mapping of query and target or the reads diverge more than min_length_contig_break of their mapping length within the contig mapping
+        valid_ext.reset_index(drop=True, inplace=True)
+        comp1 = extensions.loc[valid_ext['e_index'].values, ['q_len','q_start','q_end']].reset_index(drop=True)
+        comp2 = mappings.loc[valid_ext['q_index'].values, ['strand','side','read_from','read_to']].reset_index(drop=True)
+        valid_ext['q_max_divergence'] = np.minimum(min_length_contig_break, np.where(np.logical_xor('+' == comp2['strand'], 'l' == comp2['side']), comp2['read_to']-comp1['q_start'], comp1['q_end']-comp2['read_from']))
+        valid_ext['q_read_divergence'] = np.where(np.logical_xor('+' == comp2['strand'], 'l' == comp2['side']), comp1['q_start']-comp2['read_from'], comp2['read_to']-comp1['q_end'])
+        valid_ext['read_unmapped'] = np.where(np.logical_xor('+' == comp2['strand'], 'l' == comp2['side']), comp1['q_start'], comp1['q_len']-comp1['q_end'])
+        del comp1, comp2
+        comp1 = extensions.loc[valid_ext['e_index'].values, ['t_len','t_start','t_end']].reset_index(drop=True)
+        comp2 = mappings.loc[valid_ext['t_index'].values, ['strand','side','read_from','read_to']].reset_index(drop=True)
+        valid_ext['t_max_divergence'] = np.minimum(min_length_contig_break, np.where(np.logical_xor('+' == comp2['strand'], 'l' == comp2['side']), comp2['read_to']-comp1['t_start'], comp1['t_end']-comp2['read_from']))
+        valid_ext['t_read_divergence'] = np.where(np.logical_xor('+' == comp2['strand'], 'l' == comp2['side']), comp1['t_start']-comp2['read_from'], comp2['read_to']-comp1['t_end'])
+        valid_ext['t_read_divergence'] = np.minimum(valid_ext['t_read_divergence'], valid_ext['read_unmapped'])
+        valid_ext['read_unmapped'] = np.minimum( valid_ext['read_unmapped'], np.where(np.logical_xor('+' == comp2['strand'], 'l' == comp2['side']), comp1['t_start'], comp1['t_len']-comp1['t_end']) )
+        valid_ext['q_read_divergence'] = np.minimum(valid_ext['q_read_divergence'], valid_ext['read_unmapped'])
+        del comp1, comp2
+        valid_ext = valid_ext.loc[(0 < valid_ext['q_max_divergence']) & (0 < valid_ext['t_max_divergence']) &  # all vs. all mappings do not touch contig mapping
+                                  (valid_ext['q_read_divergence'] < valid_ext['q_max_divergence']) &
+                                  (valid_ext['t_read_divergence'] < valid_ext['t_max_divergence']), ['e_index','q_index','t_index'] ].copy()
 #
-    # Extensions: Remove reads that somehow do not fullfil strand rules and remove superfluous strand column
-    extensions.drop(extensions.index[np.where(extensions['q_strand'] == extensions['t_strand'], '+', '-') != extensions['strand']].values, inplace=True)
-    extensions.drop(columns=['strand'], inplace=True)
+        # Fill in all columns
+        valid_ext = pd.concat([ valid_ext.drop(columns=['e_index']).reset_index(drop=True),
+                                mappings.loc[valid_ext['q_index'].values, ['scaf','side','hap','strand','read_from','read_to']].reset_index(drop=True).rename(columns={'strand':'q_strand', 'read_from':'q_read_from', 'read_to':'q_read_to'}),
+                                extensions.loc[valid_ext['e_index'].values, ['q_len','q_start','q_end','t_len','t_start','t_end']].reset_index(drop=True),
+                                mappings.loc[valid_ext['t_index'].values, ['strand','read_from','read_to']].reset_index(drop=True).rename(columns={'strand':'t_strand', 'read_from':'t_read_from', 'read_to':'t_read_to'}) ], axis=1)
+        valid_ext = valid_ext[['scaf','side','hap','q_index','q_strand','q_read_from','q_read_to','q_len','q_start','q_end','t_index','t_strand','t_read_from','t_read_to','t_len','t_start','t_end']].copy()
+        ext_list.append(valid_ext)
+        del extensions, valid_ext, hap_merger
 #
-    # Split off hap_merger 
-    hap_merger = extensions[extensions['q_hap'] != extensions['t_hap']].copy()
-    extensions.drop(extensions.index[extensions['q_hap'] != extensions['t_hap']].values, inplace=True)
-    extensions.drop(columns=['t_hap'], inplace=True)
-    extensions.rename(columns={'q_hap':'hap'}, inplace=True)
-
-    # Filter extensions where the all vs. all mapping does not touch the the contig mapping of query and target or the reads diverge more than min_length_contig_break of their mapping length within the contig mapping
-    extensions['q_max_divergence'] = np.minimum(min_length_contig_break, np.where(np.logical_xor('+' == extensions['q_strand'], 'l' == extensions['side']), extensions['q_read_to']-extensions['q_start'], extensions['q_end']-extensions['q_read_from']))
-    extensions['t_max_divergence'] = np.minimum(min_length_contig_break, np.where(np.logical_xor('+' == extensions['t_strand'], 'l' == extensions['side']), extensions['t_read_to']-extensions['t_start'], extensions['t_end']-extensions['t_read_from']))
-    extensions = extensions[(0 < extensions['q_max_divergence']) & (0 < extensions['t_max_divergence'])].copy() # all vs. all mappings do not touch contig mapping
-    extensions['read_divergence'] = np.minimum(np.where(np.logical_xor('+' == extensions['q_strand'], 'l' == extensions['side']), extensions['q_start'], extensions['q_len']-extensions['q_end']), np.where(np.logical_xor('+' == extensions['t_strand'], 'l' == extensions['side']), extensions['t_start'], extensions['t_len']-extensions['t_end']))
-    extensions = extensions[( (0 < np.where(np.logical_xor('+' == extensions['q_strand'], 'l' == extensions['side']), extensions['q_read_from']-extensions['q_start'], extensions['q_end']-extensions['q_read_to']) + extensions['q_max_divergence']) |
-                              (extensions['read_divergence'] < extensions['q_max_divergence']) ) &
-                            ( (0 < np.where(np.logical_xor('+' == extensions['t_strand'], 'l' == extensions['side']), extensions['t_read_from']-extensions['t_start'], extensions['t_end']-extensions['t_read_to']) + extensions['t_max_divergence']) |
-                              (extensions['read_divergence'] < extensions['t_max_divergence']) ) ].copy()
-    extensions.drop(columns=['q_max_divergence','t_max_divergence','read_divergence'], inplace=True)
+    # Combine the chunks we read in before
+    hap_merger = pd.concat(merger_list, ignore_index=True)
+    del merger_list
+    extensions = pd.concat(ext_list, ignore_index=True)
+    del ext_list
 
     # Add the flipped entries between query and strand
-    extensions = pd.concat([extensions[['scaf','side','hap','t_index','t_strand','t_read_from','t_read_to','t_len','t_start','t_end','q_index','q_strand','q_read_from','q_read_to','q_len','q_start','q_end']].rename(columns={'t_index':'q_index','t_strand':'q_strand','t_read_from':'q_read_from','t_read_to':'q_read_to','t_len':'q_len','t_start':'q_start','t_end':'q_end','q_index':'t_index','q_strand':'t_strand','q_read_from':'t_read_from','q_read_to':'t_read_to','q_len':'t_len','q_start':'t_start','q_end':'t_end'}),
-                            extensions[['scaf','side','hap','q_index','q_strand','q_read_from','q_read_to','q_len','q_start','q_end','t_index','t_strand','t_read_from','t_read_to','t_len','t_start','t_end']] ], ignore_index=True)
-    hap_merger = pd.concat([hap_merger[['scaf','side','t_hap','t_index','t_strand','t_read_from','t_read_to','t_len','t_start','t_end','q_hap','q_index','q_strand','q_read_from','q_read_to','q_len','q_start','q_end']].rename(columns={'t_hap':'q_hap','t_index':'q_index','t_strand':'q_strand','t_read_from':'q_read_from','t_read_to':'q_read_to','t_len':'q_len','t_start':'q_start','t_end':'q_end','q_hap':'t_hap','q_index':'t_index','q_strand':'t_strand','q_read_from':'t_read_from','q_read_to':'t_read_to','q_len':'t_len','q_start':'t_start','q_end':'t_end'}),
-                            hap_merger[['scaf','side','q_hap','q_index','q_strand','q_read_from','q_read_to','q_len','q_start','q_end','t_hap','t_index','t_strand','t_read_from','t_read_to','t_len','t_start','t_end']] ], ignore_index=True)
+    extensions = pd.concat([extensions, extensions.rename(columns={'t_index':'q_index','t_strand':'q_strand','t_read_from':'q_read_from','t_read_to':'q_read_to','t_len':'q_len','t_start':'q_start','t_end':'q_end','q_index':'t_index','q_strand':'t_strand','q_read_from':'t_read_from','q_read_to':'t_read_to','q_len':'t_len','q_start':'t_start','q_end':'t_end'})], ignore_index=True)
+    hap_merger = pd.concat([hap_merger, hap_merger.rename(columns={'t_hap':'q_hap','t_index':'q_index','t_strand':'q_strand','t_read_from':'q_read_from','t_read_to':'q_read_to','t_len':'q_len','t_start':'q_start','t_end':'q_end','q_hap':'t_hap','q_index':'t_index','q_strand':'t_strand','q_read_from':'t_read_from','q_read_to':'t_read_to','q_len':'t_len','q_start':'t_start','q_end':'t_end'})], ignore_index=True)
 
     # Haplotype merger are the first mapping of a read with a given read from the main haplotype (We can stop extending the alternative haplotype there, because it is identical to the main again)
     hap_merger = hap_merger[hap_merger['t_hap'] == 0].copy()
@@ -8766,6 +8799,7 @@ def GaplessExtend(all_vs_all_mapping_file, prefix, min_length_contig_break):
     min_num_reads = 3
     max_mapping_uncertainty = 200
     min_scaf_len = 600
+    read_in_chunks = 100000000
     
     # Remove output files, such that we do not accidentially use an old one after a crash
     for f in [f"{prefix}_extended_scaffold_paths.csv", f"{prefix}_used_reads.lst"]:
@@ -8775,8 +8809,8 @@ def GaplessExtend(all_vs_all_mapping_file, prefix, min_length_contig_break):
     print( str(timedelta(seconds=process_time())), "Preparing data from files")
     scaffold_paths = pd.read_csv(prefix+"_scaffold_paths.csv").fillna('')
     ploidy = GetPloidyFromPaths(scaffold_paths)
-    mappings = LoadExtensions(prefix, min_extension)
-    extensions, hap_merger = LoadReads(all_vs_all_mapping_file, mappings, min_length_contig_break)
+    mappings, read_ids = LoadExtensions(prefix, min_extension)
+    extensions, hap_merger = LoadReads(all_vs_all_mapping_file, mappings, read_ids, min_length_contig_break, read_in_chunks)
     
     print( str(timedelta(seconds=process_time())), "Searching for extensions")
     extensions, new_scaffolds = ClusterExtension(extensions, mappings, min_num_reads, min_scaf_len)

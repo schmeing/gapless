@@ -84,7 +84,7 @@ racon -t {threads} {input_reads} gapless_consensus.paf gapless_raw.fa > gapless.
 ```
 
 `{read_type}` is `map-pb`, `asm20` or `map-ont` depending on the type of long reads.
-`{read_type2}` is `ava-pb`, `ava-pb` or `ava-ont` depending on the type of long reads.
+`{read_type2}` is `ava-pb`, `asm20 --min-occ-floor=0 -X -m100 -g10000 --max-chain-skip 25` or `ava-ont` depending on the type of long reads.
 
 ## <a name="parameter"></a>Parameter
 `gapless.sh [OPTIONS] {long_reads}.fq`

@@ -86,7 +86,7 @@ case "$type" in
     #mm_map="map-hifi"
     #mm_ava="map-hifi -X -e0 -m100"
     mm_map="asm20"
-    mm_ava="ava-pb"
+    mm_ava="asm20 --min-occ-floor=0 -X -m100 -g10000 --max-chain-skip 25"
     ;;
   nanopore)
     mm_map="map-ont"
