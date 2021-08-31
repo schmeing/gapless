@@ -7121,7 +7121,7 @@ def PhaseScaffoldsWithScaffoldGraph(scaffold_paths, graph_ext, ploidy):
     # Get all remaining phase_breaks
     phase_breaks = []
     for h in range(ploidy):
-        phase_breaks.append( scaffold_paths.loc[(scaffold_paths[f'phase{h}'] != scaffold_paths[f'phase{h}'].shift(1)) & (scaffold_paths['pid'] == scaffold_paths['pid'].shift(1)), ['pid','pos']].rename(columns={'pos':'rpos'}) )
+        phase_breaks.append( scaffold_paths.loc[(np.abs(scaffold_paths[f'phase{h}']) != np.abs(scaffold_paths[f'phase{h}'].shift(1))) & (scaffold_paths['pid'] == scaffold_paths['pid'].shift(1)), ['pid','pos']].rename(columns={'pos':'rpos'}) )
         phase_breaks[-1]['hap'] = h
     phase_breaks = pd.concat(phase_breaks, ignore_index=True)
     phase_breaks['lpos'] = phase_breaks['rpos'] - 1
