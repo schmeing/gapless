@@ -1073,11 +1073,11 @@ def UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length, max_
     mappings['remleft'] = (( (mappings['left'] == False) | ((mappings['left_con_side'] == 'r') & (False == np.where(mappings['strand'] == '+', mappings['right'].shift(1), mappings['right'].shift(-1))))
                                                          | ((mappings['left_con_side'] == 'l') & (False == np.where(mappings['strand'] == '+', mappings['left'].shift(1), mappings['left'].shift(-1)))) 
                           | ((mappings['left_con'] == mappings['conpart']) & (mappings['left_con_side'] == 'r')
-                             & (mappings['con_from'] >= np.where(mappings['strand'] == '+', mappings['con_to'].shift(1), mappings['con_to'].shift(-1)))) ) & (mappings['left_con'] > 0))
+                             & (mappings['con_from'] >= np.where(mappings['strand'] == '+', mappings['con_to'].shift(1), mappings['con_to'].shift(-1)))) ) & (mappings['left_con'] >= 0))
     mappings['remright'] = ( ( (mappings['right'] == False) | ((mappings['right_con_side'] == 'r') & (False == np.where(mappings['strand'] == '+', mappings['right'].shift(-1), mappings['right'].shift(1))))
                                                             | ((mappings['right_con_side'] == 'l') & (False == np.where(mappings['strand'] == '+', mappings['left'].shift(-1), mappings['left'].shift(1)))) 
                           | ((mappings['right_con'] == mappings['conpart']) & (mappings['right_con_side'] == 'l')
-                             & (mappings['con_to'] <= np.where(mappings['strand'] == '+', mappings['con_from'].shift(-1), mappings['con_from'].shift(1)))) ) & (mappings['right_con'] > 0))
+                             & (mappings['con_to'] <= np.where(mappings['strand'] == '+', mappings['con_from'].shift(-1), mappings['con_from'].shift(1)))) ) & (mappings['right_con'] >= 0))
     mappings.loc[mappings['remleft'], 'left_con'] = -1
     mappings.loc[mappings['remleft'], 'left_con_side'] = ''
     mappings.loc[mappings['remright'], 'right_con'] = -1
