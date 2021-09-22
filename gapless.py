@@ -21,10 +21,12 @@ import seaborn as sns
 import sys
 from time import process_time
 
+
 def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
 
-def GaplessSplit(fa_file,o_file=False,min_n=False):
+
+def GaplessSplit(fa_file,o_file=False, min_n=False):
     if False == o_file:
         if ".gz" == fa_file[-3:len(fa_file)]:
             o_file = fa_file.rsplit('.',2)[0]+"_split.fa"
@@ -32,10 +34,10 @@ def GaplessSplit(fa_file,o_file=False,min_n=False):
             o_file = fa_file.rsplit('.',1)[0]+"_split.fa"
         pass
     if False == min_n:
-        min_n = 1;
+        min_n = 1
         pass
     
-    # Remove output files, such that we do not accidentially use an old one after a crash
+    # Remove output files, such that we do not accidentally use an old one after a crash
     if os.path.exists(o_file):
         os.remove(o_file)
 
@@ -46,9 +48,9 @@ def GaplessSplit(fa_file,o_file=False,min_n=False):
             for record in SeqIO.parse(fin, "fasta"):
                 input_scaffolds += 1
                 # Split scaffolds into contigs
-                contigs=re.split('([nN]+)',str(record.seq))
+                contigs = re.split('([nN]+)',str(record.seq))
                 # Split identifier and further description
-                seqid=record.description.split(' ', 1 )
+                seqid = record.description.split(' ', 1 )
                 if 2 == len(seqid):
                     seqid[1] = " " + seqid[1] # Add the space here, so in case seqid[1] is empty no trailing space is in the sequence identifier
                 else:
@@ -590,10 +592,11 @@ def CalculateReadExtensionAfterMappingEnd(cur_mappings):
     return cur_mappings
 
 def PreparePotBreakPoints(pot_breaks, max_break_point_distance, min_mapping_length, min_num_reads):
-    break_points = pot_breaks[['contig_id','side','position','mapq','map_len','map_index','q_start','read_start','q_end','read_end','strand','q_id']].copy()
-    break_points['connected'] = 0 <= pot_breaks['con']
+    break_points = pot_breaks[['contig_id','side','position','mapq','map_len','map_index','q_start','read_start','q_end','read_end','strand','q_id','con','con_pos']].copy()
+    break_points['connected'] = 0 <= break_points['con']
     break_points = CalculateReadExtensionAfterMappingEnd(break_points)
-    break_points['ext_len'] = np.where(break_points['side'] == 'l', break_points['q_left'], break_points['q_right']) + break_points['map_len']
+    break_points['lext_len'] = break_points['q_left'] + np.where(break_points['side'] == 'l', break_points['map_len'], 0)
+    break_points['rext_len'] = break_points['q_right'] + np.where(break_points['side'] == 'r', break_points['map_len'], 0)
     break_points.drop(columns=['q_start','q_end','strand','read_start','read_end','q_left','q_right'], inplace=True)
     break_points = break_points[ break_points['map_len'] >= min_mapping_length+max_break_point_distance ].copy() # require half the mapping length for breaks as we will later require for continuously mapping reads that veto breaks, since breaking reads only map on one side
     break_points.drop(columns=['map_len'], inplace=True)
@@ -603,8 +606,8 @@ def PreparePotBreakPoints(pot_breaks, max_break_point_distance, min_mapping_leng
         break_points = break_points[ ((break_points['contig_id'] == break_points['contig_id'].shift(-1, fill_value=-1)) & (break_points['position']+max_break_point_distance >= break_points['position'].shift(-1, fill_value=-1))) | ((break_points['contig_id'] == break_points['contig_id'].shift(1, fill_value=-1)) & (break_points['position']-max_break_point_distance <= break_points['position'].shift(1, fill_value=-1))) ].copy()
     break_points.reset_index(drop=True,inplace=True)
     break_points['bindex'] = break_points.index.values
-    bp_ext_len = break_points.drop(columns=['connected','mapq'])
-    break_points.drop(columns=['map_index','ext_len'], inplace=True)
+    bp_ext_len = break_points[break_points['connected']].drop(columns=['connected','mapq'])
+    break_points.drop(columns=['map_index','lext_len','rext_len','con','con_pos'], inplace=True)
 #
     return break_points, bp_ext_len
 
@@ -687,7 +690,8 @@ def GetConProb(cov_probs, req_length, counts):
 
     return NormCDFCapped(probs['counts'],probs['mu'], probs['sigma'])
 
-def CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_ext_len, cov_probs, covered_regions, max_dist_contig_end, max_break_point_distance, min_mapping_length, min_num_reads, min_length_contig_break, prob_factor, merge_block_length, prematurity_threshold):
+def CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_ext_len, cov_probs, covered_regions, repeats, max_dist_contig_end, max_break_point_distance, min_mapping_length, min_num_reads, min_length_contig_break, prob_factor, merge_block_length, prematurity_threshold):
+    unconnected_break_points = []
     if len(break_points):
         # Check how many reads veto a break (continuously map over the break region position +- (min_mapping_length+max_break_point_distance))
         break_pos = break_points[['contig_id','position']].drop_duplicates()
@@ -711,7 +715,7 @@ def CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_ext_len, cov_
             tmp_breaks = tmp_breaks[(tmp_breaks['t_start']+min_mapping_length+max_break_point_distance <= tmp_breaks['position']) &
                                     (tmp_breaks['t_end']-min_mapping_length-max_break_point_distance >= tmp_breaks['position'])].copy()
             break_list.append( tmp_breaks.groupby(['contig_id','position','mapq']).size().reset_index(name='vetos') )
-            veto_ext_len.append( tmp_breaks.groupby(['contig_id','position']).agg({'q_left':'min', 'q_right':'max', 'mapq':'size'}).reset_index().rename(columns={'mapq':'count'}) )
+            veto_ext_len.append( tmp_breaks.groupby(['contig_id','position']).agg({'q_left':'min', 'q_right':'max', 't_start':'max', 't_end':'min', 'mapq':'size'}).reset_index().rename(columns={'mapq':'count'}) ) # For t_start and t_end we take the max and min to get later the shortest mapping length on the other side
         break_points = break_points.merge(pd.concat(break_list, ignore_index=True), on=['contig_id','position','mapq'], how='outer').fillna(0)
         break_points.sort_values(['contig_id','position','mapq'], ascending=[True,True,False], inplace=True)
         break_points.reset_index(inplace=True, drop=True)
@@ -728,21 +732,56 @@ def CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_ext_len, cov_
             break_ext_len = veto_ext_len[['ifrom','ito']].drop_duplicates()
             break_ext_len = break_ext_len.loc[np.repeat(break_ext_len.index.values, break_ext_len['ito'].values-break_ext_len['ifrom'].values+1)].reset_index(drop=True)
             break_ext_len['bindex'] = break_ext_len.groupby(['ifrom','ito']).cumcount() + break_ext_len['ifrom']
-            break_ext_len = break_ext_len.merge(bp_ext_len, on=['bindex'], how='left')
-            break_ext_len['bstart'] = break_ext_len['position'] - np.where(break_ext_len['side'] == 'l', break_ext_len['ext_len'], 0)
-            break_ext_len['bend'] = break_ext_len['position'] + np.where(break_ext_len['side'] == 'r', break_ext_len['ext_len'], 0)
-            break_ext_len = break_ext_len[['ifrom','ito','bstart','bend','side']].copy()
-            # Only check veto positions where the break map longer than the break
+            break_ext_len = break_ext_len.merge(bp_ext_len, on=['bindex'], how='inner') # bp_ext_len has filtered out the ones without a connection, thus we do an inner join
+            break_ext_len['bstart'] = break_ext_len['position'] - break_ext_len['lext_len']
+            break_ext_len['bend'] = break_ext_len['position'] + break_ext_len['rext_len']
+            break_ext_len = break_ext_len[['ifrom','ito','bstart','bend','side','con','con_pos']].copy()
+            # Assign con_id to breaks that connect to the same position
+            break_ext_len.sort_values(['ifrom','ito','side','con','con_pos'], inplace=True)
+            break_ext_len['con_id'] = ((break_ext_len.groupby(['ifrom','ito','side','con']).cumcount() == 0) | (break_ext_len['con_pos'] > break_ext_len['con_pos'].shift(1) + max_dist_contig_end)).cumsum()
+            break_ext_len.drop(columns=['con','con_pos'], inplace=True)
+            # Remove con_id with only one supporting read
+            break_ext_len = break_ext_len[(break_ext_len['con_id'] == break_ext_len['con_id'].shift(1)) | (break_ext_len['con_id'] == break_ext_len['con_id'].shift(-1))].copy()
+            # Only check veto positions where the break extend longer than the break
             veto_ext_len[['bstart','bend']] = veto_ext_len[['ifrom','ito']].merge(break_ext_len.groupby(['ifrom','ito']).agg({'bstart':'min', 'bend':'max'}).reset_index(), on=['ifrom','ito'], how='left')[['bstart','bend']].values
             veto_ext_len = veto_ext_len[(veto_ext_len['bstart'] < veto_ext_len['q_left']) | (veto_ext_len['q_right'] < veto_ext_len['bend'])].copy()
+            veto_ext_len[['bstart','bend']] = veto_ext_len[['bstart','bend']].astype(int) # In case an ifrom-ito has no connected breaks at all it has creates a NaN and is removed in the previous check, but we need to convert back to int afterwards
         if len(veto_ext_len):
+            # Use the minimum extension within a repeat on the other side of the tested extension length as gap length to avoid penalizing reads that require the full length on one side to map to a given contig and thus are short on the other side
+            veto_ext_len['lgap_length'] = veto_ext_len['position'] - veto_ext_len['t_start']
+            veto_ext_len['rgap_length'] = veto_ext_len['t_end'] - veto_ext_len['position']
+            veto_ext_len.drop(columns=['t_start','t_end'], inplace=True)
+            # The maximum gap length is the repeat that is required to be spanned to be placed at this position
+            breaks_in_repeats = veto_ext_len[['contig_id','position']].drop_duplicates().merge(repeats[['q_id','q_start','q_end']].rename(columns={'q_id':'contig_id','q_start':'rep_start','q_end':'rep_end'}), on=['contig_id'], how='inner')
+            breaks_in_repeats['lrep_len'] = np.where( (breaks_in_repeats['rep_start'] < breaks_in_repeats['position']) & (breaks_in_repeats['rep_end'] > breaks_in_repeats['position'] - min_mapping_length),
+                                                      np.minimum(breaks_in_repeats['rep_end'], breaks_in_repeats['position']) - breaks_in_repeats['rep_start'],
+                                                      0 )
+            breaks_in_repeats['rrep_len'] = np.where( (breaks_in_repeats['rep_start'] < breaks_in_repeats['position'] + min_mapping_length) & (breaks_in_repeats['rep_end'] > breaks_in_repeats['position']),
+                                                      breaks_in_repeats['rep_end'] - np.maximum(breaks_in_repeats['rep_start'], breaks_in_repeats['position']),
+                                                      0 )
+            breaks_in_repeats = breaks_in_repeats[ (breaks_in_repeats['lrep_len'] > 0) | (breaks_in_repeats['rrep_len'] > 0) ].copy()
+            breaks_in_repeats = breaks_in_repeats.groupby(['contig_id','position'])[['lrep_len','rrep_len']].max().reset_index()
+            veto_ext_len[['lrep_len','rrep_len']] = veto_ext_len[['contig_id','position']].merge(breaks_in_repeats, on=['contig_id','position'], how='left')[['lrep_len','rrep_len']].fillna(0).astype(int).values
+            veto_ext_len['lgap_length'] = np.minimum(veto_ext_len['lgap_length'], veto_ext_len['lrep_len'])
+            veto_ext_len['rgap_length'] = np.minimum(veto_ext_len['rgap_length'], veto_ext_len['rrep_len'])
+            veto_ext_len.drop(columns=['lrep_len','rrep_len'], inplace=True)
+            # Correct the gap lengths with the minimum extensions (gap length) of the breaking reads (if the breaking reads would also span the repeats we do not need to penalize them)
+            veto_ext_len = veto_ext_len.merge(bp_ext_len.groupby(['contig_id','position','side'])[['lext_len','rext_len']].min().reset_index(), on=['contig_id','position'], how='inner')
+            veto_ext_len['lgap_length'] = np.maximum(0, veto_ext_len['lgap_length']-veto_ext_len['lext_len'])
+            veto_ext_len['rgap_length'] = np.maximum(0, veto_ext_len['rgap_length']-veto_ext_len['rext_len'])
+            veto_ext_len.drop(columns=['lext_len','rext_len'], inplace=True)
             # Count how many breaks are longer than the vetos and check if this is likely due to chance
-            break_ext_len = veto_ext_len[['contig_id','position','q_left','q_right','ifrom','ito']].merge(break_ext_len, on=['ifrom','ito'], how='left')
-            break_ext_len['longer'] = np.where(break_ext_len['side'] == 'r', break_ext_len['bend'] > break_ext_len['q_right'], break_ext_len['q_left'] > break_ext_len['bstart'])
+            break_ext_len = veto_ext_len[['contig_id', 'position', 'side', 'q_left', 'q_right', 'lgap_length', 'rgap_length', 'ifrom', 'ito']].merge(break_ext_len, on=['ifrom', 'ito','side'], how='inner')
+            veto_ext_len.drop(columns=['bstart','bend','lgap_length','rgap_length','side'], inplace=True)
+            veto_ext_len.drop_duplicates(inplace=True)
+            veto_ext_len = veto_ext_len.merge(break_ext_len[['contig_id','position','con_id']].drop_duplicates())
+            break_ext_len['llonger'] = break_ext_len['q_left'] > break_ext_len['bstart']+break_ext_len['rgap_length']
+            break_ext_len['rlonger'] = break_ext_len['bend'] > break_ext_len['q_right']+break_ext_len['lgap_length']
             for s in ['l','r']:
-                veto_ext_len[[f'{s}bcount',f'{s}blonger']] = veto_ext_len[['contig_id','position']].merge(break_ext_len[break_ext_len['side'] == s].groupby(['contig_id','position']).agg({'side':'size','longer':'sum'}).reset_index(), on=['contig_id','position'], how='left')[['side','longer']].fillna(0).astype(int).values
-                veto_ext_len.loc[veto_ext_len[f'{s}bcount'] < min_num_reads, [f'{s}blonger']] = 0 # Filter out cases that not exceed min_num_reads
-            veto_ext_len = veto_ext_len[veto_ext_len[['lblonger','rblonger']].sum(axis=1) > 0].copy()
+                veto_ext_len[[f'{s}bcount','llonger','rlonger']] = veto_ext_len[['contig_id','position','con_id']].merge(break_ext_len[break_ext_len['side'] == s].groupby(['contig_id','position','con_id']).agg({'side':'size','llonger':'sum','rlonger':'sum'}).reset_index(), on=['contig_id','position','con_id'], how='left')[['side','llonger','rlonger']].fillna(0).astype(int).values
+                veto_ext_len[f'{s}blonger'] = np.maximum(veto_ext_len['llonger'],veto_ext_len['rlonger'])
+                veto_ext_len.loc[veto_ext_len[f'{s}bcount'] < min_num_reads, [f'{s}blonger']] = 0 # Filter out cases that not reach min_num_reads
+            veto_ext_len = veto_ext_len[veto_ext_len[['lblonger','rblonger']].sum(axis=1) > 0].drop(columns=['llonger','rlonger'])
         if len(veto_ext_len):
             for s in ['l','r']:
                 veto_ext_len[f'{s}broken_veto_prob'] = GetPrematureStopProb(veto_ext_len['count'].values, veto_ext_len[f'{s}bcount'].values, veto_ext_len[f'{s}blonger'].values)
@@ -750,6 +789,8 @@ def CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_ext_len, cov_
         if len(veto_ext_len) == 0:
             break_points[['lg_broken_veto','rg_broken_veto']] = -1
         else:
+            # Combine breaks with different connections at the same position
+            veto_ext_len = veto_ext_len.groupby(['contig_id','position','q_left','q_right'])[['lbroken_veto_prob','rbroken_veto_prob']].min().reset_index()
             # Assign prematurely stopping vetos into groups to use the other breaks as a filter in the count comparison to avoid a flood of break points
             for s in ['l','r']:
                 veto_ext_len[f'{s}g_broken_veto'] = veto_ext_len[f'{s}broken_veto_prob'] <= prematurity_threshold
@@ -768,7 +809,8 @@ def CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_ext_len, cov_
         for s in ['l','r']:
             tmp = break_points.loc[break_points[f'{s}g_broken_veto'] >= 0, [f'{s}g_broken_veto','mapq','break_prob']].drop_duplicates().sort_values([f'{s}g_broken_veto','mapq','break_prob'], ascending=[True,False,False])
             tmp['break_prob'] = tmp.groupby([f'{s}g_broken_veto','mapq'], sort=False)['break_prob'].cummax()
-            tmp.drop_duplicates(inplace=True)
+            if len(tmp):
+                tmp.drop_duplicates(inplace=True)
             break_points[f'{s}g_veto_prob'] = break_points[[f'{s}g_broken_veto','mapq']].merge(tmp, on=[f'{s}g_broken_veto','mapq'], how='left')['break_prob'].values
         break_points['veto_prob'] = np.minimum(break_points['veto_prob'], np.minimum(break_points['lg_veto_prob'].fillna(1), break_points['rg_veto_prob'].fillna(1)))
         break_points.drop(columns=['lg_veto_prob','rg_veto_prob'], inplace=True)
@@ -779,7 +821,7 @@ def CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_ext_len, cov_
         # Remove break points that will reconnected anyways
         break_points['vetoed'] = (break_points['vetos'] >= min_num_reads) & (break_points['con_supp'] < min_num_reads) # If we have enough support, but not enough con_supp the bridge finding step would anyways reseal the break with a unique bridge, so don't even break it
         break_points['vetoed'] = break_points.groupby(['contig_id','position'], sort=False)['vetoed'].cummax() # Propagate vetos to lower mapping qualities
-        unconnected_break_points = [break_points[break_points['vetoed'] == True].copy()] # Store unconnected break points to later check if we can insert additional sequence to provide a connection in a second run
+        unconnected_break_points.append( break_points[break_points['vetoed'] == True].copy() ) # Store unconnected break points to later check if we can insert additional sequence to provide a connection in a second run
         break_points = break_points[break_points['vetoed'] == False].copy()
 #
         # Remove break points with not enough consistent breaks
@@ -826,7 +868,7 @@ def CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_ext_len, cov_
 #
     return break_points, unconnected_break_points
 
-def FindBreakPoints(mappings, contigs, covered_regions, max_dist_contig_end, min_mapping_length, min_length_contig_break, max_break_point_distance, min_num_reads, min_extension, merge_block_length, org_scaffold_trust, cov_probs, prob_factor, allow_same_contig_breaks, prematurity_threshold, pdf):
+def FindBreakPoints(mappings, contigs, covered_regions, repeats, max_dist_contig_end, min_mapping_length, min_length_contig_break, max_break_point_distance, min_num_reads, min_extension, merge_block_length, org_scaffold_trust, cov_probs, prob_factor, allow_same_contig_breaks, prematurity_threshold, pdf):
     if pdf:
         loose_reads_ends = mappings[(mappings['t_start'] > max_dist_contig_end) & np.where('+' == mappings['strand'], -1 == mappings['prev_con'], -1 == mappings['next_con'])]
         loose_reads_ends_length = np.where('+' == loose_reads_ends['strand'], loose_reads_ends['q_start']-loose_reads_ends['read_start'], loose_reads_ends['read_end']-loose_reads_ends['q_end'])
@@ -848,7 +890,7 @@ def FindBreakPoints(mappings, contigs, covered_regions, max_dist_contig_end, min
             PlotHist(pdf, "Break point distance", "# Break point pairs", break_point_dist, threshold=max_break_point_distance, logx=True )
 
     break_points = CountBreakSupport(break_points, max_break_point_distance, min_num_reads)
-    break_points, unconnected_break_points = CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_ext_len, cov_probs, covered_regions, max_dist_contig_end, max_break_point_distance, min_mapping_length, min_num_reads, min_length_contig_break, prob_factor, merge_block_length, prematurity_threshold)
+    break_points, unconnected_break_points = CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_ext_len, cov_probs, covered_regions, repeats, max_dist_contig_end, max_break_point_distance, min_mapping_length, min_num_reads, min_length_contig_break, prob_factor, merge_block_length, prematurity_threshold)
 
     if len(break_points):
         # Cluster break_points into groups, so that groups have a maximum length of 2*max_break_point_distance
@@ -1106,8 +1148,6 @@ def UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length, max_
 
     return mappings
 
-
-
 def FindDuplicatedContigPartEnds(repeats, contig_parts, max_dist_contig_end, proportion_duplicated):
     repeat_ends = repeats.copy()
     for s in ['q','t']:
@@ -1164,10 +1204,18 @@ def CreateBridges(left_bridge, right_bridge, min_distance_tolerance, rel_distanc
 
     return bridges
 
-def PrepareBridgeExtLen(bridge_extlen, bridges):
+def PrepareBridgeExtLen(bridge_extlen, bridges, repeats):
     # Assign mean_dist from bridges to bridge_extlen
     bridge_extlen = bridge_extlen.merge(bridges[['from','from_side','to','to_side','mean_dist','min_dist','max_dist']].drop_duplicates(), on=['from','from_side','to','to_side'], how='left')
-    bridge_extlen = bridge_extlen[(bridge_extlen['min_dist'] <= bridge_extlen['distance']) & (bridge_extlen['distance'] <= bridge_extlen['max_dist'])].drop(columns=['min_dist','max_dist'])    
+    bridge_extlen = bridge_extlen[(bridge_extlen['min_dist'] <= bridge_extlen['distance']) & (bridge_extlen['distance'] <= bridge_extlen['max_dist'])].drop(columns=['min_dist','max_dist'])
+    # Add the minimum extension within a repeat on the other side of the tested extension length to the gap length to avoid penalizing reads that require the full length on one side to map to a given contig and thus are short on the other side
+    rep_len = bridge_extlen.groupby(['from','from_side','to','to_side','mean_dist'])[['from_extlen','to_extlen']].min().reset_index()
+    reps = repeats.groupby(['q_con','side','q_confrom','q_conto']).agg({'q_start':'min','q_end':'max'}).reset_index()
+    reps['rep_len'] = np.where(reps['side'] == 'r', reps['q_conto'] - reps['q_start'], reps['q_end'] - reps['q_confrom'])
+    reps.drop(columns=['q_confrom','q_conto','q_start','q_end'], inplace=True)
+    rep_len['from_extlen'] = np.minimum( rep_len['from_extlen'], rep_len[['from','from_side']].merge(reps.rename(columns={'q_con':'from','side':'from_side'}), on=['from','from_side'], how='left')['rep_len'].fillna(0).astype(int).values )
+    rep_len['to_extlen'] = np.minimum( rep_len['to_extlen'], rep_len[['to','to_side']].merge(reps.rename(columns={'q_con':'to','side':'to_side'}), on=['to','to_side'], how='left')['rep_len'].fillna(0).astype(int).values )
+    bridge_extlen[['from_gaplen','to_gaplen']] += bridge_extlen[['from','from_side','to','to_side','mean_dist']].merge(rep_len, on=['from','from_side','to','to_side','mean_dist'], how='left')[['to_extlen','from_extlen']].values
 #
     return bridge_extlen
 
@@ -1335,7 +1383,7 @@ def CheckBridgeConsistency(bridges):
         print(inconsistencies)
         raise RuntimeError("Bridges are inconsistent.")
 
-def GetBridges(mappings, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, cov_probs, prob_factor, min_mapping_length, min_distance_tolerance, rel_distance_tolerance, prematurity_threshold, max_dist_contig_end, pdf):
+def GetBridges(mappings, repeats, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, cov_probs, prob_factor, min_mapping_length, min_distance_tolerance, rel_distance_tolerance, prematurity_threshold, max_dist_contig_end, pdf):
     # Get bridges
     for s in ['left','right']:
         cur_bridge = mappings.loc[mappings[f'{s}_con'] >= 0, ['conpart',f'{s}_con',f'{s}_con_side',f'{s}_con_dist','mapq','con_from','con_to','read_start','read_end','read_from','read_to','strand']].copy()
@@ -1367,7 +1415,7 @@ def GetBridges(mappings, borderline_removal, min_factor_alternatives, min_num_re
             bridge_extlen = pd.concat([bridge_extlen, cur_bridge.drop(columns=['mapq'])], ignore_index=True)
 #
     bridges = CreateBridges(left_bridge, right_bridge, min_distance_tolerance, rel_distance_tolerance)
-    bridge_extlen = PrepareBridgeExtLen(bridge_extlen, bridges)
+    bridge_extlen = PrepareBridgeExtLen(bridge_extlen, bridges, repeats)
     bridges = FilterBridges(bridges, bridge_extlen, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, cov_probs, prob_factor, min_mapping_length, contig_parts, prematurity_threshold, pdf)
     CheckBridgeConsistency(bridges)
 
@@ -1778,7 +1826,7 @@ def GetScaffoldLength(scaffold_parts, contig_parts):
 #
     return scaf_len
 
-def FilterLongRangeConnections(long_range_connections, long_range_extlen, scaffold_parts, contig_parts, cov_probs, prob_factor, min_mapping_length, prematurity_threshold):
+def FilterLongRangeConnections(long_range_connections, long_range_extlen, scaffold_parts, contig_parts, repeats, cov_probs, prob_factor, min_mapping_length, prematurity_threshold):
     scaf_len = GetScaffoldLength(scaffold_parts, contig_parts)
     if len(long_range_connections):
         for l in range(3,long_range_connections['size'].max()+1):
@@ -7402,7 +7450,7 @@ def ScaffoldContigs(contig_parts, bridges, mappings, cov_probs, repeats, prob_fa
     long_range_connections = GetLongRangeConnections(bridges, mappings, contig_parts, max_dist_contig_end)
     long_range_connections = TransformContigConnectionsToScaffoldConnections(long_range_connections, scaffold_parts)
     long_range_connections, long_range_extlen = SummarizeLongRangeConnections(long_range_connections)
-    long_range_connections, long_range_extlen = FilterLongRangeConnections(long_range_connections, long_range_extlen, scaffold_parts, contig_parts, cov_probs, prob_factor, min_mapping_length, prematurity_threshold)
+    long_range_connections, long_range_extlen = FilterLongRangeConnections(long_range_connections, long_range_extlen, scaffold_parts, contig_parts, repeats, cov_probs, prob_factor, min_mapping_length, prematurity_threshold)
     scaffold_graph = BuildScaffoldGraph(long_range_connections, scaf_bridges)
     scaffold_graph, trim_repeats = DeduplicateScaffoldsInGraph(scaffold_graph, repeats, scaffold_parts, scaf_bridges)
     scaf_bridges = UpdateScafBridgesAccordingToScaffoldGraph(scaf_bridges, scaffold_graph)
@@ -8381,7 +8429,7 @@ def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
         # Do not break contigs
         break_groups, spurious_break_indexes, non_informative_mappings = CallAllBreaksSpurious(mappings, contigs, covered_regions, max_dist_contig_end, min_length_contig_break, min_extension, pdf)
     else:
-        break_groups, spurious_break_indexes, non_informative_mappings, unconnected_breaks = FindBreakPoints(mappings, contigs, covered_regions, max_dist_contig_end, min_mapping_length, min_length_contig_break, max_break_point_distance, min_num_reads, min_extension, merge_block_length, org_scaffold_trust, cov_probs, prob_factor, allow_same_contig_breaks, prematurity_threshold, pdf)
+        break_groups, spurious_break_indexes, non_informative_mappings, unconnected_breaks = FindBreakPoints(mappings, contigs, covered_regions, repeats, max_dist_contig_end, min_mapping_length, min_length_contig_break, max_break_point_distance, min_num_reads, min_extension, merge_block_length, org_scaffold_trust, cov_probs, prob_factor, allow_same_contig_breaks, prematurity_threshold, pdf)
     mappings.drop(np.concatenate([np.unique(spurious_break_indexes['map_index'].values), non_informative_mappings]), inplace=True) # Remove not-accepted breaks from mappings and mappings that do not contain any information (mappings inside of contigs that do not overlap with breaks)
     del spurious_break_indexes, non_informative_mappings
 #
@@ -8392,7 +8440,7 @@ def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     del break_groups, contigs, contig_ids
 #
     print( str(timedelta(seconds=process_time())), "Search for possible bridges")
-    bridges = GetBridges(mappings, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, cov_probs, prob_factor, min_mapping_length, min_distance_tolerance, rel_distance_tolerance, prematurity_threshold, max_dist_contig_end, pdf)
+    bridges = GetBridges(mappings, repeats, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, cov_probs, prob_factor, min_mapping_length, min_distance_tolerance, rel_distance_tolerance, prematurity_threshold, max_dist_contig_end, pdf)
     if min_len_contig_overlap == 0:
         overlap_bridges = []
     else:
@@ -9428,7 +9476,7 @@ def TestFindBreakPoints():
         print(test)
         return True
 #
-    break_points, unconnected_break_points = CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_ext_len, cov_probs, covered_regions, max_dist_contig_end, max_break_point_distance, min_mapping_length, min_num_reads, min_length_contig_break, prob_factor, merge_block_length, prematurity_threshold)
+    break_points, unconnected_break_points = CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_ext_len, cov_probs, covered_regions, [], max_dist_contig_end, max_break_point_distance, min_mapping_length, min_num_reads, min_length_contig_break, prob_factor, merge_block_length, prematurity_threshold)
     test = []
     test.append( pd.DataFrame( {'contig_id': {0: 118, 1: 118, 2: 118, 3: 118, 4: 118, 5: 118, 6: 118, 7: 118, 8: 118, 9: 118},
                                 'position': {0: 5459, 1: 5502, 2: 5541, 3: 5551, 4: 5557, 5: 5559, 6: 5561, 7: 5562, 8: 5564, 9: 5566},
