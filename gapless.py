@@ -317,6 +317,15 @@ def LoadRepeats(repeat_file, contig_ids):
 #
     return repeats
 
+def ReplaceReadNamesWithID(mappings):
+    read_names = mappings[['q_name']].drop_duplicates()
+    read_names.reset_index(drop=True, inplace=True)
+    mappings['q_name'] = mappings[['q_name']].merge(read_names.reset_index(), on='q_name', how='left')['index'].values
+    mappings.rename(columns={'q_name':'q_id'}, inplace=True)
+    read_names.rename(columns={'q_name':'read_name'}, inplace=True)
+#
+    return mappings, read_names
+
 def GetThresholdsFromReadLenDist(mappings, num_read_len_groups):
     # Get read length distribution
     read_len_dist = mappings[['q_id','q_len']].drop_duplicates()
@@ -408,11 +417,7 @@ def ReadMappings(mapping_file, contig_ids, min_mapq, min_mapping_length, keep_al
         raise RuntimeError("Read mapping file empty.")
 
     # Assign ids instead of read names
-    read_names = mappings[['q_name']].drop_duplicates()
-    read_names.reset_index(drop=True, inplace=True)
-    mappings['q_name'] = mappings[['q_name']].merge(read_names.reset_index(), on='q_name', how='left')['index'].values
-    mappings.rename(columns={'q_name':'q_id'}, inplace=True)
-    read_names.rename(columns={'q_name':'read_name'}, inplace=True)
+    mappings, read_names = ReplaceReadNamesWithID(mappings)
 
     # Extract coverage
     length_thresholds = GetThresholdsFromReadLenDist(mappings, num_read_len_groups)
@@ -1450,7 +1455,7 @@ def InsertBridgesOnUniqueContigOverlapsWithoutConnections(bridges, repeats, spur
         overlaps.drop(columns=['q_confrom','q_conto','t_confrom','t_conto'], inplace=True)
         overlaps.sort_values(['q_con','q_side','q_overlap'], ascending=[True,True,False], inplace=True)
         overlaps['q_alt_overlap'] = np.where( (overlaps['q_con'] == overlaps['q_con'].shift(-1)) & (overlaps['q_side'] == overlaps['q_side'].shift(-1)), overlaps['q_overlap'].shift(-1, fill_value=0), 0)
-        overlaps = overlaps[(overlaps['q_con'] != overlaps['q_con'].shift(1)) & (overlaps['q_side'] != overlaps['q_side'].shift(1))].copy()
+        overlaps = overlaps[(overlaps['q_con'] != overlaps['q_con'].shift(1)) | (overlaps['q_side'] != overlaps['q_side'].shift(1))].copy()
         overlaps = overlaps[overlaps['q_overlap'] >= overlaps['q_alt_overlap'] + min_len_contig_overlap].copy()
         overlaps.drop(columns=['q_alt_overlap'], inplace=True)
     if len(overlaps):
@@ -1466,11 +1471,11 @@ def InsertBridgesOnUniqueContigOverlapsWithoutConnections(bridges, repeats, spur
         overlap_mappings = spurious_mappings[['q_id','t_id','t_start','t_end','strand','mapq','next_con','prev_con']].reset_index()
         overlap_mappings['prev_spur'] = (overlap_mappings['index'] == overlap_mappings['index'].shift(1)+1) & (overlap_mappings['q_id'] == overlap_mappings['q_id'].shift(1))
         overlap_mappings['next_spur'] = (overlap_mappings['index'] == overlap_mappings['index'].shift(-1)-1) & (overlap_mappings['q_id'] == overlap_mappings['q_id'].shift(-1))
-        overlap_mappings = overlap_mappings.merge(contig_parts.loc[overlaps['q_con'].values, ['contig','start','end']].reset_index().rename(columns={'index':'conpart','contig':'t_id','start':'pstart','end':'pend'}), on='t_id', how='inner')
+        overlap_mappings = overlap_mappings.merge(contig_parts.loc[np.unique(overlaps['q_con'].values), ['contig','start','end']].reset_index().rename(columns={'index':'conpart','contig':'t_id','start':'pstart','end':'pend'}), on='t_id', how='inner')
         overlap_mappings = overlap_mappings[(overlap_mappings['t_start'] < overlap_mappings['pend']) & (overlap_mappings['t_end'] > overlap_mappings['pstart'])].drop(columns=['pstart','pend']) # mappings overlap with a contig part in overlaps
         if len(overlap_mappings):
-            overlap_mappings[['oside','ostart','oend']] = overlap_mappings[['conpart']].rename(columns={'conpart':'q_con'}).merge(overlaps[['q_con','q_side','q_start','q_end']], on='q_con', how='left')[['q_side','q_start','q_end']].values
-            overlap_mappings[['ostart','oend']] = overlap_mappings[['ostart','oend']].astype(int)
+            # Check if the mappings is at the correct side
+            overlap_mappings = overlap_mappings.merge(overlaps[['q_con','q_side','q_start','q_end']].rename(columns={'q_con':'conpart','q_side':'oside','q_start':'ostart','q_end':'oend'}), on='conpart', how='left')
             overlap_mappings = overlap_mappings[np.where(overlap_mappings['oside'] == 'l', (overlap_mappings['t_start'] < overlap_mappings['oend'] + max_dist_contig_end) & (overlap_mappings['t_end'] > overlap_mappings['oend']),
                                                                                            (overlap_mappings['t_start'] < overlap_mappings['ostart']) & (overlap_mappings['t_end'] > overlap_mappings['oend'] - max_dist_contig_end) )].copy()
         if len(overlap_mappings):
@@ -8406,7 +8411,7 @@ def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     alignment_precision = 100
 #
     proportion_duplicated = 0.95
-    min_len_contig_overlap = 10000
+    min_len_contig_overlap = 5000
     remove_duplicated_contigs = True
 #
     remove_zero_hit_contigs = True
@@ -9133,9 +9138,11 @@ def GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length, kee
     # Filter mappings
     mappings = mappings[(min_mapq <= mappings['mapq']) & (min_mapping_length <= mappings['t_end'] - mappings['t_start'])].copy()
     
+    mappings, read_names = ReplaceReadNamesWithID(mappings)
+    
     # Remove all but the best subread
     if not keep_all_subreads:
-        mappings = GetBestSubreads(mappings, alignment_precision)
+        mappings = GetBestSubreads(mappings, read_names, alignment_precision)
     
     # Find mappings inside defined regions
     mappings['in_region'] = False
@@ -9143,12 +9150,12 @@ def GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length, kee
          mappings.loc[ (reg['scaffold'] == mappings['t_name']) & (reg['start'] < mappings['t_end']) & (reg['end'] >= mappings['t_start']) , 'in_region'] = True
          
     # Only keep mappings that are in defined regions or are the previous or next mappings of a read in the region
-    mappings.sort_values(['q_name','q_start','q_end'], inplace=True)
-    mappings = mappings[ mappings['in_region'] | (mappings['in_region'].shift(-1, fill_value=False) & (mappings['q_name'] == mappings['q_name'].shift(-1, fill_value=''))) | (mappings['in_region'].shift(1, fill_value=False) & (mappings['q_name'] == mappings['q_name'].shift(1, fill_value=''))) ].copy()
+    mappings.sort_values(['q_id','q_start','q_end'], inplace=True)
+    mappings = mappings[ mappings['in_region'] | (mappings['in_region'].shift(-1, fill_value=False) & (mappings['q_id'] == mappings['q_id'].shift(-1, fill_value=''))) | (mappings['in_region'].shift(1, fill_value=False) & (mappings['q_id'] == mappings['q_id'].shift(1, fill_value=''))) ].copy()
     
     # Get left and right scaffold of read (first ignore strand and later switch next and prev if necessary)
-    mappings['left_scaf'] = np.where(mappings['q_name'] != mappings['q_name'].shift(1, fill_value=''), '', mappings['t_name'].shift(1, fill_value=''))
-    mappings['right_scaf'] = np.where(mappings['q_name'] != mappings['q_name'].shift(-1, fill_value=''), '', mappings['t_name'].shift(-1, fill_value=''))
+    mappings['left_scaf'] = np.where(mappings['q_id'] != mappings['q_id'].shift(1, fill_value=''), '', mappings['t_name'].shift(1, fill_value=''))
+    mappings['right_scaf'] = np.where(mappings['q_id'] != mappings['q_id'].shift(-1, fill_value=''), '', mappings['t_name'].shift(-1, fill_value=''))
     # Get distance to next mapping or distance to read end if no next mapping exists
     mappings['left_dist'] = np.where('' == mappings['left_scaf'], mappings['q_start'], mappings['q_start']-mappings['q_end'].shift(1, fill_value=0))
     mappings['right_dist'] = np.where('' == mappings['right_scaf'], mappings['q_len']-mappings['q_end'], mappings['q_start'].shift(-1, fill_value=0)-mappings['q_end'])
@@ -9214,7 +9221,7 @@ def GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length, kee
     mappings.loc[mappings['overrun_right'], 'right_len'] = 0
     
     # Remove mappings that are less than min_mapping_length in the region, except if they belong to a read with multiple mappings
-    mappings = mappings[ ((min_mapping_length <= mappings['t_end'] - mappings['start']) & (min_mapping_length <= mappings['end'] - mappings['t_start'])) | (mappings['q_name'] == mappings['q_name'].shift(1, fill_value="")) | (mappings['q_name'] == mappings['q_name'].shift(-1, fill_value="")) ].copy()
+    mappings = mappings[ ((min_mapping_length <= mappings['t_end'] - mappings['start']) & (min_mapping_length <= mappings['end'] - mappings['t_start'])) | (mappings['q_id'] == mappings['q_id'].shift(1, fill_value="")) | (mappings['q_id'] == mappings['q_id'].shift(-1, fill_value="")) ].copy()
     
     mappings.drop(columns=['in_region','start','end','scaffold'], inplace=True)
         
@@ -9222,14 +9229,14 @@ def GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length, kee
     mappings['con_prev_reg'] = 'no'
     if 1 < len(regions):
         # Find indirect connections, where the previous region has a mapping somewhere before the current mapping
-        for s in range(2,np.max(mappings.groupby(['q_name'], sort=False).size())+1):
-            mappings.loc[('+' == mappings['strand']) & (mappings['q_name'] == mappings['q_name'].shift(s, fill_value="")) & (0 < mappings['region']) & (mappings['region']-1 == mappings['region'].shift(s, fill_value=-1)), 'con_prev_reg'] = 'indirect'
-            mappings.loc[('-' == mappings['strand']) & (mappings['q_name'] == mappings['q_name'].shift(-s, fill_value="")) & (0 < mappings['region']) & (mappings['region']-1 == mappings['region'].shift(-s, fill_value=-1)), 'con_prev_reg'] = 'indirect'
+        for s in range(2,np.max(mappings.groupby(['q_id'], sort=False).size())+1):
+            mappings.loc[('+' == mappings['strand']) & (mappings['q_id'] == mappings['q_id'].shift(s, fill_value="")) & (0 < mappings['region']) & (mappings['region']-1 == mappings['region'].shift(s, fill_value=-1)), 'con_prev_reg'] = 'indirect'
+            mappings.loc[('-' == mappings['strand']) & (mappings['q_id'] == mappings['q_id'].shift(-s, fill_value="")) & (0 < mappings['region']) & (mappings['region']-1 == mappings['region'].shift(-s, fill_value=-1)), 'con_prev_reg'] = 'indirect'
         
         # Find direct connections
-        mappings.loc[('+' == mappings['strand']) & (mappings['q_name'] == mappings['q_name'].shift(1, fill_value="")) & ('+' == mappings['strand'].shift(1, fill_value="")) &\
+        mappings.loc[('+' == mappings['strand']) & (mappings['q_id'] == mappings['q_id'].shift(1, fill_value="")) & ('+' == mappings['strand'].shift(1, fill_value="")) &\
                      (0 < mappings['region']) & (mappings['region']-1 == mappings['region'].shift(1, fill_value=-1)), 'con_prev_reg'] = 'direct'
-        mappings.loc[('-' == mappings['strand']) & (mappings['q_name'] == mappings['q_name'].shift(-1, fill_value="")) & ('-' == mappings['strand'].shift(-1, fill_value="")) &\
+        mappings.loc[('-' == mappings['strand']) & (mappings['q_id'] == mappings['q_id'].shift(-1, fill_value="")) & ('-' == mappings['strand'].shift(-1, fill_value="")) &\
                  (0 < mappings['region']) & (mappings['region']-1 == mappings['region'].shift(-1, fill_value=-1)), 'con_prev_reg'] = 'direct'
         # Clear scaffold connection info for direct connections
         mappings.loc['direct' == mappings['con_prev_reg'], 'left_scaf'] = ''
@@ -9244,15 +9251,15 @@ def GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length, kee
     mappings = mappings[0 <= mappings['region']].copy()
     
     # Assign read ids to the mappings sorted from left to right by appearance on screen to give position in drawing
-    tmp = mappings.groupby(['q_name'], sort=False)['region'].agg(['size','min'])
+    tmp = mappings.groupby(['q_id'], sort=False)['region'].agg(['size','min'])
     mappings['min_region'] = np.repeat(tmp['min'].values, tmp['size'].values)
     mappings['t_min_start'] = np.where(mappings['min_region'] == mappings['region'], mappings['t_start'], sys.maxsize)
     mappings['t_max_end'] = np.where(mappings['min_region'] == mappings['region'], mappings['t_end'], 0)
-    tmp = mappings.groupby(['q_name'], sort=False)[['t_min_start','t_max_end']].agg({'t_min_start':['size','min'], 't_max_end':['max']})
+    tmp = mappings.groupby(['q_id'], sort=False)[['t_min_start','t_max_end']].agg({'t_min_start':['size','min'], 't_max_end':['max']})
     mappings['t_min_start'] = np.repeat(tmp[('t_min_start','min')].values, tmp[('t_min_start','size')].values)
     mappings['t_max_end'] = np.repeat(tmp[('t_max_end','max')].values, tmp[('t_min_start','size')].values)
-    mappings.sort_values(['min_region','t_min_start','t_max_end','q_name','region','t_start','t_end'], ascending=[True,True,True,True,False,False,False], inplace=True)
-    mappings['read_id'] = (mappings['q_name'] != mappings['q_name'].shift(1, fill_value="")).cumsum()
+    mappings.sort_values(['min_region','t_min_start','t_max_end','q_id','region','t_start','t_end'], ascending=[True,True,True,True,False,False,False], inplace=True)
+    mappings['read_id'] = (mappings['q_id'] != mappings['q_id'].shift(1, fill_value="")).cumsum()
     mappings.drop(columns=['min_region','t_min_start','t_max_end'], inplace=True)
     
     # Check whether the reads support a contig break within the region (on left or right side of the read)
