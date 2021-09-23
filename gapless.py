@@ -436,6 +436,8 @@ def ReadMappings(mapping_file, contig_ids, min_mapq, min_mapping_length, keep_al
     mappings['t_id'] = itemgetter(*mappings['t_name'])(contig_ids)
     cov_counts['t_id'] = itemgetter(*cov_counts['t_name'])(contig_ids)
 
+    mappings.reset_index(drop=True, inplace=True)
+
     return mappings, cov_counts, cov_probs, read_names
 
 def RemoveUnmappedContigs(contigs, mappings, remove_zero_hit_contigs):
@@ -1093,6 +1095,15 @@ def UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length, max_
     mappings.sort_values(['q_id','read_start','read_from','read_to'], inplace=True)
     mappings.reset_index(inplace=True, drop=True)
 #
+    # Handle completely overlapping mappings from the same read (by removing the completely included one)
+    while True:
+        mappings['conflict'] = (mappings['q_id'] == mappings['q_id'].shift(1)) & (mappings['read_start'] == mappings['read_start'].shift(1)) & (mappings['read_to'] <= mappings['read_to'].shift(1))
+        if np.sum(mappings['conflict']):
+            mappings = mappings[mappings['conflict'] == False].copy()
+        else:
+            break
+    mappings.drop(columns='conflict', inplace=True)
+#
     # Update connections
     mappings['next_con'] = np.where((mappings['q_id'].shift(-1, fill_value='') != mappings['q_id']) | (mappings['read_start'].shift(-1, fill_value=-1) != mappings['read_start']), -1, mappings['conpart'].shift(-1, fill_value=-1))
     mappings['next_strand'] = np.where(-1 == mappings['next_con'], '', mappings['strand'].shift(-1, fill_value=''))
@@ -1421,7 +1432,7 @@ def GetBridges(mappings, repeats, borderline_removal, min_factor_alternatives, m
 
     return bridges
 
-def InsertBridgesOnUniqueContigOverlapsWithoutConnections(bridges, repeats, min_len_contig_overlap, min_num_reads):
+def InsertBridgesOnUniqueContigOverlapsWithoutConnections(bridges, repeats, spurious_mappings, contig_parts, min_len_contig_overlap, min_num_reads, max_dist_contig_end):
     if len(repeats):
         # Find overlapping ends
         overlaps = repeats.rename(columns={'side':'q_side'})
@@ -1450,6 +1461,33 @@ def InsertBridgesOnUniqueContigOverlapsWithoutConnections(bridges, repeats, min_
         for s in ['q','t']:
             if len(overlaps):
                 overlaps = overlaps[ overlaps[[f'{s}_con',f'{s}_side']].rename(columns={f'{s}_con':'from',f'{s}_side':'from_side'}).merge(bridges[['from','from_side']].drop_duplicates(), on=['from','from_side'], how='left', indicator=True)['_merge'].values == "left_only" ].copy()
+    if len(overlaps):
+        # Check which spurious mappings indicate an overlap
+        overlap_mappings = spurious_mappings[['q_id','t_id','t_start','t_end','strand','mapq','next_con','prev_con']].reset_index()
+        overlap_mappings['prev_spur'] = (overlap_mappings['index'] == overlap_mappings['index'].shift(1)+1) & (overlap_mappings['q_id'] == overlap_mappings['q_id'].shift(1))
+        overlap_mappings['next_spur'] = (overlap_mappings['index'] == overlap_mappings['index'].shift(-1)-1) & (overlap_mappings['q_id'] == overlap_mappings['q_id'].shift(-1))
+        overlap_mappings = overlap_mappings.merge(contig_parts.loc[overlaps['q_con'].values, ['contig','start','end']].reset_index().rename(columns={'index':'conpart','contig':'t_id','start':'pstart','end':'pend'}), on='t_id', how='inner')
+        overlap_mappings = overlap_mappings[(overlap_mappings['t_start'] < overlap_mappings['pend']) & (overlap_mappings['t_end'] > overlap_mappings['pstart'])].drop(columns=['pstart','pend']) # mappings overlap with a contig part in overlaps
+        if len(overlap_mappings):
+            overlap_mappings[['oside','ostart','oend']] = overlap_mappings[['conpart']].rename(columns={'conpart':'q_con'}).merge(overlaps[['q_con','q_side','q_start','q_end']], on='q_con', how='left')[['q_side','q_start','q_end']].values
+            overlap_mappings[['ostart','oend']] = overlap_mappings[['ostart','oend']].astype(int)
+            overlap_mappings = overlap_mappings[np.where(overlap_mappings['oside'] == 'l', (overlap_mappings['t_start'] < overlap_mappings['oend'] + max_dist_contig_end) & (overlap_mappings['t_end'] > overlap_mappings['oend']),
+                                                                                           (overlap_mappings['t_start'] < overlap_mappings['ostart']) & (overlap_mappings['t_end'] > overlap_mappings['oend'] - max_dist_contig_end) )].copy()
+        if len(overlap_mappings):
+            overlap_mappings['prev_spur'] = overlap_mappings['prev_spur'] & ((overlap_mappings['index'] == overlap_mappings['index'].shift(1)+1) & (overlap_mappings['q_id'] == overlap_mappings['q_id'].shift(1)) == False) # If both spurious mappings are still present it is probably caused by the overlap and we do not call it spurious anymore
+            overlap_mappings['next_spur'] = overlap_mappings['next_spur'] & ((overlap_mappings['index'] == overlap_mappings['index'].shift(-1)-1) & (overlap_mappings['q_id'] == overlap_mappings['q_id'].shift(-1)) == False)
+            overlap_mappings = overlap_mappings[np.where( (overlap_mappings['oside'] == 'l') == (overlap_mappings['strand'] == '+'), overlap_mappings['prev_spur'], overlap_mappings['next_spur'] ) == False].drop(columns=['index','q_id','prev_spur','next_spur'])
+        if len(overlap_mappings):
+            overlap_mappings['conn'] = np.where( (overlap_mappings['oside'] == 'l') == (overlap_mappings['strand'] == '+'), overlap_mappings['prev_con'], overlap_mappings['next_con'] )
+            overlap_mappings = overlap_mappings.merge(contig_parts[['contig']].reset_index().rename(columns={'index':'conn_part','contig':'conn'}), on='conn', how='inner')
+            overlap_mappings = overlap_mappings[overlap_mappings['conpart'] != overlap_mappings['conn_part']].copy()
+        if len(overlap_mappings):
+            overlap_mappings = overlap_mappings[overlap_mappings['mapq'] == overlap_mappings[['conpart','oside']].merge(overlap_mappings.groupby(['conpart','oside'])['mapq'].max().reset_index(), on=['conpart','oside'], how='left')['mapq'].values].copy()
+        # Check that the overlap does not conflict with mappings
+        if len(overlap_mappings):
+            overlaps = overlaps[ (overlaps[['q_con','q_side','t_con']].rename(columns={'q_con':'conpart','q_side':'oside','t_con':'conn_part'}).merge(overlap_mappings[['conpart','oside','conn_part']].drop_duplicates(), on=['conpart','oside','conn_part'], how='left', indicator=True)['_merge'].values == "both") | # We have direct support
+                                 (overlaps[['q_con','q_side']].rename(columns={'q_con':'conpart','q_side':'oside'}).merge(overlap_mappings[['conpart','oside']].drop_duplicates(), on=['conpart','oside'], how='left', indicator=True)['_merge'].values == "left_only") ].copy() # We have no contradictory evidence 
+            overlaps = overlaps.merge(overlaps[['q_con','q_start','q_end','t_con','t_start','t_end']].rename(columns={'q_con':'t_con','q_start':'t_start','q_end':'t_end','t_con':'q_con','t_start':'q_start','t_end':'q_end'}), on=['q_con','q_start','q_end','t_con','t_start','t_end'], how='inner')
     # Add the valid overlaps to bridges
     overlap_bridges = overlaps.copy()
     if len(overlaps):
@@ -8430,6 +8468,8 @@ def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
         break_groups, spurious_break_indexes, non_informative_mappings = CallAllBreaksSpurious(mappings, contigs, covered_regions, max_dist_contig_end, min_length_contig_break, min_extension, pdf)
     else:
         break_groups, spurious_break_indexes, non_informative_mappings, unconnected_breaks = FindBreakPoints(mappings, contigs, covered_regions, repeats, max_dist_contig_end, min_mapping_length, min_length_contig_break, max_break_point_distance, min_num_reads, min_extension, merge_block_length, org_scaffold_trust, cov_probs, prob_factor, allow_same_contig_breaks, prematurity_threshold, pdf)
+    spurious_mappings = mappings.loc[np.unique(spurious_break_indexes['map_index'].values)].copy() # We still need them for InsertBridgesOnUniqueContigOverlapsWithoutConnections
+    spurious_mappings = spurious_mappings[np.isin(spurious_mappings['t_id'], np.unique(repeats['q_id']))].copy()
     mappings.drop(np.concatenate([np.unique(spurious_break_indexes['map_index'].values), non_informative_mappings]), inplace=True) # Remove not-accepted breaks from mappings and mappings that do not contain any information (mappings inside of contigs that do not overlap with breaks)
     del spurious_break_indexes, non_informative_mappings
 #
@@ -8444,7 +8484,8 @@ def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     if min_len_contig_overlap == 0:
         overlap_bridges = []
     else:
-        bridges, overlap_bridges = InsertBridgesOnUniqueContigOverlapsWithoutConnections(bridges, repeats, min_len_contig_overlap, min_num_reads)
+        bridges, overlap_bridges = InsertBridgesOnUniqueContigOverlapsWithoutConnections(bridges, repeats, spurious_mappings, contig_parts, min_len_contig_overlap, min_num_reads, max_dist_contig_end)
+    del spurious_mappings
 #
     print( str(timedelta(seconds=process_time())), "Scaffold the contigs")
     scaffold_paths, trim_repeats = ScaffoldContigs(contig_parts, bridges, mappings, cov_probs, repeats, prob_factor, min_mapping_length, max_dist_contig_end, prematurity_threshold, ploidy, max_loop_units)
