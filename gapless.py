@@ -1513,7 +1513,7 @@ def GetBridges(mappings, repeats, borderline_removal, min_factor_alternatives, m
 
     return bridges
 
-def InsertBridgesOnUniqueContigOverlapsWithoutConnections(bridges, repeats, spurious_mappings, contig_parts, min_len_contig_overlap, min_num_reads, max_dist_contig_end):
+def GetContigPartOverlaps(repeats):
     if len(repeats):
         # Find overlapping ends
         overlaps = repeats.rename(columns={'side':'q_side'})
@@ -1524,6 +1524,11 @@ def InsertBridgesOnUniqueContigOverlapsWithoutConnections(bridges, repeats, spur
         overlaps = overlaps[(overlaps['q_side'] != overlaps['t_side']) == (overlaps['strand'] == '+')].drop(columns=['strand'])
     else:
         overlaps = []
+#
+    return overlaps
+
+def InsertBridgesOnUniqueContigOverlapsWithoutConnections(bridges, repeats, spurious_mappings, contig_parts, min_len_contig_overlap, min_num_reads, max_dist_contig_end):
+    overlaps = GetContigPartOverlaps(repeats)
     if len(overlaps):
         # Overlap needs to be unique or at least min_len_contig_overlap longer than all other options (if there is no other option it has to be at least min_len_contig_overlap long)
         for s in ['q','t']:
@@ -8227,8 +8232,8 @@ def CountResealedBreaks(result_info, scaffold_paths, contig_parts, ploidy):
 
     return result_info
 
-def FindBestReadsToFillGaps(mappings, overlap_bridges):
-    possible_reads = mappings.loc[(mappings['rcon'] >= 0) & (mappings['rpos'] >= 0), ['scaf','pos','rhap','rpos','read_pos','read_id','read_start','read_from','read_to','strand','rdist','mapq','rmapq','matches','rmatches','con_from','con_to','rmapid']].sort_values(['scaf','pos','rhap'])
+def FindBestReadsToFillGaps(mappings, repeats, overlap_bridges):
+    possible_reads = mappings.loc[(mappings['rcon'] >= 0) & (mappings['rpos'] >= 0), ['scaf','pos','rhap','rpos','read_pos','read_id','read_start','read_from','read_to','strand','rdist','mapq','rmapq','matches','rmatches','con_from','con_to','rmapid','conpart','rcon','con_strand']].sort_values(['scaf','pos','rhap'])
 #
     # First take the one with the highest mapping qualities on both sides
     possible_reads['cmapq'] = np.minimum(possible_reads['mapq'], possible_reads['rmapq'])*1000 + np.maximum(possible_reads['mapq'], possible_reads['rmapq'])
@@ -8261,16 +8266,46 @@ def FindBestReadsToFillGaps(mappings, overlap_bridges):
     possible_reads.loc[possible_reads['strand'] == '-', 'read_to'] = possible_reads.loc[possible_reads['strand'] == '-', 'read_from']
     possible_reads.loc[possible_reads['strand'] == '-', 'read_from'] = possible_reads.loc[possible_reads['strand'] == '-', 'read_to'] - possible_reads.loc[possible_reads['strand'] == '-', 'rdist']
     possible_reads.loc[possible_reads['rdist'] <= 0, ['read_from','read_to']] = 0
-    possible_reads.drop(columns=['rdist'], inplace=True)
 #
     # Get the mapping information for the other side of the gap
     possible_reads['read_pos'] += np.where(possible_reads['strand'] == '+', 1, -1)
     possible_reads[['rcon_from','rcon_to']] = possible_reads[['read_id','read_start','read_pos','scaf','pos','rpos','rmapid']].merge(mappings[['read_id','read_start','read_pos','scaf','pos','lpos','con_from','con_to','mapid']].rename(columns={'pos':'rpos','lpos':'pos','con_from':'rcon_from','con_to':'rcon_to','mapid':'rmapid'}), on=['read_id','read_start','read_pos','scaf','pos','rpos','rmapid'], how='left')[['rcon_from','rcon_to']].astype(int).values
+#
+    # Remove part of the mapping to apply negative distances (if we find a repeat use that one, otherwise estimate the cut)
+    possible_reads['rcon_strand'] = possible_reads[['read_id','read_start','read_pos','scaf','pos','rpos','rmapid']].merge(mappings[['read_id','read_start','read_pos','scaf','pos','lpos','con_strand','mapid']].rename(columns={'pos':'rpos','lpos':'pos','con_strand':'rcon_strand','mapid':'rmapid'}), on=['read_id','read_start','read_pos','scaf','pos','rpos','rmapid'], how='left')['rcon_strand'].values
     possible_reads.drop(columns=['read_pos','read_start','rmapid'], inplace=True)
+    neg_dist = possible_reads.loc[possible_reads['rdist'] < 0, ['conpart','rcon','con_strand','rcon_strand']].reset_index()
+    if len(neg_dist):
+        neg_dist.rename(columns={'conpart':'q_con','rcon':'t_con','con_strand':'q_side','rcon_strand':'t_side'}, inplace=True)
+        neg_dist['q_side'] = np.where(neg_dist['q_side'] == '+', 'r', 'l')
+        neg_dist['t_side'] = np.where(neg_dist['t_side'] == '+', 'l', 'r')
+        overlaps = GetContigPartOverlaps(repeats)
+        # Split the neg_dist into overlaps (the ones that have an repeat as overlap) and neg_dist (the ones where we need to estimate the cut)
+        if len(overlaps):
+            overlaps = neg_dist.merge(overlaps, on=['q_con','t_con','q_side','t_side'], how='inner')
+        if len(overlaps):
+            neg_dist = neg_dist[np.isin(neg_dist['index'], overlaps['index']) == False].copy()
+            if np.sum(overlaps['q_side'] == 'l'):
+                possible_reads.loc[overlaps.loc[overlaps['q_side'] == 'l', 'index'].values, 'con_from'] = overlaps.loc[overlaps['q_side'] == 'l', 'q_end'].values
+            if np.sum(overlaps['q_side'] == 'r'):
+                possible_reads.loc[overlaps.loc[overlaps['q_side'] == 'r', 'index'].values, 'con_to'] = overlaps.loc[overlaps['q_side'] == 'r', 'q_start'].values
+            if np.sum(overlaps['t_side'] == 'l'):
+                possible_reads.loc[overlaps.loc[overlaps['t_side'] == 'l', 'index'].values, 'rcon_from'] = overlaps.loc[overlaps['t_side'] == 'l', 't_start'].values
+            if np.sum(overlaps['t_side'] == 'r'):
+                possible_reads.loc[overlaps.loc[overlaps['t_side'] == 'r', 'index'].values, 'rcon_to'] = overlaps.loc[overlaps['t_side'] == 'r', 't_end'].values
+        if len(neg_dist):
+            if np.sum(neg_dist['q_side'] == 'l'):
+                possible_reads.loc[neg_dist.loc[neg_dist['q_side'] == 'l', 'index'].values, 'con_from'] -= possible_reads.loc[neg_dist.loc[neg_dist['q_side'] == 'l', 'index'].values, 'rdist'].values
+            if np.sum(neg_dist['q_side'] == 'r'):
+                possible_reads.loc[neg_dist.loc[neg_dist['q_side'] == 'r', 'index'].values, 'con_from'] += possible_reads.loc[neg_dist.loc[neg_dist['q_side'] == 'r', 'index'].values, 'rdist'].values
+    possible_reads.drop(columns=['rdist','conpart','rcon','con_strand'], inplace=True)
 #
     # Add overlap_bridges as pseudo reads
     if len(overlap_bridges):
-        pseudo_reads = overlap_bridges[['scaf','lpos','hap','rpos','q_start','q_end','t_start','t_end']].rename(columns={'lpos':'pos','hap':'rhap','q_start':'con_from','q_end':'con_to','t_start':'rcon_from','t_end':'rcon_to'})
+        # To remove the duplicated part in the query contig we flip q_start and q_end and set the other side to 0 or something large
+        pseudo_reads = overlap_bridges[['scaf','lpos','hap','rpos','q_end','q_start','t_start','t_end']].rename(columns={'lpos':'pos','hap':'rhap','q_end':'con_from','q_start':'con_to','t_start':'rcon_from','t_end':'rcon_to'})
+        pseudo_reads.loc[overlap_bridges['q_side'] == 'l', 'con_to'] = pseudo_reads.loc[overlap_bridges['q_side'] == 'l', 'con_from'] + 10000
+        pseudo_reads.loc[overlap_bridges['q_side'] == 'r', 'con_from'] = 0
         pseudo_reads['read_id'] = mappings['read_id'].max() + 1 + np.arange(len(pseudo_reads))
         pseudo_reads['read_from'] = 0
         pseudo_reads['read_to'] = 0
@@ -8420,8 +8455,8 @@ def RemoveNonExtendingMappings(mappings, contig_parts, max_dist_contig_end, min_
 #
     return mappings
 
-def FillGapsWithReads(scaffold_paths, mappings, contig_parts, read_names, overlap_bridges, ploidy, max_dist_contig_end, min_extension, min_num_reads, pdf):
-    possible_reads = FindBestReadsToFillGaps(mappings, overlap_bridges)
+def FillGapsWithReads(scaffold_paths, mappings, contig_parts, read_names, repeats, overlap_bridges, ploidy, max_dist_contig_end, min_extension, min_num_reads, pdf):
+    possible_reads = FindBestReadsToFillGaps(mappings, repeats, overlap_bridges)
     scaffold_paths = StoreReadAndContingInformationInScaffoldPaths(scaffold_paths, contig_parts, possible_reads, read_names, ploidy)
     mappings = RemoveNonExtendingMappings(mappings, contig_parts, max_dist_contig_end, min_extension, min_num_reads, pdf)
     mappings['read_id'] = read_names.loc[ mappings['read_id'].values, 'read_name' ].values
@@ -8576,7 +8611,7 @@ def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     print( str(timedelta(seconds=process_time())), "Fill gaps")
     mappings, scaffold_paths, overlap_bridges = MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploidy) # Might break apart scaffolds again, if we cannot find a mapping read for a connection
     result_info = CountResealedBreaks(result_info, scaffold_paths, contig_parts, ploidy)
-    scaffold_paths, mappings = FillGapsWithReads(scaffold_paths, mappings, contig_parts, read_names, overlap_bridges, ploidy, max_dist_contig_end, min_extension, min_num_reads, pdf) # Mappings are prepared for scaffold extensions
+    scaffold_paths, mappings = FillGapsWithReads(scaffold_paths, mappings, contig_parts, read_names, repeats, overlap_bridges, ploidy, max_dist_contig_end, min_extension, min_num_reads, pdf) # Mappings are prepared for scaffold extensions
     result_info = GetOutputInfo(result_info, scaffold_paths)
 #
     if pdf:
