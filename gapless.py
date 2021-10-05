@@ -384,7 +384,7 @@ def GetCoverageProbabilities(cov_counts, pdf):
         prob_sigma.append(opt_par[1])
         if pdf:
             x_values = np.arange(probs.loc[selection, 'count'].values[0], probs.loc[selection, 'count'].values[-1]+1)
-            PlotXY(pdf, "Max. Coverage", "% Bins (Size: {})".format(bsize), probs.loc[selection, 'count'], probs.loc[selection, 'nbin_cumsum']/probs.loc[selection, 'nbin_sum'], linex=x_values, liney=NormCDF(x_values,opt_par[0],opt_par[1]))
+            PlotXY(pdf, "Max. Coverage", "% Bins (Size: {})".format(bsize), probs.loc[selection, 'count'], probs.loc[selection, 'nbin_cumsum']/probs.loc[selection, 'nbin_sum']*100, linex=x_values, liney=NormCDF(x_values,opt_par[0],opt_par[1])*100)
 
     # Store results in DataFrame
     cov_probs = pd.DataFrame({'length':prob_len, 'mu':prob_mu, 'sigma':prob_sigma})
