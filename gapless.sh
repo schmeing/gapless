@@ -50,8 +50,15 @@ while getopts "h?i:j:n:o:rs:t:" opt; do
   esac
 done
 
-shift $((OPTIND-1))
-[ "$1" = "--" ] && shift
+if [ -z ${1+x} ]; then
+	echo_usage
+	exit
+else
+	shift $((OPTIND-1))
+	if [ ! -z ${1+x} ]; then
+		[ "$1" = "--" ] && shift
+	fi
+fi
 
 # Checking arguments
 if [ -z "$asm" ]; then
@@ -61,7 +68,7 @@ if [ -z "$asm" ]; then
   exit 1
 fi
 
-if [ -z "$1" ]; then
+if [ -z ${1+x} ]; then
   echo "Long reads required."
   echo
   echo_usage
@@ -71,7 +78,7 @@ else
 fi
 
 if [ -z "$type" ]; then
-  echo "Reads type required."
+  echo "Read type required."
   echo
   echo_usage
   exit 1
