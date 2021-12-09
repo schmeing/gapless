@@ -326,12 +326,11 @@ def ReplaceReadNamesWithID(mappings):
 #
     return mappings, read_names
 
-def GetThresholdsFromReadLenDist(mappings, num_read_len_groups):
+def GetThresholdsFromReadLenDist(read_len, num_read_len_groups):
     # Get read length distribution
-    read_len_dist = mappings[['q_id','q_len']].drop_duplicates()
-    read_len_dist = read_len_dist['q_len'].sort_values().values
+    read_len_dist = read_len['q_len'].sort_values().values
 
-    return read_len_dist[[len(read_len_dist)//num_read_len_groups*i for i in range(1,num_read_len_groups)]]
+    return np.unique(read_len_dist[[len(read_len_dist)//num_read_len_groups*i for i in range(1,num_read_len_groups)]])
 
 def GetBinnedCoverage(mappings, length_thresholds):
     # Count coverage for bins of threshold length
@@ -420,7 +419,9 @@ def ReadMappings(mapping_file, contig_ids, min_mapq, min_mapping_length, keep_al
     mappings, read_names = ReplaceReadNamesWithID(mappings)
 
     # Extract coverage
-    length_thresholds = GetThresholdsFromReadLenDist(mappings, num_read_len_groups)
+    read_len = mappings[['q_id','q_len']].drop_duplicates()
+    read_len.rename(columns={'q_id':'read_id'}, inplace=True)
+    length_thresholds = GetThresholdsFromReadLenDist(read_len, num_read_len_groups)
     cov_counts = GetBinnedCoverage(mappings, length_thresholds)
     cov_probs = GetCoverageProbabilities(cov_counts, pdf)
     cov_counts.rename(columns={'count':'count_all'}, inplace=True)
@@ -443,7 +444,7 @@ def ReadMappings(mapping_file, contig_ids, min_mapq, min_mapping_length, keep_al
 
     mappings.reset_index(drop=True, inplace=True)
 
-    return mappings, cov_counts, cov_probs, read_names
+    return mappings, cov_counts, cov_probs, read_names, read_len
 
 def RemoveUnmappedContigs(contigs, mappings, remove_zero_hit_contigs):
     # Schedule contigs for removal that don't have any high quality reads mapping to it
@@ -1147,12 +1148,17 @@ def GetBreakAndRemovalInfo(result_info, contigs, contig_parts):
     
     return result_info
 
-def UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length, max_dist_contig_end, min_extension):
+def GetContigPartFromTargetID(mappings, contig_parts, min_mapping_length):
     # Duplicate mappings for every contig part (using inner, because some contigs have been removed (e.g. being too short)) 
     mappings = mappings.merge(contig_parts.reset_index()[['contig', 'index', 'part', 'start', 'end']].rename(columns={'contig':'t_id', 'index':'conpart', 'start':'part_start', 'end':'part_end'}), on=['t_id'], how='inner')
 #
     # Remove mappings that do not touch a contig part or only less than min_mapping_length bases
     mappings = mappings[(mappings['t_start']+min_mapping_length < mappings['part_end']) & (mappings['t_end']-min_mapping_length > mappings['part_start'])].copy()
+#
+    return mappings
+
+def UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length, max_dist_contig_end, min_extension):
+    mappings = GetContigPartFromTargetID(mappings, contig_parts, min_mapping_length)
 #
     # Update mapping information with limits from contig part
     mappings['con_from'] = np.maximum(mappings['t_start'], mappings['part_start'])  # We cannot work with 0 < mappings['num_part'], because of reads that start before mappings['con_start'] but do not cross the break region and therefore don't have a mapping before
@@ -1173,6 +1179,7 @@ def UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length, max_
     mappings.loc[(mappings['con_to'] < mappings['t_end']) & (mappings['strand'] == '-'), 'read_from'] = np.round(multi_maps['q_start'] + (multi_maps['q_end']-multi_maps['q_start'])/(multi_maps['t_end']-multi_maps['t_start'])*(multi_maps['t_end']-multi_maps['con_to'])).astype(int)
 #
     mappings['matches'] = np.round(mappings['matches']/(mappings['t_end']-mappings['t_start'])*(mappings['con_to']-mappings['con_from'])).astype(int) # Rough estimate use with care!
+    mappings['alignment_length'] = np.round(mappings['alignment_length']/(mappings['t_end']-mappings['t_start'])*(mappings['con_to']-mappings['con_from'])).astype(int)
     mappings.sort_values(['q_id','read_start','read_from','read_to'], inplace=True)
     mappings.reset_index(inplace=True, drop=True)
 #
@@ -1231,7 +1238,7 @@ def UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length, max_
 #
     # Select the columns we still need
     mappings.rename(columns={'q_id':'read_id'}, inplace=True)
-    mappings = mappings.loc[remove == False, ['read_id', 'read_start', 'read_end', 'read_from', 'read_to', 'strand', 'conpart', 'con_from', 'con_to', 'left_con', 'left_con_side', 'left_con_dist', 'right_con', 'right_con_side', 'right_con_dist', 'mapq', 'matches']]
+    mappings = mappings.loc[remove == False, ['read_id', 'read_start', 'read_end', 'read_from', 'read_to', 'strand', 'conpart', 'con_from', 'con_to', 'left_con', 'left_con_side', 'left_con_dist', 'right_con', 'right_con_side', 'right_con_dist', 'mapq', 'matches','alignment_length']]
 #
     # Count how many mappings each read has
     mappings['num_mappings'] = 1
@@ -1239,6 +1246,107 @@ def UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length, max_
     mappings['num_mappings'] = np.repeat(num_mappings, num_mappings)
 
     return mappings
+
+def AssignContigBins(contig_parts, used_parts, min_mapping_length):
+    # Break contig_parts into coverage chunks of min_mapping_length
+    polishing_bins = used_parts.copy()
+    polishing_bins.sort_values('conpart', inplace=True)
+    polishing_bins.reset_index(drop=True, inplace=True)
+    polishing_bins[['start','end']] = contig_parts.loc[ polishing_bins['conpart'].values, ['start','end']].values
+    polishing_bins = polishing_bins.loc[np.repeat(polishing_bins.index.values, (polishing_bins['end']-polishing_bins['start']).values//min_mapping_length)].reset_index()
+    polishing_bins['start'] += (polishing_bins['end']-polishing_bins['start']).values%min_mapping_length//2 + polishing_bins.groupby(['index']).cumcount() * min_mapping_length
+    polishing_bins.drop(columns=['index','end'], inplace=True)
+    polishing_bins['bin'] = np.arange(len(polishing_bins))
+#
+    return polishing_bins
+
+def AssignReadsToContigBins(reads, polishing_bins, min_mapping_length):
+    pol_cov = reads[['q_id','conpart','con_start','con_end']].copy()
+    pol_cov = pol_cov.merge(polishing_bins.groupby(['conpart'])[['start']].min().reset_index(), on='conpart', how='inner')
+    pol_cov['start'] += ((pol_cov['con_start'] - pol_cov['start'] - 1)//min_mapping_length + 1) * min_mapping_length
+    pol_cov = pol_cov.loc[np.repeat(pol_cov.index.values, np.maximum(0,pol_cov['con_end']-pol_cov['start']).values//min_mapping_length), ['q_id','conpart','start']].reset_index()
+    pol_cov['start'] += pol_cov.groupby('index').cumcount() * min_mapping_length
+    pol_cov['bin'] = pol_cov[['conpart','start']].merge(polishing_bins, on=['conpart','start'], how='left')['bin'].fillna(-1).astype(int).values
+    pol_cov = pol_cov[pol_cov['bin'] >= 0].drop(columns=['index','conpart','start'])
+#
+    return pol_cov
+
+def RemoveReadsByRankUntilPolishingCoverageIsReached(reads, pol_cov, rank, fid, funit, polishing_coverage):
+    if len(pol_cov):
+        rem_reads = pol_cov.groupby(fid)['cov'].min().reset_index()
+        rem_reads = rem_reads[rem_reads['cov'] > polishing_coverage].copy()
+    else:
+        rem_reads = []
+    if len(rem_reads):
+        # Select the reads that rank worst until polishing_coverage is reached
+        rem_reads = rem_reads[[fid]].merge(rank, on=fid, how='left')
+        pol_cov = pol_cov.merge(rem_reads, on=fid, how='inner')
+        num_bins = pol_cov.groupby(fid).size().reset_index(name='nbins')
+        pol_cov.sort_values([funit,'rank'], ascending=[True,False], inplace=True)
+        pol_cov['cov'] -= polishing_coverage
+        while len(pol_cov):
+            selection = pol_cov.loc[ pol_cov.groupby(funit, sort=False).cumcount() < pol_cov['cov'], [fid] ].groupby(fid).size().reset_index(name='nsel')
+            selection['nbins'] = selection[[fid]].merge(num_bins, on=fid, how='left')['nbins'].values
+            selection = selection.loc[selection['nsel'] == selection['nbins'], fid].values
+            # Remove selection
+            reads = reads[ np.isin(reads[fid], selection) == False ].copy()
+            pol_cov['cov'] -= pol_cov[[funit]].merge( pol_cov.loc[ np.isin(pol_cov[fid], selection), [funit] ].groupby(funit).size().reset_index(name='rcov'), on=funit, how='left')['rcov'].fillna(0).astype(int).values
+            rem_reads = pol_cov.groupby(fid)['cov'].min().reset_index()
+            pol_cov = pol_cov[np.isin(pol_cov[fid], rem_reads.loc[rem_reads['cov'] > 0, fid].values) & (np.isin(pol_cov[fid], selection) == False)].copy()
+#
+    return reads, pol_cov
+
+def SelectSingleContigReadsForPolishing(single_contig_reads, contig_parts, repeats, min_mapping_length, polishing_coverage):
+    if len(single_contig_reads):
+        # Update single_contig_reads to contig_parts
+        single_contig_reads = GetContigPartFromTargetID(single_contig_reads, contig_parts, min_mapping_length)
+        single_contig_reads.drop(columns=['t_id','t_len','part','part_start','part_end'], inplace=True)
+        single_contig_reads.rename(columns={'t_start':'con_start','t_end':'con_end'}, inplace=True)
+    if len(single_contig_reads):
+        # Rank single_contig_reads by mapping quality, uniqueness (proportion not in repeat), length and matches to filter on them later
+        rank = single_contig_reads[['q_id','mapq','conpart','con_start','con_end','matches']].copy()
+        rank['len'] = rank['con_end'] - rank['con_start']
+        uniqueness = rank[['q_id','conpart','con_start','con_end']].copy()
+        rank.drop(columns=['conpart','con_start','con_end'], inplace=True)
+        if len(repeats) == 0:
+            rank['uniqueness'] = 1.0
+        else:
+            reps = repeats[['t_id','t_start','t_end']].copy()
+            reps = GetContigPartFromTargetID(reps, contig_parts, 1)
+            reps['con_from'] = np.maximum(reps['t_start'], reps['part_start'])
+            reps['con_to'] = np.minimum(reps['t_end'], reps['part_end'])
+            reps = reps[['conpart','con_from','con_to']].rename(columns={'con_from':'rep_from','con_to':'rep_to'})
+            reps.sort_values(['conpart','rep_from','rep_to'], inplace=True)
+            while True:
+                old_len = len(reps)
+                reps = reps[(reps['conpart'] != reps['conpart'].shift(1)) | (reps['rep_to'] > reps['rep_to'].shift(1))].copy() # Remove reps that are fully included in another repeat
+                if len(reps) == old_len:
+                    break
+            uniqueness = uniqueness.merge(reps, on='conpart', how='inner')
+            uniqueness = uniqueness[ (uniqueness['con_start']  < uniqueness['rep_to']) & (uniqueness['con_end'] > uniqueness['rep_from']) ].copy()
+            if len(uniqueness) == 0:
+                rank['uniqueness'] = 1.0
+            else:
+                uniqueness['rep_from'] = np.maximum(uniqueness['rep_from'], uniqueness['con_start'])
+                uniqueness['rep_to'] = np.minimum(uniqueness['rep_to'], uniqueness['con_end'])
+                uniqueness['uniqueness'] = 1 - (uniqueness['rep_to'] - uniqueness['rep_from'])/(uniqueness['con_end'] - uniqueness['con_start'])
+                uniqueness = uniqueness.groupby('q_id')['uniqueness'].min().reset_index()
+                rank['uniqueness'] = rank[['q_id']].merge(uniqueness, on='q_id', how='left')['uniqueness'].fillna(1.0).values
+        rank.sort_values(['mapq','uniqueness','len','matches'], ascending=[False,False,False,False], inplace=True)
+        rank['rank'] = np.arange(len(rank))+1
+        rank = rank[['q_id','rank']].copy()
+        polishing_bins = AssignContigBins(contig_parts, single_contig_reads[['conpart']].drop_duplicates(), min_mapping_length)
+        # Get coverage
+        pol_cov = AssignReadsToContigBins(single_contig_reads, polishing_bins, min_mapping_length)
+        polishing_bins['cov'] = polishing_bins[['bin']].merge(pol_cov.groupby(['bin']).size().reset_index(name='cov'), on='bin', how='left')['cov'].fillna(0).astype(int)
+        # Find reads that are only part of bins that can be reduced (above polishing_coverage)
+        pol_cov['cov'] = pol_cov[['bin']].merge(polishing_bins[['bin','cov']], on='bin', how='left')['cov'].values
+        single_contig_reads, pol_cov = RemoveReadsByRankUntilPolishingCoverageIsReached(single_contig_reads, pol_cov, rank, 'q_id', 'bin', polishing_coverage)
+    if len(single_contig_reads):
+        # Store rank for later reduction once we add the reads connecting contigs
+        single_contig_reads['rank'] = single_contig_reads[['q_id']].merge(rank, on='q_id', how='left')['rank'].values
+#
+    return single_contig_reads
 
 def FindDuplicatedContigPartEnds(repeats, contig_parts, max_dist_contig_end, proportion_duplicated):
     repeat_ends = repeats.copy()
@@ -7681,6 +7789,7 @@ def TrimDuplicatedEnds(contig_parts, scaffold_paths, mappings, repeats, trim_rep
             if np.sum(trim['side'] == 'r'):
                 contig_parts.loc[trim.loc[trim['side'] == 'r', 'q_con'].values, 'end'] = trim.loc[trim['side'] == 'r', 'q_start'].values
 #
+    if len(repeats):
         # Trim unconnected contigs that are duplicated on both sides by the same contig (likely alternative haplotypes)
         ctrim = scaffold_paths.groupby(['scaf'])['pos'].max().reset_index(name='len')
         ctrim = ctrim[ctrim['len'] == 0].drop(columns='len')
@@ -7692,17 +7801,23 @@ def TrimDuplicatedEnds(contig_parts, scaffold_paths, mappings, repeats, trim_rep
             ctrim = ctrim[ctrim['q_con'] != ctrim['t_con']].copy()
         if len(ctrim):
             # Remove overlapping duplications (we do not want to remove the contigs that passed the thresholds for not fully duplicated)
-            ctrim = ctrim[ np.where(ctrim['strand'] == '+', ctrim['ltend'] < ctrim['rtstart'], ctrim['rtend'] < ctrim['ltstart']) ].copy()
+            ctrim = ctrim[ np.where(ctrim['strand'] == '+', ctrim['ltend'] < ctrim['rtstart'], ctrim['rtend'] < ctrim['ltstart']) & (ctrim['new_start'] < ctrim['new_end']) ].copy()
         if len(ctrim):
             # Collect the trimming caused by different targets
             ctrim = ctrim.groupby(['scaf','q_con']).agg({'new_start':'min','new_end':'max'}).reset_index()
             if len(ctrim):
                 contig_parts.loc[ctrim['q_con'].values, ['start','end']] = ctrim[['new_start','new_end']].values
 #
-        # Remove contig_parts that became shorter than min_mapping_length+alignment_precision completely
-        scaffold_paths, removed_length = RemoveScaffoldsFromAssembly(scaffold_paths, contig_parts, scaffold_paths.loc[np.isin(scaffold_paths['con0'], contig_parts[contig_parts['end'] - contig_parts['start'] < min_mapping_length+alignment_precision].index.values), 'scaf'].values)
-        # Remove mappings for trimmed contigs, so that they will not be extended (must happen after RemoveUnconnectedLowlyMappedOrDuplicatedContigs or we will remove all of them)
-        mappings = mappings[np.isin(mappings['conpart'], np.concatenate([ctrim['q_con'].values, trim['q_con'].values])) == False].copy()
+    # Remove contig_parts that became shorter than min_mapping_length+alignment_precision completely
+    scaffold_paths, removed_length = RemoveScaffoldsFromAssembly(scaffold_paths, contig_parts, scaffold_paths.loc[np.isin(scaffold_paths['con0'], contig_parts[contig_parts['end']-contig_parts['start'] < min_mapping_length+alignment_precision].index.values), 'scaf'].values)
+    # Remove mappings for trimmed contigs, so that they will not be extended (must happen after RemoveUnconnectedLowlyMappedOrDuplicatedContigs or we will remove all of them)
+    if len(trim_repeats):
+        if len(repeats):
+            mappings = mappings[np.isin(mappings['conpart'], np.concatenate([ctrim['q_con'].values, trim['q_con'].values])) == False].copy()
+        else:
+            mappings = mappings[np.isin(mappings['conpart'], trim['q_con'].values) == False].copy()
+    elif len(repeats):
+        mappings = mappings[np.isin(mappings['conpart'], ctrim['q_con'].values) == False].copy()
 #
     return contig_parts, scaffold_paths, mappings
 
@@ -8232,6 +8347,173 @@ def CountResealedBreaks(result_info, scaffold_paths, contig_parts, ploidy):
 
     return result_info
 
+def AssingTemporaryConpartByScaffoldPosition(scaffolding_reads, contig_positions):
+    scaffolding_reads.rename(columns={'conpart':'truepart','hap':'jokerhap'}, inplace=True)
+    scaffolding_reads['hap'] = np.where(scaffolding_reads['jokerhap'] == -1, 0, scaffolding_reads['jokerhap'])
+    scaffolding_reads['conpart'] = scaffolding_reads[['scaf','pos','hap']].merge(contig_positions[['scaf','pos','hap','conpart']], on=['scaf','pos','hap'], how='left')['conpart'].values
+    scaffolding_reads.drop(columns=['hap'], inplace=True)
+    scaffolding_reads.rename(columns={'jokerhap':'hap'}, inplace=True)
+#
+    return scaffolding_reads
+
+def SelectReadsForPolishing(mappings, scaffold_paths, single_contig_reads, contig_parts, read_len, min_mapping_length, polishing_coverage, ploidy):
+    # Rank mapping qualities in each conpart by 1 - proportion of mappings having a higher mapping quality
+    mapq_ranks = mappings[['conpart','mapq','read_id','read_start','read_pos']].drop_duplicates().groupby(['conpart','mapq']).size().reset_index(name='count')
+    mapq_ranks.sort_values(['conpart','mapq'], ascending=[True,False], inplace=True)
+    mapq_ranks['mrank'] = 1 - (mapq_ranks.groupby(['conpart'], sort=False)['count'].cumsum() - mapq_ranks['count']) / mapq_ranks[['conpart']].merge( mapq_ranks.groupby(['conpart'])['count'].sum().reset_index(name='csum'), on='conpart', how='left')['csum'].values
+    mapq_ranks.drop(columns='count', inplace=True)
+    scaffolding_reads = mappings[['read_id','read_start','read_pos','read_from','read_to','strand','con_strand','conpart','con_from','con_to','rcon','mapq','matches','alignment_length','scaf','pos','rpos','rhap','mapid','rdist']].copy()
+    # Assign scaffolding_reads to haplotype (reads that do not cross a scaffold with multiple haplotypes are a joker; reads that have multiple haplotypes are removed)
+    read_haps = scaffolding_reads.loc[((scaffolding_reads['rcon'] >= 0) & (scaffolding_reads['rpos'] >= 0)) | (scaffolding_reads['rhap'] > 0), ['mapid','scaf','rpos','rhap','pos']].rename(columns={'rpos':'pos','rhap':'hap','pos':'epos'})
+    if np.sum(read_haps['pos'] == -1):
+        read_haps.loc[read_haps['pos'] == -1, 'pos'] = read_haps.loc[read_haps['pos'] == -1, 'epos']
+    read_haps = pd.concat([ read_haps.merge( scaffold_paths.loc[(scaffold_paths[[f'phase{h}' for h in range(1,ploidy)]] > 0).any(axis=1), ['scaf','pos']], on=['scaf','pos'], how='inner'),
+                            read_haps.merge( scaffold_paths.loc[((scaffold_paths[[f'phase{h}' for h in range(1,ploidy)]].values > 0) & ((scaffold_paths[[f'con{h}' for h in range(1,ploidy)]].values != scaffold_paths[['con0' for h in range(1,ploidy)]].values) | (scaffold_paths[[f'strand{h}' for h in range(1,ploidy)]].values != scaffold_paths[['strand0' for h in range(1,ploidy)]].values))), ['scaf','pos']].rename(columns={'pos':'epos'}), on=['scaf','epos'], how='inner')], ignore_index=True).drop_duplicates()
+    read_haps = read_haps[['mapid','hap']].drop_duplicates()
+    read_haps['nalts'] = read_haps[['mapid']].merge(read_haps.groupby(['mapid']).size().reset_index(name='nalts'), on='mapid', how='left')['nalts'].values
+    read_haps = read_haps.groupby(['mapid','nalts']).max().reset_index() # If we have multiple haplotypes we remove them anyways, so just choose max arbitrarily to remove duplicates
+    scaffolding_reads[['hap','nalts']] = scaffolding_reads[['mapid']].merge(read_haps, on='mapid', how='left')[['hap','nalts']].values
+    scaffolding_reads = scaffolding_reads[(scaffolding_reads['nalts'] > 1) == False].drop(columns='nalts') # Keeping the nans is important here
+    scaffolding_reads['hap'] = scaffolding_reads['hap'].fillna(-1).astype(int).values # Set jokers to -1
+    scaffolding_reads.drop(columns=['rhap'], inplace=True)
+    # Find the split reads that start or end exactly at contig breaks, which means their read_from and read_to were estimated during the contig breakup
+    splits = contig_parts.loc[np.repeat(contig_parts.index.values, (contig_parts['org_dist_left'] == 0).astype(int) + (contig_parts['org_dist_right'] == 0)), ['start','end']].reset_index()
+    if len(splits):
+        splits.rename(columns={'index':'conpart'}, inplace=True)
+        splits['split_pos'] = np.where(splits['conpart'] == splits['conpart'].shift(1)+1, splits['start'], splits['end'])
+        splits['scon'] = splits['conpart'] + np.where(splits['split_pos'] == splits['start'], -1, 1)
+        splits.drop(columns=['start','end'], inplace=True)
+        splits = scaffolding_reads[['mapid','conpart','con_from','con_to']].merge(splits, on='conpart', how='inner')
+        splits = splits[(splits['con_from'] == splits['split_pos']) | (splits['con_to'] == splits['split_pos'])].drop(columns=['conpart','con_from','con_to','split_pos'])
+    if len(splits):
+        splits.rename(columns={'scon':'conpart'}, inplace=True)
+        splits = np.unique(splits.loc[splits.merge(scaffolding_reads[['mapid','conpart']].drop_duplicates(), on=['mapid','conpart'], how='left', indicator=True)['_merge'].values == "left_only", 'mapid'].values)
+    # Rank the mapids by split, joker, mapping quality ranks, number of scaffolds, summed length, summed matches
+    scaffolding_reads['mrank'] = scaffolding_reads[['conpart','mapq']].merge(mapq_ranks, on=['conpart','mapq'], how='left')['mrank'].values
+    scaffolding_reads['conlen'] = scaffolding_reads['con_to']-scaffolding_reads['con_from']
+    mapids = scaffolding_reads.groupby(['mapid','hap']).agg({'mrank':'min','read_id':'size','conlen':'sum','matches':'sum'}).reset_index().rename(columns={'read_id':'ncons'})
+    single_mappings = mapids.loc[mapids['ncons'] == 1, 'mapid'].values
+    if len(splits):
+        mapids['split'] = np.isin(mapids['mapid'], splits)
+    else:
+        mapids['split'] = False
+    mapids['hap'] = mapids['hap'] == -1
+    mapids.rename(columns={'hap':'joker'}, inplace=True)
+    mapids.sort_values(['split','joker','mrank','ncons','conlen','matches'], ascending=[True,True,False,False,False,False], inplace=True)
+    mapids['rank'] = np.arange(len(mapids)) + 1
+    mapids = mapids[['mapid','rank']].copy()
+    scaffolding_reads.drop(columns=['mrank','conlen'], inplace=True)
+    # Store single_mappings for later
+    single_mappings = scaffolding_reads[np.isin(scaffolding_reads['mapid'], single_mappings)].copy()
+    scaffolding_reads.drop(single_mappings.index.values, inplace=True)
+    # Find the gaps that the mapids close (including circular ones) and reduce them to polishing_coverage
+    if len(scaffolding_reads):
+        # Identify gaps
+        scaffolding_reads.loc[scaffolding_reads['rcon'] == -1, 'rpos'] = -1
+        gap_cov = scaffolding_reads.loc[scaffolding_reads['rpos'] >= 0, ['scaf','pos','rpos','hap','mapid']].copy()
+        gaps = gap_cov.groupby(['scaf','pos','rpos','hap']).size().reset_index(name='cov')
+        # Assign joker to all matching haplotypes
+        gap_cov = gaps.loc[gaps['hap'] >= 0, ['scaf','pos','rpos','hap']].rename(columns={'hap':'nhap'}).merge(gap_cov, on=['scaf','pos','rpos'], how='right')
+        gap_cov = gap_cov[(gap_cov['nhap'] == gap_cov['hap']) | (-1 == gap_cov['hap'])].copy()
+        gap_cov.loc[gap_cov['nhap'].isnull() == False, 'hap'] = gap_cov.loc[gap_cov['nhap'].isnull() == False, 'nhap'].astype(int)
+        gap_cov.drop(columns='nhap', inplace=True)
+        gaps = gap_cov.groupby(['scaf','pos','rpos','hap']).size().reset_index(name='cov')
+        # Reduce reads to polishing_coverage
+        gaps['gap'] = np.arange(len(gaps))
+        gap_cov[['gap','cov']] = gap_cov[['scaf','pos','rpos','hap']].merge(gaps, on=['scaf','pos','rpos','hap'], how='left')[['gap','cov']].values
+        gap_cov = gap_cov[['mapid','gap','cov']].copy()
+        gap_cov['cov'] -= polishing_coverage
+        scaffolding_reads, gap_cov = RemoveReadsByRankUntilPolishingCoverageIsReached(scaffolding_reads, gap_cov, mapids, 'mapid', 'gap', polishing_coverage)
+        scaffolding_reads.drop(columns=['rcon'], inplace=True)
+#
+    # Remove single_contig_reads for removed contig_parts
+    single_contig_reads = single_contig_reads[np.isin(single_contig_reads['conpart'], np.unique(scaffold_paths[[col for col in scaffold_paths.columns if col[:3] == "con"]].values))].copy()
+    # Get coverage of scaffolding_reads for haplotype resolved positions where we could fill up with single_contig_reads or single_mappings
+    contig_positions = []
+    for h in range(ploidy):
+        contig_positions.append( scaffold_paths.loc[scaffold_paths[f'con{h}'] >= 0, ['scaf','pos',f'con{h}']].rename(columns={f'con{h}':'conpart'}) )
+        contig_positions[-1]['hap'] = h
+        if h==0:
+            contig_positions[-1]['keep'] = False # This is the main, so we do not need extra handling to keep it
+        else:
+            contig_positions[-1]['keep'] = ( (scaffold_paths.loc[scaffold_paths[f'con{h}'] >= 0, f'con{h}'] != scaffold_paths.loc[scaffold_paths[f'con{h}'] >= 0, 'con0']) |
+                                             (scaffold_paths.loc[scaffold_paths[f'con{h}'] >= 0, f'strand{h}'] != scaffold_paths.loc[scaffold_paths[f'con{h}'] >= 0, 'strand0']) )
+            contig_positions.append( scaffold_paths.loc[(scaffold_paths[f'phase{h}'] < 0) & (scaffold_paths['con0'] >= 0), ['scaf','pos','con0']].rename(columns={'con0':'conpart'}) )
+            contig_positions[-1]['hap'] = h
+            contig_positions[-1]['keep'] = False # It is identical to main and we only want to take the minimum coverage over the haplotypes in the end and not keep both versions
+    contig_positions = pd.concat(contig_positions, ignore_index=True)
+    contig_positions.rename(columns={'conpart':'truepart'}, inplace=True)
+    contig_positions.sort_values(['scaf','pos','hap'], inplace=True)
+    contig_positions['conpart'] = (contig_positions['hap'] == 0).cumsum() - 1 # We temporarily need to overwrite conpart to use AssignReadsToContigBins properly in this case
+    contig_positions.loc[contig_positions['keep'], 'conpart'] = contig_positions['conpart'].max() + 1 + np.arange(np.sum(contig_positions['keep']))
+    polishing_bins = AssignContigBins(contig_parts, pd.concat([single_contig_reads[['conpart']].drop_duplicates(), single_mappings[['conpart']].drop_duplicates()], ignore_index=True).drop_duplicates(), min_mapping_length)
+    polishing_bins.rename(columns={'conpart':'truepart'}, inplace=True)
+    polishing_bins = contig_positions[['conpart','truepart']].drop_duplicates().merge(polishing_bins, on='truepart', how='right')
+    polishing_bins.sort_values(['conpart','start'], inplace=True)
+    polishing_bins['bin'] = np.arange(len(polishing_bins))
+    scaffolding_reads = AssingTemporaryConpartByScaffoldPosition(scaffolding_reads, contig_positions)
+    for h in range(-1, ploidy):
+        pol_cov = AssignReadsToContigBins(scaffolding_reads.loc[scaffolding_reads['hap'] == h, ['mapid','conpart','con_from','con_to']].rename(columns={'mapid':'q_id','con_from':'con_start','con_to':'con_end'}), polishing_bins, min_mapping_length)
+        polishing_bins[f'cov{h}'] = polishing_bins[['bin']].merge(pol_cov.groupby(['bin']).size().reset_index(name='cov'), on='bin', how='left')['cov'].fillna(0).astype(int).values
+    # Take the minimum coverage of alternative haplotypes or the maximum if only one of them exists
+    polishing_bins.rename(columns={'cov-1':'scov'}, inplace=True)
+    polishing_bins['nhaps'] = polishing_bins[['conpart']].merge(contig_positions.groupby(['conpart']).size().reset_index(name='nhaps'), on='conpart', how='left')['nhaps'].values
+    polishing_bins['scov'] += np.where(polishing_bins['nhaps'] == 1, polishing_bins[[f'cov{h}' for h in range(ploidy)]].max(axis=1), polishing_bins[[f'cov{h}' for h in range(ploidy)]].min(axis=1))
+    polishing_bins.drop(columns=['nhaps']+[f'cov{h}' for h in range(ploidy)], inplace=True)
+    # Remove single_contig_reads if they are not needed anymore due to scaffolding_reads (Duplicate reads with different ids so we only keep the mappings to the scaffolds we need them for)
+    single_contig_reads.rename(columns={'conpart':'truepart','q_id':'trueid'}, inplace=True)
+    single_contig_reads = single_contig_reads.merge(contig_positions[['truepart','conpart']].drop_duplicates(), on='truepart', how='left')
+    single_contig_reads['q_id'] = np.arange(len(single_contig_reads))
+    pol_cov = AssignReadsToContigBins(single_contig_reads, polishing_bins, min_mapping_length)
+    polishing_bins['cov'] = polishing_bins['scov'] + polishing_bins[['bin']].merge(pol_cov.groupby(['bin']).size().reset_index(name='cov'), on='bin', how='left')['cov'].fillna(0).astype(int)
+    rank = single_contig_reads[['q_id','rank']].copy()
+    single_contig_reads.drop(columns=['rank'], inplace=True)
+    pol_cov['cov'] = pol_cov[['bin']].merge(polishing_bins[['bin','cov']], on='bin', how='left')['cov'].values
+    single_contig_reads, pol_cov = RemoveReadsByRankUntilPolishingCoverageIsReached(single_contig_reads, pol_cov, rank, 'q_id', 'bin', polishing_coverage)
+    # Check if we have to add single_mappings somewhere to fill up to polishing_coverage
+    pol_cov = AssignReadsToContigBins(single_contig_reads, polishing_bins, min_mapping_length)
+    polishing_bins['ccov'] = polishing_bins[['bin']].merge(pol_cov.groupby(['bin']).size().reset_index(name='cov'), on='bin', how='left')['cov'].fillna(0).astype(int)
+    single_mappings = AssingTemporaryConpartByScaffoldPosition(single_mappings, contig_positions)
+    pol_cov = AssignReadsToContigBins(single_mappings[['mapid','conpart','con_from','con_to']].rename(columns={'mapid':'q_id','con_from':'con_start','con_to':'con_end'}), polishing_bins, min_mapping_length)
+    pol_cov.rename(columns={'q_id':'mapid'}, inplace=True)
+    polishing_bins['cov'] = polishing_bins[['bin']].merge(pol_cov.groupby(['bin']).size().reset_index(name='cov'), on='bin', how='left')['cov'].fillna(0).astype(int) + polishing_bins['scov'] + polishing_bins['ccov']
+    pol_cov['cov'] = pol_cov[['bin']].merge(polishing_bins[['bin','cov']], on='bin', how='left')['cov'].values
+    single_mappings, pol_cov = RemoveReadsByRankUntilPolishingCoverageIsReached(single_mappings, pol_cov, mapids, 'mapid', 'bin', polishing_coverage)
+#
+    # Combine scaffolding_reads, single_contig_reads and single_mappings into polishing_reads
+    scaffolding_reads[['matches','alignment_length','mapq']] = scaffolding_reads[['mapid']].merge(scaffolding_reads.groupby(['mapid'])[['matches','alignment_length','mapq']].agg({'matches':'sum','alignment_length':'sum','mapq':'max'}).reset_index(), on='mapid', how='left')[['matches','alignment_length','mapq']].values
+    scaffolding_reads = scaffolding_reads[(scaffolding_reads['mapid'] != scaffolding_reads['mapid'].shift(1)) | (scaffolding_reads['mapid'] != scaffolding_reads['mapid'].shift(-1))].rename(columns={'pos':'pos_start'})
+    scaffolding_reads['pos_end'] = scaffolding_reads['pos_start'].shift(-1, fill_value=-1)
+    scaffolding_reads['con_start'] = np.where(scaffolding_reads['con_strand'] == '+', scaffolding_reads['con_from'], scaffolding_reads['con_to'])
+    scaffolding_reads['con_end'] = np.where(scaffolding_reads['con_strand'] == '+', scaffolding_reads['con_to'], scaffolding_reads['con_from'])
+    scaffolding_reads['con_start'] = np.where(scaffolding_reads['pos_start'] > scaffolding_reads['pos_end'], scaffolding_reads['con_start'].shift(-1, fill_value=0), scaffolding_reads['con_start'])
+    scaffolding_reads['con_end'] = np.where(scaffolding_reads['pos_start'] > scaffolding_reads['pos_end'], scaffolding_reads['con_end'], scaffolding_reads['con_end'].shift(-1, fill_value=0))
+    scaffolding_reads['q_len'] = scaffolding_reads[['read_id']].merge(read_len, on='read_id', how='left')['q_len'].values
+    scaffolding_reads = scaffolding_reads.loc[scaffolding_reads['mapid'] != scaffolding_reads['mapid'].shift(1), ['read_id','q_len','read_from','read_to','strand','scaf','pos_start','pos_end','hap','con_start','con_end','matches','alignment_length','mapq']].rename(columns={'read_from':'q_start','read_to':'q_end'})
+    scaffolding_reads.loc[scaffolding_reads['pos_start'] > scaffolding_reads['pos_end'], ['pos_start','pos_end']] = scaffolding_reads.loc[scaffolding_reads['pos_start'] > scaffolding_reads['pos_end'], ['pos_end','pos_start']].values
+    single_contig_reads = single_contig_reads[['trueid','q_len','q_start','q_end','strand','conpart','con_start','con_end','matches','alignment_length','mapq']].rename(columns={'trueid':'read_id'})
+    contig_positions = contig_positions[['conpart','scaf','pos','hap']].copy()
+    contig_positions[['con_strand']+[f'strand{h}' for h in range(1,ploidy)]] = contig_positions[['scaf','pos']].merge(scaffold_paths[['scaf','pos']+[f'strand{h}' for h in range(ploidy)]], on=['scaf','pos'], how='left')[[f'strand{h}' for h in range(ploidy)]].values
+    for h in range(1,ploidy):
+        contig_positions.loc[(contig_positions['hap'] == h) & (contig_positions[f'strand{h}'] != ''), 'con_strand'] = contig_positions.loc[(contig_positions['hap'] == h) & (contig_positions[f'strand{h}'] != ''), f'strand{h}']
+    contig_positions.drop(columns=[f'strand{h}' for h in range(1,ploidy)], inplace=True)
+    nhaps = contig_positions.groupby('conpart').size().reset_index(name='nhaps')
+    contig_positions.loc[np.isin(contig_positions['conpart'], nhaps.loc[nhaps['nhaps'] == ploidy, 'conpart'].values), 'hap'] = -1 # Set joker
+    contig_positions.drop_duplicates(inplace=True)
+    single_contig_reads[['scaf','pos_start','hap']] = single_contig_reads[['conpart']].merge(contig_positions, on='conpart', how='left')[['scaf','pos','hap']].values
+    flip = single_contig_reads[['conpart']].merge(contig_positions[['conpart','con_strand']], on='conpart', how='left')['con_strand'].values == '-'
+    single_contig_reads.loc[flip, ['con_start','con_end']] = single_contig_reads.loc[flip, ['con_end','con_start']].values
+    single_contig_reads[['con_start','con_end']] = single_contig_reads[['con_start','con_end']].astype(int)
+    single_contig_reads.drop(columns='conpart', inplace=True)
+    single_contig_reads['pos_end'] = single_contig_reads['pos_start']
+    single_mappings.loc[single_mappings['con_strand'] == '-', ['con_from','con_to']] = single_mappings.loc[single_mappings['con_strand'] == '-', ['con_to','con_from']].values
+    single_mappings = single_mappings[['read_id','read_from','read_to','strand','scaf','pos','hap','con_from','con_to','matches','alignment_length','mapq']].rename(columns={'read_from':'q_start','read_to':'q_end','con_from':'con_start','con_to':'con_end','pos':'pos_start'})
+    single_mappings['pos_end'] = single_mappings['pos_start']
+    single_mappings['q_len'] = single_mappings[['read_id']].merge(read_len, on='read_id', how='left')['q_len'].values
+    polishing_reads = pd.concat([scaffolding_reads, single_contig_reads, single_mappings], ignore_index=True)
+    
+    return polishing_reads, single_contig_reads
+
 def FindBestReadsToFillGaps(mappings, repeats, overlap_bridges):
     possible_reads = mappings.loc[(mappings['rcon'] >= 0) & (mappings['rpos'] >= 0), ['scaf','pos','rhap','rpos','read_pos','read_id','read_start','read_from','read_to','strand','rdist','mapq','rmapq','matches','rmatches','con_from','con_to','rmapid','conpart','rcon','con_strand']].sort_values(['scaf','pos','rhap'])
 #
@@ -8395,6 +8677,7 @@ def StoreReadAndContingInformationInScaffoldPaths(scaffold_paths, contig_parts, 
         scaffold_paths.loc[identical, [f'name{h}',f'start{h}',f'end{h}',f'strand{h}']] = ['',0,0,'']
         scaffold_paths.loc[identical, f'phase{h}'] = -scaffold_paths.loc[identical, f'phase{h}']
     # Update positions in scaffold to accomodate the reads and split contigs
+    scaffold_paths['old_pos'] = scaffold_paths['pos']
     scaffold_paths['pos'] = scaffold_paths.groupby(['scaf'], sort=False).cumcount()
     # Move sdist_left and sdist_right to first or last entry of a scaffold only
     tmp = scaffold_paths[['scaf','sdist_left']].groupby(['scaf']).max().values
@@ -8501,6 +8784,58 @@ def GetOutputInfo(result_info, scaffold_paths):
 
     return result_info
 
+def UpdatePositionsChangedDueToInsertedReads(polishing_reads, scaffold_paths, read_names, ploidy):
+    new_pos = []
+    for h in range(ploidy):
+        new_pos.append( scaffold_paths.loc[scaffold_paths['type'] == "contig", ['scaf','pos','old_pos',f'start{h}',f'end{h}']+([f'phase{h}','start0','end0'] if h>0 else [])].rename(columns={'old_pos':'pos_start',f'phase{h}':'phase',f'start{h}':'start',f'end{h}':'end'}) )
+        if h>0:
+            if np.sum(new_pos[-1]['phase'] < 0):
+                new_pos[-1].loc[new_pos[-1]['phase'] < 0, ['start','end']] = new_pos[-1].loc[new_pos[-1]['phase'] < 0, ['start0','end0']].values
+            new_pos[-1].drop(columns=['phase','start0','end0'], inplace=True)
+        new_pos[-1]['h'] = h
+    new_pos = pd.concat(new_pos, ignore_index=True)
+    new_pos = new_pos[new_pos['end'] > 0].copy()
+    polishing_reads['h'] = np.where(polishing_reads['hap'] < 0, 0, polishing_reads['hap'])
+    #Handle pos_start
+    polishing_reads = polishing_reads.reset_index().merge(new_pos, on=['scaf','pos_start','h'], how='left')
+    polishing_reads['dist'] = -1*np.minimum(0, np.minimum(polishing_reads['con_start']-polishing_reads['start'],polishing_reads['end']-polishing_reads['con_start']))
+    polishing_reads.sort_values(['index','dist'], inplace=True)
+    polishing_reads = polishing_reads.groupby('index', sort=False).first().reset_index()
+    polishing_reads = polishing_reads[(polishing_reads['pos_start'] != polishing_reads['pos_end']) | (((polishing_reads['con_start'] > polishing_reads['start']) | (polishing_reads['con_end'] > polishing_reads['start'])) & ((polishing_reads['con_start'] > polishing_reads['end']) | (polishing_reads['con_end'] < polishing_reads['end'])))].drop(columns='index')
+    polishing_reads['pos_start'] = polishing_reads['pos']
+    polishing_reads['dist'] = np.maximum(0, polishing_reads['start']-polishing_reads['con_start'])
+    polishing_reads.loc[(polishing_reads['dist'] > 0) & (polishing_reads['strand'] == '+'), 'q_start'] += polishing_reads.loc[(polishing_reads['dist'] > 0) & (polishing_reads['strand'] == '+'), 'dist'].values
+    polishing_reads.loc[(polishing_reads['dist'] > 0) & (polishing_reads['strand'] == '-'), 'q_end'] -= polishing_reads.loc[(polishing_reads['dist'] > 0) & (polishing_reads['strand'] == '-'), 'dist'].values
+    polishing_reads['con_start'] += polishing_reads['dist'].values
+    polishing_reads['dist'] = np.maximum(0, polishing_reads['con_start']-polishing_reads['end'])
+    polishing_reads.loc[(polishing_reads['dist'] > 0) & (polishing_reads['strand'] == '+'), 'q_end'] -= polishing_reads.loc[(polishing_reads['dist'] > 0) & (polishing_reads['strand'] == '+'), 'dist'].values
+    polishing_reads.loc[(polishing_reads['dist'] > 0) & (polishing_reads['strand'] == '-'), 'q_start'] += polishing_reads.loc[(polishing_reads['dist'] > 0) & (polishing_reads['strand'] == '-'), 'dist'].values
+    polishing_reads['con_start'] -= polishing_reads['dist'].values
+    polishing_reads.drop(columns=['pos','start','end','dist'], inplace=True)
+    #Handle pos_end
+    new_pos.rename(columns={'pos_start':'pos_end'}, inplace=True)
+    polishing_reads = polishing_reads.reset_index().merge(new_pos, on=['scaf','pos_end','h'], how='left')
+    polishing_reads['dist'] = -1*np.minimum(0, np.minimum(polishing_reads['con_end']-polishing_reads['start'],polishing_reads['end']-polishing_reads['con_end']))
+    polishing_reads.sort_values(['index','dist'], inplace=True)
+    polishing_reads = polishing_reads.groupby('index', sort=False).first().reset_index()
+    polishing_reads['pos_end'] = polishing_reads['pos']
+    polishing_reads = polishing_reads[(polishing_reads['pos_start'] != polishing_reads['pos_end']) | (((polishing_reads['con_start'] > polishing_reads['start']) | (polishing_reads['con_end'] > polishing_reads['start'])) & ((polishing_reads['con_start'] > polishing_reads['end']) | (polishing_reads['con_end'] < polishing_reads['end'])))].drop(columns='index')
+    polishing_reads['dist'] = np.maximum(0, polishing_reads['start']-polishing_reads['con_end'])
+    polishing_reads.loc[(polishing_reads['dist'] > 0) & (polishing_reads['strand'] == '+'), 'q_start'] += polishing_reads.loc[(polishing_reads['dist'] > 0) & (polishing_reads['strand'] == '+'), 'dist'].values
+    polishing_reads.loc[(polishing_reads['dist'] > 0) & (polishing_reads['strand'] == '-'), 'q_end'] -= polishing_reads.loc[(polishing_reads['dist'] > 0) & (polishing_reads['strand'] == '-'), 'dist'].values
+    polishing_reads['con_end'] += polishing_reads['dist'].values
+    polishing_reads['dist'] = np.maximum(0, polishing_reads['con_end']-polishing_reads['end'])
+    polishing_reads.loc[(polishing_reads['dist'] > 0) & (polishing_reads['strand'] == '+'), 'q_end'] -= polishing_reads.loc[(polishing_reads['dist'] > 0) & (polishing_reads['strand'] == '+'), 'dist'].values
+    polishing_reads.loc[(polishing_reads['dist'] > 0) & (polishing_reads['strand'] == '-'), 'q_start'] += polishing_reads.loc[(polishing_reads['dist'] > 0) & (polishing_reads['strand'] == '-'), 'dist'].values
+    polishing_reads['con_end'] -= polishing_reads['dist'].values
+    polishing_reads.drop(columns=['pos','start','end','dist','h'], inplace=True)
+    # Finish
+    polishing_reads = polishing_reads[polishing_reads['q_start'] < polishing_reads['q_end']].copy()
+    polishing_reads['read_id'] = read_names.loc[ polishing_reads['read_id'].values, 'read_name' ].values # Convert read id back into the name
+    polishing_reads.rename(columns={'read_id':'q_name'}, inplace=True)
+#
+    return polishing_reads
+
 def PrintStats(result_info):
     print("Input assembly:     {:8,.0f} contigs   (Total sequence: {:,.0f} Min: {:,.0f} Max: {:,.0f} N50: {:,.0f})".format(result_info['input']['contigs']['num'], result_info['input']['contigs']['total'], result_info['input']['contigs']['min'], result_info['input']['contigs']['max'], result_info['input']['contigs']['N50']))
     print("                    {:8,.0f} scaffolds (Total sequence: {:,.0f} Min: {:,.0f} Max: {:,.0f} N50: {:,.0f})".format(result_info['input']['scaffolds']['num'], result_info['input']['scaffolds']['total'], result_info['input']['scaffolds']['min'], result_info['input']['scaffolds']['max'], result_info['input']['scaffolds']['N50']))
@@ -8549,6 +8884,8 @@ def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     ploidy = 2
     max_loop_units = 10
     lowmap_threshold = 0.05
+#
+    polishing_coverage = 20
 
     # Guarantee that outdir exists
     outdir = os.path.dirname(prefix)
@@ -8574,7 +8911,7 @@ def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     repeats = LoadRepeats(repeat_file, contig_ids)
 #
     print( str(timedelta(seconds=process_time())), "Filtering mappings")
-    mappings, cov_counts, cov_probs, read_names = ReadMappings(mapping_file, contig_ids, min_mapq, min_mapping_length, keep_all_subreads, alignment_precision, num_read_len_groups, pdf)
+    mappings, cov_counts, cov_probs, read_names, read_len = ReadMappings(mapping_file, contig_ids, min_mapq, min_mapping_length, keep_all_subreads, alignment_precision, num_read_len_groups, pdf)
     contigs, covered_regions = RemoveUnmappedContigs(contigs, mappings, remove_zero_hit_contigs)
     mappings = BreakReadsAtAdapters(mappings, alignment_precision, keep_all_subreads)
 #
@@ -8586,12 +8923,14 @@ def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
         break_groups, repeat_removal, spurious_break_indexes, non_informative_mappings, unconnected_breaks = FindBreakPoints(mappings, contigs, covered_regions, repeats, max_dist_contig_end, min_mapping_length, min_length_contig_break, max_break_point_distance, min_num_reads, min_extension, merge_block_length, org_scaffold_trust, cov_probs, prob_factor, allow_same_contig_breaks, prematurity_threshold, pdf)
     spurious_mappings = mappings.loc[np.unique(spurious_break_indexes['map_index'].values)].copy() # We still need them for InsertBridgesOnUniqueContigOverlapsWithoutConnections
     spurious_mappings = spurious_mappings[np.isin(spurious_mappings['t_id'], np.unique(repeats['q_id']))].copy()
+    single_contig_reads = mappings.loc[non_informative_mappings, ['q_id','q_len','q_start','q_end','strand','t_id','t_len','t_start','t_end','matches','alignment_length','mapq']].copy()
     mappings.drop(np.concatenate([np.unique(spurious_break_indexes['map_index'].values), non_informative_mappings]), inplace=True) # Remove not-accepted breaks from mappings and mappings that do not contain any information (mappings inside of contigs that do not overlap with breaks)
     del spurious_break_indexes, non_informative_mappings
 #
     contig_parts, contigs = GetContigParts(contigs, break_groups, repeat_removal, covered_regions, remove_short_contigs, remove_zero_hit_contigs, min_mapping_length, alignment_precision, pdf)
     result_info = GetBreakAndRemovalInfo(result_info, contigs, contig_parts)
     mappings = UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length, max_dist_contig_end, min_extension)
+    single_contig_reads = SelectSingleContigReadsForPolishing(single_contig_reads, contig_parts, repeats, min_mapping_length, polishing_coverage)
     repeats = FindDuplicatedContigPartEnds(repeats, contig_parts, max_dist_contig_end, proportion_duplicated)
     del break_groups, repeat_removal, contigs, contig_ids
 #
@@ -8611,8 +8950,12 @@ def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     print( str(timedelta(seconds=process_time())), "Fill gaps")
     mappings, scaffold_paths, overlap_bridges = MapReadsToScaffolds(mappings, scaffold_paths, overlap_bridges, bridges, ploidy) # Might break apart scaffolds again, if we cannot find a mapping read for a connection
     result_info = CountResealedBreaks(result_info, scaffold_paths, contig_parts, ploidy)
+    polishing_reads, single_contig_reads = SelectReadsForPolishing(mappings, scaffold_paths, single_contig_reads, contig_parts, read_len, min_mapping_length, polishing_coverage, ploidy)
+    del single_contig_reads
     scaffold_paths, mappings = FillGapsWithReads(scaffold_paths, mappings, contig_parts, read_names, repeats, overlap_bridges, ploidy, max_dist_contig_end, min_extension, min_num_reads, pdf) # Mappings are prepared for scaffold extensions
     result_info = GetOutputInfo(result_info, scaffold_paths)
+    polishing_reads = UpdatePositionsChangedDueToInsertedReads(polishing_reads, scaffold_paths, read_names, ploidy)
+    scaffold_paths.drop(columns=['old_pos'], inplace=True)
 #
     if pdf:
         pdf.close()
@@ -8621,6 +8964,7 @@ def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     mappings.to_csv(f"{prefix}_extensions.csv", index=False)
     scaffold_paths.to_csv(f"{prefix}_scaffold_paths.csv", index=False)
     np.savetxt(f"{prefix}_extending_reads.lst", np.unique(mappings['read_name']), fmt='%s')
+    polishing_reads.to_csv(f"{prefix}_polishing.csv", index=False)
 
     print( str(timedelta(seconds=process_time())), "Finished")
     PrintStats(result_info)
@@ -8829,7 +9173,7 @@ def ClusterExtension(extensions, mappings, min_num_reads, min_scaf_len):
 #
     return extensions, new_scaffolds
 
-def ExtendScaffolds(scaffold_paths, extensions, hap_merger, new_scaffolds, mappings, min_num_reads, max_mapping_uncertainty, min_scaf_len, ploidy):
+def ExtendScaffolds(scaffold_paths, polishing_reads, extensions, hap_merger, new_scaffolds, mappings, min_num_reads, max_mapping_uncertainty, min_scaf_len, ploidy, polishing_coverage):
     extension_info = {}
     extension_info['count'] = 0
     extension_info['new'] = 0
@@ -8936,6 +9280,61 @@ def ExtendScaffolds(scaffold_paths, extensions, hap_merger, new_scaffolds, mappi
             # Get start and end of extending read
             extending_reads['start0'] = np.where((extending_reads['strand'] == '+') == (extending_reads['side'] == 'r'), extending_reads['read_to'], extending_reads['read_from']-extending_reads['valid_ext'])
             extending_reads['end0'] = np.where((extending_reads['strand'] == '+') == (extending_reads['side'] == 'r'), extending_reads['read_to']+extending_reads['valid_ext'], extending_reads['read_from'])
+            
+            # Get polishing reads for extension
+            ext_polishing = extending_reads[['scaf','side','hap','q_index','start0','end0']].merge(extensions, on=['scaf','side','hap','q_index'], how='left')
+            ext_polishing.sort_values(['scaf','side','hap','q_agree'], ascending=[True,True,True,False], inplace=True)
+            ext_polishing = ext_polishing[ext_polishing.groupby(['scaf','side','hap']).cumcount() < polishing_coverage].copy()
+            ext_polishing['nq_start'] = np.where((ext_polishing['side'] == 'r') == (ext_polishing['t_strand'] == '+'), ext_polishing['t_read_to'], ext_polishing['t_start'])
+            ext_polishing['nq_end'] = np.where((ext_polishing['side'] == 'r') == (ext_polishing['t_strand'] == '+'), ext_polishing['t_end'], ext_polishing['t_read_from'])
+            ext_polishing['con_start'] = np.where((ext_polishing['side'] == 'r') == (ext_polishing['q_strand'] == '+'), ext_polishing['q_read_to'], ext_polishing['q_start'])
+            ext_polishing['con_end'] = np.where((ext_polishing['side'] == 'r') == (ext_polishing['q_strand'] == '+'), ext_polishing['q_end'], ext_polishing['q_read_from'])
+            ext_polishing['ratio'] = (ext_polishing['t_end']-ext_polishing['t_start']) / (ext_polishing['q_end']-ext_polishing['q_start'])
+            trim = ext_polishing['con_start'] < ext_polishing['start0']
+            trim_len = np.round((ext_polishing.loc[trim, 'start0']-ext_polishing.loc[trim, 'con_start']) * ext_polishing.loc[trim, 'ratio']).astype(int).values
+            ext_polishing.loc[trim, 'nq_start'] += np.where(ext_polishing.loc[trim, 'q_strand'] == ext_polishing.loc[trim, 't_strand'], trim_len, 0)
+            ext_polishing.loc[trim, 'nq_end'] -= np.where(ext_polishing.loc[trim, 'q_strand'] != ext_polishing.loc[trim, 't_strand'], trim_len, 0)
+            ext_polishing.loc[trim, 'con_start'] = ext_polishing.loc[trim, 'start0']
+            trim = ext_polishing['con_end'] > ext_polishing['end0']
+            trim_len = np.round((ext_polishing.loc[trim, 'con_end']-ext_polishing.loc[trim, 'end0']) * ext_polishing.loc[trim, 'ratio']).astype(int).values
+            ext_polishing.loc[trim, 'nq_end'] -= np.where(ext_polishing.loc[trim, 'q_strand'] == ext_polishing.loc[trim, 't_strand'], trim_len, 0)
+            ext_polishing.loc[trim, 'nq_start'] += np.where(ext_polishing.loc[trim, 'q_strand'] != ext_polishing.loc[trim, 't_strand'], trim_len, 0)
+            ext_polishing.loc[trim, 'con_end'] = ext_polishing.loc[trim, 'end0']
+            ext_polishing.loc[ext_polishing['q_strand'] == '-', ['con_start','con_end']] = ext_polishing.loc[ext_polishing['q_strand'] == '-', ['con_end','con_start']].values
+            ext_polishing['read_name'] = mappings.loc[ext_polishing['t_index'].values, 'read_name'].values
+            ext_polishing = ext_polishing[['read_name','t_len','nq_start','nq_end','t_strand','scaf','side','hap','con_start','con_end','q_strand']].rename(columns={'read_name':'q_name','t_len':'q_len','nq_start':'q_start','nq_end':'q_end','t_strand':'strand','q_strand':'con_strand'})
+            # Add extending_reads themselves for polishing
+            ext_polishing2 = extending_reads[['read_name','start0','end0','strand','scaf','side','hap','q_index']].rename(columns={'read_name':'q_name','start0':'q_start','end0':'q_end'})
+            ext_polishing2['q_len'] = ext_polishing2[['q_index']].merge(extensions[['q_index','q_len']].drop_duplicates(), on='q_index', how='left')['q_len'].values
+            ext_polishing2.drop(columns='q_index', inplace=True)
+            ext_polishing2['con_start'] = np.where(ext_polishing2['strand'] == '+', ext_polishing2['q_start'], ext_polishing2['q_end'])
+            ext_polishing2['con_end'] = np.where(ext_polishing2['strand'] == '+', ext_polishing2['q_end'], ext_polishing2['q_start'])
+            ext_polishing2['con_strand'] = ext_polishing2['strand']
+            ext_polishing = pd.concat([ext_polishing,ext_polishing2], ignore_index=True)
+            # Set pos, matches, etc..
+            ext_polishing['pos_start'] = np.where(ext_polishing['side'] == 'l', 0, ext_polishing[['scaf']].merge(ext_pos, on='scaf', how='left')['pos'].values+1)
+            ext_polishing[['matches','alignment_length','mapq']] = 0
+            # Update positions for polishing reads
+            polishing_reads.loc[np.isin(polishing_reads['scaf'], extending_reads.loc[extending_reads['side'] == 'l', 'scaf'].values), ['pos_start','pos_end']] += 1
+            ext_polishing.loc[np.isin(ext_polishing['scaf'], extending_reads.loc[extending_reads['side'] == 'l', 'scaf'].values) & (ext_polishing['side'] == 'r'), 'pos_start'] += 1
+            # Merge reads appearing in polishing_reads and ext_polishing
+            pairs = ext_polishing[['q_name','scaf','pos_start','side','strand']].reset_index().rename(columns={'index':'eindex','pos_start':'pos'})
+            pairs['pos'] = np.where(pairs['pos'] == 0, 1, pairs['pos']-1) # Set pos to the position of the extended contig
+            pairs = pairs.merge(pd.concat([polishing_reads[['q_name','scaf','pos_start']].reset_index().rename(columns={'index':'pindex','pos_start':'pos'}), polishing_reads[['q_name','scaf','pos_end']].reset_index().rename(columns={'index':'pindex','pos_end':'pos'})], ignore_index=True).drop_duplicates(), on=['q_name','scaf','pos'], how='inner')
+            polishing_reads.loc[pairs.loc[pairs['side'] == 'l', 'pindex'].values, 'pos_start'] = ext_polishing.loc[pairs.loc[pairs['side'] == 'l', 'eindex'].values, 'pos_start'].values
+            polishing_reads.loc[pairs.loc[pairs['side'] == 'r', 'pindex'].values, 'pos_end'] = ext_polishing.loc[pairs.loc[pairs['side'] == 'r', 'eindex'].values, 'pos_start'].values
+            polishing_reads.loc[pairs.loc[pairs['side'] == 'l', 'pindex'].values, 'con_start'] = ext_polishing.loc[pairs.loc[pairs['side'] == 'l', 'eindex'].values, 'con_start'].values
+            polishing_reads.loc[pairs.loc[pairs['side'] == 'r', 'pindex'].values, 'con_end'] = ext_polishing.loc[pairs.loc[pairs['side'] == 'r', 'eindex'].values, 'con_end'].values
+            polishing_reads.loc[pairs.loc[(pairs['side'] == 'r') != (pairs['strand'] == '+'), 'pindex'].values, 'q_start'] = ext_polishing.loc[pairs.loc[(pairs['side'] == 'r') != (pairs['strand'] == '+'), 'eindex'].values, 'q_start'].values
+            polishing_reads.loc[pairs.loc[(pairs['side'] == 'r') == (pairs['strand'] == '+'), 'pindex'].values, 'q_end'] = ext_polishing.loc[pairs.loc[(pairs['side'] == 'r') == (pairs['strand'] == '+'), 'eindex'].values, 'q_end'].values
+            ext_polishing.drop(pairs['eindex'].values, inplace=True)
+            # Combine polishing_reads and ext_polishing
+            ext_polishing['pos_end'] = ext_polishing['pos_start']
+            joker = extending_reads[['scaf','side','hap']].groupby(['scaf','side']).size().reset_index(name='nhaps')
+            joker = joker[joker['nhaps'] == 1].drop(columns='nhaps')
+            ext_polishing.loc[ ext_polishing[['scaf','side']].merge(joker, on=['scaf','side'], how='left', indicator=True)['_merge'].values == 'both', 'hap'] = -1
+            ext_polishing.drop(columns=['side','con_strand'], inplace=True)
+            polishing_reads = pd.concat([polishing_reads, ext_polishing], ignore_index=True)
 
             # Change structure of extending_reads to the same as scaffold_paths
             extending_reads = extending_reads[['scaf','side','hap','read_name','start0','end0','strand']].rename(columns={'read_name':'name0','strand':'strand0'})
@@ -8984,6 +9383,9 @@ def ExtendScaffolds(scaffold_paths, extensions, hap_merger, new_scaffolds, mappi
             gap_scaffolds[['sdist_left','sdist_right']] = -1
             scaffold_paths = scaffold_paths.append( gap_scaffolds[['scaf','pos','type']+[f'{n}{h}' for h in range(ploidy) for n in ['phase','name','start','end','strand']]+['sdist_left','sdist_right']] )
 
+            # Only keep the columns in gap_scaffolds, that we need for polishing_reads
+            gap_scaffolds = gap_scaffolds[['scaf','pos','name0','start0','end0']].rename(columns={'name0':'t_name'})
+
     if extension_info['count'] == 0:
         extension_info['left'] = 0
         extension_info['right'] = 0
@@ -8996,15 +9398,44 @@ def ExtendScaffolds(scaffold_paths, extensions, hap_merger, new_scaffolds, mappi
         extension_info['new_min'] = 0
         extension_info['new_max'] = 0
         
-    return scaffold_paths, extension_info
+    return scaffold_paths, polishing_reads, extension_info, gap_scaffolds
+
+def FindPolishingForGapScaffolds(polishing_reads, gap_scaffolds, all_vs_all_mapping_file, polishing_coverage, read_in_chunks):
+    if len(gap_scaffolds):
+        # Get mappings of other reads to the new contig
+        gap_pol = []
+        for reads in pd.read_csv(all_vs_all_mapping_file, sep='\t', header=None, usecols=range(9), names=['q_name','q_len','q_start','q_end','strand','t_name','t_len','t_start','t_end'], dtype={'q_name':object, 'q_len':np.int32, 'q_start':np.int32, 'q_end':np.int32, 'strand':str, 't_name':object, 't_len':np.int32, 't_start':np.int32, 't_end':np.int32}, chunksize=read_in_chunks):
+            gap_pol.append( reads.merge(gap_scaffolds, on='t_name', how='inner') )
+        gap_pol = pd.concat(gap_pol, ignore_index=True)
+        gap_pol = gap_pol[(gap_pol['t_start'] < gap_pol['end0']) & (gap_pol['t_end'] > gap_pol['start0'])].drop(columns=['t_name','t_len'])
+        # Filter down to polishing_coverage first based on mapping length inside contig region and then outside (We do not bin here, because due to the selection of reads in the all_vs_all_mapping_file we expect most reads to come from one side and in general the new contigs should not be too long)
+        gap_pol['inmaplen'] = np.minimum(gap_pol['end0'], gap_pol['t_end']) - np.maximum(gap_pol['start0'], gap_pol['t_start'])
+        gap_pol['outmaplen'] = gap_pol['t_end'] - gap_pol['t_start']
+        gap_pol.sort_values(['scaf','inmaplen','outmaplen'], ascending=[True,False,False], inplace=True)
+        gap_pol['cov'] = gap_pol.groupby('scaf', sort=False).cumcount()
+        gap_pol = gap_pol[gap_pol['cov'] < polishing_coverage].drop(columns=['inmaplen','outmaplen','cov'])
+        # Add gap_pol to polishing_reads
+        gap_pol.rename(columns={'pos':'pos_start','start0':'con_start','end0':'con_end'}, inplace=True)
+        gap_pol['ratio'] = (gap_pol['q_end']-gap_pol['q_start'])/(gap_pol['t_end']-gap_pol['t_start'])
+        gap_pol['q_start'] += np.round(np.maximum(0, np.where(gap_pol['strand'] == '+', gap_pol['con_start']-gap_pol['t_start'], gap_pol['t_end']-gap_pol['con_end']))*gap_pol['ratio']).astype(int)
+        gap_pol['q_end'] -= np.round(np.maximum(0, np.where(gap_pol['strand'] == '+', gap_pol['t_end']-gap_pol['con_end'], gap_pol['con_start']-gap_pol['t_start']))*gap_pol['ratio']).astype(int)
+        gap_pol['con_start'] = np.maximum(gap_pol['t_start'],gap_pol['con_start'])
+        gap_pol['con_end'] = np.minimum(gap_pol['t_end'],gap_pol['con_end'])
+        gap_pol.drop(columns=['t_start','t_end','ratio'], inplace=True)
+        gap_pol[['pos_end','matches','alignment_length','mapq']] = 0
+        gap_pol['hap'] = -1
+        polishing_reads = pd.concat([polishing_reads, gap_pol], ignore_index=True)
+        
+    return polishing_reads
 
 def GaplessExtend(all_vs_all_mapping_file, prefix, min_length_contig_break):
     # Define parameters
-    min_extension = 500    
+    min_extension = 500
     min_num_reads = 3
     max_mapping_uncertainty = 200
     min_scaf_len = 600
     read_in_chunks = 100000000
+    polishing_coverage = 20
     
     # Remove output files, such that we do not accidentially use an old one after a crash
     for f in [f"{prefix}_extended_scaffold_paths.csv", f"{prefix}_used_reads.lst"]:
@@ -9016,13 +9447,16 @@ def GaplessExtend(all_vs_all_mapping_file, prefix, min_length_contig_break):
     ploidy = GetPloidyFromPaths(scaffold_paths)
     mappings, read_ids = LoadExtensions(prefix, min_extension)
     extensions, hap_merger = LoadReads(all_vs_all_mapping_file, mappings, read_ids, min_length_contig_break, read_in_chunks)
+    polishing_reads = pd.read_csv(prefix+"_polishing.csv")
     
     print( str(timedelta(seconds=process_time())), "Searching for extensions")
     extensions, new_scaffolds = ClusterExtension(extensions, mappings, min_num_reads, min_scaf_len)
-    scaffold_paths, extension_info = ExtendScaffolds(scaffold_paths, extensions, hap_merger, new_scaffolds, mappings, min_num_reads, max_mapping_uncertainty, min_scaf_len, ploidy)
+    scaffold_paths, polishing_reads, extension_info, gap_scaffolds = ExtendScaffolds(scaffold_paths, polishing_reads, extensions, hap_merger, new_scaffolds, mappings, min_num_reads, max_mapping_uncertainty, min_scaf_len, ploidy, polishing_coverage)
+    polishing_reads = FindPolishingForGapScaffolds(polishing_reads, gap_scaffolds, all_vs_all_mapping_file, polishing_coverage, read_in_chunks)
 
     print( str(timedelta(seconds=process_time())), "Writing output")
     scaffold_paths.to_csv(f"{prefix}_extended_scaffold_paths.csv", index=False)
+    polishing_reads.to_csv(f"{prefix}_extended_polishing.csv", index=False)
     np.savetxt(f"{prefix}_used_reads.lst", np.unique(pd.concat([scaffold_paths.loc[('read' == scaffold_paths['type']) & ('' != scaffold_paths[f'name{h}']), f'name{h}'] for h in range(ploidy)], ignore_index=True)), fmt='%s')
     
     print( str(timedelta(seconds=process_time())), "Finished")
@@ -9045,7 +9479,7 @@ def RemoveBubbleHaplotype(outpaths, hap, remove):
 #
     return outpaths
 
-def GaplessFinish(assembly_file, read_file, read_format, scaffold_file, output_files, haplotypes):
+def GaplessFinish(assembly_file, read_file, read_format, scaffold_file, polishing_file, output_files, haplotypes):
     min_length = 600 # Minimum length for a contig or alternative haplotype to be in the output
     skip_length = 50 # Haplotypes with a length shorter than this get lowest priority for being included in the main scaffold for mixed mode
     merge_dist = 1000 # Alternative haplotypes separated by at max merge_dist of common sequence are merged and output as a whole alternative contig in mixed mode
@@ -9055,6 +9489,13 @@ def GaplessFinish(assembly_file, read_file, read_format, scaffold_file, output_f
             output_files[0] = assembly_file.rsplit('.',2)[0]+"_gapless.fa"
         else:
             output_files[0] = assembly_file.rsplit('.',1)[0]+"_gapless.fa"
+#
+    polishing_output = []
+    for of in output_files:
+        if ".gz" == of[-3:len(of)]:
+            polishing_output.append( of.rsplit('.',2)[0]+"_polishing.paf" )
+        else:
+            polishing_output.append( of.rsplit('.',1)[0]+"_polishing.paf" )
 #
     # Remove output files, such that we do not accidentially use an old one after a crash
     for f in output_files:
@@ -9070,6 +9511,9 @@ def GaplessFinish(assembly_file, read_file, read_format, scaffold_file, output_f
         elif haplotypes[i] >= ploidy:
             print(f"The highest haplotype in scaffold file is {ploidy-1}, but {haplotypes[i]} was specified")
             sys.exit(1)
+#
+    print( str(timedelta(seconds=process_time())), "Loading polishing info from: {}".format(polishing_file))
+    polishing_reads = pd.read_csv(polishing_file)
 #
     print( str(timedelta(seconds=process_time())), "Loading assembly from: {}".format(assembly_file))
     contigs = {}
@@ -9089,7 +9533,7 @@ def GaplessFinish(assembly_file, read_file, read_format, scaffold_file, output_f
         for record in SeqIO.parse(fin, read_format):
             reads[ record.description.split(' ', 1)[0] ] = record.seq
     
-    for outfile, hap in zip(output_files, haplotypes):
+    for outfile, hap, polfile in zip(output_files, haplotypes, polishing_output):
         outpaths = scaffold_paths.copy()
         outpaths['meta'] = ((outpaths['scaf'] != outpaths['scaf'].shift(1)) & (outpaths['sdist_left'] < 0)).cumsum()
         # Select the paths based on haplotype
@@ -9188,6 +9632,7 @@ def GaplessFinish(assembly_file, read_file, read_format, scaffold_file, output_f
             outpaths.rename(columns={'name0':'name','start0':'start','end0':'end','strand0':'strand'}, inplace=True)
             if hap > 0:
                 outpaths.loc[outpaths[f'phase{hap}'] >= 0, ['name','start','end','strand']] = outpaths.loc[outpaths[f'phase{hap}'] >= 0, [f'name{hap}',f'start{hap}',f'end{hap}',f'strand{hap}']].values
+            pol_reads = polishing_reads[(polishing_reads['hap'] == -1) | (polishing_reads['hap'] == hap)].drop(columns='hap')
         # Remove scaffolds that are shorter than min_length
         outpaths = outpaths.loc[outpaths['name'] != '', ['meta','scaf','pos','type','name','start','end','strand','sdist_right']].copy()
         outpaths['length'] = outpaths['end'] - outpaths['start']
@@ -9196,7 +9641,28 @@ def GaplessFinish(assembly_file, read_file, read_format, scaffold_file, output_f
         outpaths.loc[(outpaths['meta'] != outpaths['meta'].shift(-1)), 'sdist_right'] = -1
         # Make sure sdist_right is int
         outpaths['sdist_right'] = outpaths['sdist_right'].astype(int)
-        # Write to file
+        # Create polishing mapping file
+        pol_merge = outpaths.drop(columns=['type','name'])
+        pol_merge.rename(columns={'meta':'t_name','strand':'con_strand'}, inplace=True)
+        if np.sum(pol_merge['sdist_right'] > 0):
+            pol_merge.loc[pol_merge['sdist_right'] > 0, 'length'] += pol_merge.loc[pol_merge['sdist_right'] > 0, 'sdist_right']
+        pol_merge.drop(columns=['sdist_right'], inplace=True)
+        meta_len = pol_merge.groupby('t_name')['length'].sum().reset_index(name='t_len')
+        pol_merge['length'] = pol_merge.groupby('t_name', sort=False)['length'].cumsum().shift(1, fill_value=0)
+        pol_merge['length'] = np.where(pol_merge['t_name'] != pol_merge['t_name'].shift(1), 0, pol_merge['length'])
+        pol_reads = pol_reads.merge(pol_merge.rename(columns={'pos':'pos_start'}), on=['scaf','pos_start'], how='inner')
+        pol_reads['con_start'] = np.minimum(np.maximum(pol_reads['con_start'], pol_reads['start']), pol_reads['end'])
+        pol_reads['con_start'] = pol_reads['length'] + np.where(pol_reads['con_strand'] == '+', pol_reads['con_start']-pol_reads['start'], pol_reads['end']-pol_reads['con_start'])
+        pol_reads = pol_reads.drop(columns=['pos_start','start','end','con_strand','length']).merge(pol_merge.drop(columns='t_name').rename(columns={'pos':'pos_end'}), on=['scaf','pos_end'], how='inner')
+        pol_reads['con_end'] = np.minimum(np.maximum(pol_reads['con_end'], pol_reads['start']), pol_reads['end'])
+        pol_reads['con_end'] = pol_reads['length'] + np.where(pol_reads['con_strand'] == '+', pol_reads['con_end']-pol_reads['start'], pol_reads['end']-pol_reads['con_end'])
+        pol_reads.drop(columns=['scaf','pos_end','start','end','con_strand','length'], inplace=True)
+        pol_reads['t_len'] = pol_reads[['t_name']].merge(meta_len, on='t_name', how='left')['t_len'].values
+        pol_reads = pol_reads[['q_name','q_len','q_start','q_end','strand','t_name','t_len','con_start','con_end','matches','alignment_length','mapq']].copy()
+        pol_reads.sort_values(['q_name','q_start','q_end'], inplace=True)
+        pol_reads.to_csv(polfile,sep='\t',index=False,header=False)
+        
+        # Write outpaths to file
         try:
             with gzip.open(outfile, 'wb') if 'gz' == outfile.rsplit('.',1)[-1] else open(outfile, 'w') as fout:
                 meta = ''
@@ -12420,6 +12886,7 @@ def Usage(module=""):
         print("  --hap[1-9] INT            Haplotypes starting from 0 written to {out[1-9]} (default: mixed)")
         print("  -o, --output FILE.fa      Output file for modified assembly ({assembly}_gapless.fa)")
         print("  --out[1-9] FILE.fa        Additional output files for modified assembly (deactivated)")
+        print("  -p, --polishing FILE.fa   Input file for polishing read information")
         print("  -s, --scaffolds FILE.csv  Csv file from previous steps describing the scaffolding (mandatory)")
     elif "visualize" == module:
         print("Usage: gapless.py visualize [OPTIONS] -o {output}.pdf {mapping}.paf {scaffold}:{start}-{end} [{scaffold}:{start}-{end} ...]")
@@ -12570,7 +13037,7 @@ def main(argv):
     elif "finish" == module:
         num_slots = 10
         try:
-            optlist, args = getopt.getopt(argv, 'hf:H:o:s:', ['help','format=','hap=','output=','scaffolds=','version']+[f'hap{i}=' for i in range(1,num_slots)]+[f'out{i}=' for i in range(1,num_slots)])
+            optlist, args = getopt.getopt(argv, 'hf:H:o:p:s:', ['help','format=','hap=','output=','polishing=','scaffolds=','version']+[f'hap{i}=' for i in range(1,num_slots)]+[f'out{i}=' for i in range(1,num_slots)])
         except getopt.GetoptError:
             print("Unknown option\n")
             Usage(module)
@@ -12580,6 +13047,7 @@ def main(argv):
         output = [False]*num_slots
         haplotypes = [-1]*num_slots
         scaffolds = False
+        polishing_file = False
         for opt, par in optlist:
             if opt in ("-h", "--help"):
                 Usage(module)
@@ -12601,6 +13069,8 @@ def main(argv):
                 output[0] = par
             elif opt in [f'--out{i}' for i in range(1,num_slots)]:
                 output[int(opt[5:])] = par
+            elif opt in ("-p", "--polishing"):
+                polishing_file = par
             elif opt in ("-s", "--scaffolds"):
                 scaffolds = par
             elif opt == "--version":
@@ -12617,6 +13087,11 @@ def main(argv):
             Usage(module)
             sys.exit(1)
             
+        if False == polishing_file:
+            print("Polishing argument is mandatory")
+            Usage(module)
+            sys.exit(1)
+            
         selected_output = [output[0]]
         selected_haplotypes = [haplotypes[0]]
         for i in range(1,num_slots):
@@ -12629,7 +13104,7 @@ def main(argv):
                 selected_output.append(output[i])
                 selected_haplotypes.append(haplotypes[i])
 
-        GaplessFinish(args[0], args[1], read_format, scaffolds, selected_output, selected_haplotypes)
+        GaplessFinish(args[0], args[1], read_format, scaffolds, polishing_file, selected_output, selected_haplotypes)
     elif "visualize" == module:
         try:
             optlist, args = getopt.getopt(argv, 'ho:', ['help','output=','--keepAllSubreads','--minLenBreak=','minMapLength=','minMapQ=','version'])

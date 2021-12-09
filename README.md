@@ -137,6 +137,7 @@ racon -t {threads} {input_reads} gapless_consensus.paf gapless_raw.fa > gapless.
 | `--hap[1-9]`       | mixed                   | Haplotypes starting from 0 written to `--out[1-9]` |
 | `-o` `--output`    | `{assembly}`_gapless.fa | Output file for modified assembly |
 | `--out[1-9]`       | (no additional output)  | Additional output files for modified assembly |
+| `-p` `--polishing` | (mandatory)             | Input file for polishing read information |
 | `-s` `--scaffolds` | (mandatory)             | Csv file from previous steps describing the scaffolding |
 
 ## <a name="output"></a>Intermediate and final output files in the pipeline
@@ -146,7 +147,7 @@ racon -t {threads} {input_reads} gapless_consensus.paf gapless_raw.fa > gapless.
 | gapless_split_repeats.paf           | minimap2            | temporary    | Mapping of the split assembly to itself              |
 | gapless_reads.paf                   | minimap2            | temporary    | Mapping of the long reads to the split assembly      |
 | gapless_scaffold_paths.csv          | gapless.py scaffold | intermediate | Table summarising the first and last base included for contigs and reads in the new scaffolds as well as their order and orientation for all haplotypes. Positions start at 0 and end positions are one after the last included position. The orientation is encoded with +/-. The first and last contig/read in a scaffold contain information about the distance to the next scaffold in case this information is present. Otherwise, the fields are encoded with -1. Identical phases mean that contig/reads are phased to be on the same haplotype. Negative phases mark contigs/reads identical to main haplotye (0). Empty contig/read names in combination with positive phases mark deletions. |
-| gapless_extensions.csv              | gapless.py scaffold | intermediate | Table summarising the mapping of extending reads to the assembly. How much they extend the new scaffolds, how far from the end they stop aligning (trim), the read distance to the next alignment (unmap_ext).
+| gapless_extensions.csv              | gapless.py scaffold | intermediate | Table summarising the mapping of extending reads to the assembly. How much they extend the new scaffolds, how far from the end they stop aligning (trim), the read distance to the next alignment (unmap_ext). |
 | gapless_extending_reads.lst         | gapless.py scaffold | intermediate | List of extending reads with one read name per line  |
 | gapless_stats.pdf                   | gapless.py scaffold | final        | File containing plots with information about the run |
 | gapless_extending_reads.paf         | minimap2            | temporary    | All-vs.-all alignment of the extending reads         |

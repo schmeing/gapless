@@ -158,7 +158,7 @@ do
         env time -v -o pass${i}/timing/minimap2_extension.txt minimap2 -t $threads -x $mm_ava <(seqtk subseq "${org_path}/${reads}" pass${i}/gapless_extending_reads.lst) <(seqtk subseq "${org_path}/${reads}" pass${i}/gapless_extending_reads.lst) > pass${i}/gapless_extending_reads.paf 2>pass${i}/logs/minimap2_extension.log || rm -f pass${i}/gapless_extending_reads.paf
       fi
       env time -v -o pass${i}/timing/gapless_extend.txt gapless.py extend -p pass${i}/gapless pass${i}/gapless_extending_reads.paf >pass${i}/logs/gapless_extend.log 2>&1 &&\
-      rm -f pass${i}/gapless_extending_reads.paf
+      rm -f pass${i}/gapless_extending_reads.paf pass${i}/gapless_polishing.csv
       if [ -f pass${i}/gapless_extending_reads.paf ]; then
 		rm -f pass${i}/gapless_extended_scaffold_paths.csv
 	  fi
@@ -169,10 +169,12 @@ do
     fi
     # Finish
     if [ ! -f pass${i}/gapless_raw.fa ] || [ $reset = true ]; then
-      env time -v -o pass${i}/timing/gapless_finish.txt gapless.py finish -o pass${i}/gapless_raw.fa -H 0 -s pass${i}/gapless_extended_scaffold_paths.csv pass${i}/gapless_split.fa <(seqtk subseq "${org_path}/${reads}" pass${i}/gapless_used_reads.lst) >pass${i}/logs/gapless_finish.log 2>&1 || rm -f pass${i}/gapless_raw.fa
+      env time -v -o pass${i}/timing/gapless_finish.txt gapless.py finish -o pass${i}/gapless_raw.fa -H 0 -s pass${i}/gapless_extended_scaffold_paths.csv -p pass${i}/gapless_extended_polishing.csv pass${i}/gapless_split.fa <(seqtk subseq "${org_path}/${reads}" pass${i}/gapless_used_reads.lst) >pass${i}/logs/gapless_finish.log 2>&1 || rm -f pass${i}/gapless_raw.fa
       if [ ! -f pass${i}/gapless_raw.fa ]; then
         echo "pipeline crashed: finish"
         exit 1
+      else
+        rm -f pass${i}/gapless_extended_polishing.csv
       fi
     fi
 	# Consensus
@@ -180,7 +182,7 @@ do
       env time -v -o pass${i}/timing/minimap2_consensus.txt minimap2 -t $threads -x $mm_map pass${i}/gapless_raw.fa "${org_path}/${reads}" > pass${i}/gapless_consensus.paf 2>pass${i}/logs/minimap2_consensus.log || rm -f pass${i}/gapless_consensus.paf
     fi
     env time -v -o pass${i}/timing/racon.txt racon -t $threads "${org_path}/${reads}" pass${i}/gapless_consensus.paf pass${i}/gapless_raw.fa > pass${i}/gapless.fa 2>pass${i}/logs/racon.log &&\
-    rm -f pass${i}/gapless_consensus.paf pass${i}/gapless_raw.fa pass${i}/gapless_split.fa
+    rm -f pass${i}/gapless_raw_polishing.paf pass${i}/gapless_raw.fa pass${i}/gapless_split.fa
     if [ -f pass${i}/gapless_raw.fa ]; then
 		rm -f pass${i}/gapless.fa # In case of an error remove final output file to avoid going into the next round
     fi
