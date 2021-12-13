@@ -1583,6 +1583,16 @@ def CheckBridgeConsistency(bridges):
         print(inconsistencies)
         raise RuntimeError("Bridges are inconsistent.")
 
+def PrintBridgeFilter(bridges, bridge_extlen, borderline_removal, min_factor_alternatives, org_scaffold_trust, cov_probs, min_mapping_length, contig_parts):
+    filtered_bridges = []
+    for min_num_reads in [0,1,2,3,4,5,10,20,30,50]:
+        for prematurity_threshold in [0.0,1e-5,1e-4,1e-3,5e-3,0.01,0.02,0.05,0.1,0.2,0.5]:
+            for prob_factor in [2,3,5,10,20,30,50,1e50]:
+                print(min_num_reads, prematurity_threshold, prob_factor)
+                cur_bridges = bridges.copy()
+                cur_bridges = FilterBridges(cur_bridges, bridge_extlen, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, cov_probs, prob_factor, min_mapping_length, contig_parts, prematurity_threshold, pdf)
+                filtered_bridges.append(cur_bridges)
+
 def GetBridges(mappings, repeats, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, cov_probs, prob_factor, min_mapping_length, min_distance_tolerance, rel_distance_tolerance, prematurity_threshold, max_dist_contig_end, pdf):
     # Get bridges
     for s in ['left','right']:
@@ -6651,8 +6661,11 @@ def PlacePathAInPathB(duplications, scaffold_paths, graph_ext, scaffold_graph, s
         test_paths, group_info = MergeHaplotypes(test_paths, graph_ext, scaf_bridges, ploidy, ends)
         pids = np.unique(test_paths['pid'])
         includes['success'] = (np.isin(includes['tpid1'], pids) == False) & (np.isin(includes['tpid2'], pids) == False) # If we still have the original pids they could not be merged
-        group_info['new_pid'] = group_info[[f'pid{h}' for h in range(ploidy)]].max(axis=1) # We get here tpid2 from includes, which is the pid we want to assign to the now merged middle part
-        test_paths['new_pid'] = test_paths[['pid']].merge(group_info[['pid','new_pid']], on=['pid'], how='left')['new_pid'].values
+        if len(group_info):
+            group_info['new_pid'] = group_info[[f'pid{h}' for h in range(ploidy)]].max(axis=1) # We get here tpid2 from includes, which is the pid we want to assign to the now merged middle part
+            test_paths['new_pid'] = test_paths[['pid']].merge(group_info[['pid','new_pid']], on=['pid'], how='left')['new_pid'].values
+        else:
+            test_paths['new_pid'] = np.nan
         test_paths = test_paths[np.isnan(test_paths['new_pid']) == False].copy()
         test_paths['pid'] = test_paths['new_pid'].astype(int)
         test_paths.drop(columns=['new_pid'], inplace=True)
