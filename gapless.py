@@ -7811,12 +7811,12 @@ def TrimDuplicatedEnds(contig_parts, scaffold_paths, mappings, repeats, trim_rep
     # Remove contig_parts that became shorter than min_mapping_length+alignment_precision completely
     scaffold_paths, removed_length = RemoveScaffoldsFromAssembly(scaffold_paths, contig_parts, scaffold_paths.loc[np.isin(scaffold_paths['con0'], contig_parts[contig_parts['end']-contig_parts['start'] < min_mapping_length+alignment_precision].index.values), 'scaf'].values)
     # Remove mappings for trimmed contigs, so that they will not be extended (must happen after RemoveUnconnectedLowlyMappedOrDuplicatedContigs or we will remove all of them)
-    if len(trim_repeats):
-        if len(repeats):
+    if len(trim_repeats) and len(trim):
+        if len(repeats) and len(ctrim):
             mappings = mappings[np.isin(mappings['conpart'], np.concatenate([ctrim['q_con'].values, trim['q_con'].values])) == False].copy()
         else:
             mappings = mappings[np.isin(mappings['conpart'], trim['q_con'].values) == False].copy()
-    elif len(repeats):
+    elif len(repeats) and len(ctrim):
         mappings = mappings[np.isin(mappings['conpart'], ctrim['q_con'].values) == False].copy()
 #
     return contig_parts, scaffold_paths, mappings
