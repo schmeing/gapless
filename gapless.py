@@ -7355,11 +7355,11 @@ def PhaseScaffoldsWithScafBridges(scaffold_paths, scaf_bridges, ploidy):
     # Filter to have only valid bridges
     test_bridges = test_bridges.merge(scaf_bridges[['from','from_side','to','to_side','mean_dist']], on=['from','from_side','to','to_side','mean_dist'], how='inner')
     test_bridges.sort_values(['pid','from_pos','from_hap','to_pos','to_hap'], inplace=True)
-    # Combine phases without alternatives
+    # Combine phases without alternatives if they are not on different haplotypes (which can happen if a haplotype ends with a deletion)
     alt_count = test_bridges.groupby(['pid','from_pos','from_hap'], sort=False).size().values
     test_bridges['from_alts'] = np.repeat(alt_count, alt_count)
     test_bridges['to_alts'] = test_bridges[['pid','to_pos','to_hap']].merge(test_bridges.groupby(['pid','to_pos','to_hap']).size().reset_index(name='alts'), on=['pid','to_pos','to_hap'], how='left')['alts'].values
-    test_bridges = test_bridges.loc[(test_bridges['from_alts'] == 1) & (test_bridges['to_alts'] == 1), ['from_phase','to_phase']].copy()
+    test_bridges = test_bridges.loc[(test_bridges['from_alts'] == 1) & (test_bridges['to_alts'] == 1) & (test_bridges['from_hap'] == test_bridges['to_hap']), ['from_phase','to_phase']].copy()
     scaffold_paths = AssignNewPhases(scaffold_paths, test_bridges, ploidy)
     # Handle deletions by assigning them to the following phase (or the previous if they are at the end of the paths)
     scaffold_paths = AssignDeletionsToFollowingPhase(scaffold_paths, ploidy)
