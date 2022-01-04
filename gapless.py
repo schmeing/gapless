@@ -16,7 +16,7 @@ import pandas as pd
 from PIL import Image, ImageDraw, ImageFont
 import re
 from scipy.optimize import minimize
-from scipy.special import erf
+from scipy.stats import poisson
 import seaborn as sns
 import sys
 from time import process_time
@@ -358,11 +358,8 @@ def GetBinnedCoverage(mappings, length_thresholds):
 
     return pd.concat(cov_counts, ignore_index=True)
 
-def NormCDF(x, mu, sigma):
-    return (1+erf((x-mu)/sigma))/2 # We skip the sqrt(2) factor for the sigma, since sigma will be fitted anyways and we don't care about the value as long as it describes the curve
-
 def CovChi2(par, df): #, expo
-    return np.sum((NormCDF(df['x'], par[0], par[1]) - df['y'])**2)
+    return np.sum((poisson.cdf(df['x'], par[0]) - df['y'])**2)
     
 def GetCoverageProbabilities(cov_counts, pdf):
     probs = cov_counts.groupby(['bin_size','count']).size().reset_index(name='nbins')
@@ -370,23 +367,21 @@ def GetCoverageProbabilities(cov_counts, pdf):
     cov_bins = probs.groupby(['bin_size'])['nbins'].agg(['sum','size']).reset_index()
     probs['nbin_sum'] = np.repeat( cov_bins['sum'].values, cov_bins['size'].values)
 
-    # Fit CDF with CDF of normal distribution
+    # Fit CDF with CDF of Poisson distribution
     probs['lower_half'] = (np.repeat( (cov_bins['sum']*0.5).values.astype(int), cov_bins['size'].values) > probs['nbin_cumsum']).shift(1, fill_value=True) # Shift so that we also get the bin that is only partially in the lower half (Ensures that we always have at least one bin)
     probs.loc[probs['bin_size'] != probs['bin_size'].shift(1), 'lower_half'] = True # The first bin must be True, but likely has been turned to False by the shift 
     prob_len = np.unique(probs['bin_size'])
     prob_mu = []
-    prob_sigma = []
     for bsize in prob_len:
         selection = (bsize == probs['bin_size']) & probs['lower_half']
-        opt_par = minimize(CovChi2, [probs.loc[selection, 'count'].values[-1],1.0], args=(pd.DataFrame({'x':probs.loc[selection, 'count'], 'y':probs.loc[selection, 'nbin_cumsum']/probs.loc[selection, 'nbin_sum']})), method='Nelder-Mead').x
+        opt_par = minimize(CovChi2, [probs.loc[selection, 'count'].values[-1]], args=(pd.DataFrame({'x':probs.loc[selection, 'count'], 'y':probs.loc[selection, 'nbin_cumsum']/probs.loc[selection, 'nbin_sum']})), method='Nelder-Mead').x
         prob_mu.append(opt_par[0])
-        prob_sigma.append(opt_par[1])
         if pdf:
             x_values = np.arange(probs.loc[selection, 'count'].values[0], probs.loc[selection, 'count'].values[-1]+1)
-            PlotXY(pdf, "Max. Coverage", "% Bins (Size: {})".format(bsize), probs.loc[selection, 'count'], probs.loc[selection, 'nbin_cumsum']/probs.loc[selection, 'nbin_sum']*100, linex=x_values, liney=NormCDF(x_values,opt_par[0],opt_par[1])*100)
+            PlotXY(pdf, "Max. Coverage", "% Bins (Size: {})".format(bsize), probs.loc[selection, 'count'], probs.loc[selection, 'nbin_cumsum']/probs.loc[selection, 'nbin_sum']*100, linex=x_values, liney=poisson.cdf(x_values,opt_par[0])*100)
 
     # Store results in DataFrame
-    cov_probs = pd.DataFrame({'length':prob_len, 'mu':prob_mu, 'sigma':prob_sigma})
+    cov_probs = pd.DataFrame({'length':prob_len, 'mu':prob_mu})
 
     return cov_probs
 
@@ -740,16 +735,15 @@ def GetPrematureStopProb(ntest, ncontrol, longer):
         p[sel] -= prob[sel]
     return np.where(longer == 0, 1.0, p)
 
-def NormCDFCapped(x, mu, sigma):
-    return np.minimum(0.5, NormCDF(x, mu, sigma)) # Cap it at the mean so that repeats do not get a bonus
+def PoisCDFCapped(x, mu):
+    return np.minimum(0.5, poisson.cdf(x, mu)) # Cap it at the mean so that repeats do not get a bonus
 
 def GetConProb(cov_probs, req_length, counts):
-    probs = pd.DataFrame({'length':req_length, 'counts':counts, 'mu':0.0, 'sigma':1.0})
-    for plen, mu, sigma in zip(reversed(cov_probs['length']), reversed(cov_probs['mu']), reversed(cov_probs['sigma'])):
+    probs = pd.DataFrame({'length':req_length, 'counts':counts, 'mu':0.0})
+    for plen, mu in zip(reversed(cov_probs['length']), reversed(cov_probs['mu'])):
         probs.loc[plen >= probs['length'], 'mu'] = mu
-        probs.loc[plen >= probs['length'], 'sigma'] = sigma
 
-    return NormCDFCapped(probs['counts'],probs['mu'], probs['sigma'])
+    return PoisCDFCapped(probs['counts'],probs['mu'])
 
 def CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_ext_len, cov_probs, covered_regions, repeats, max_dist_contig_end, max_break_point_distance, min_mapping_length, min_num_reads, min_length_contig_break, prob_factor, merge_block_length, prematurity_threshold):
     unconnected_break_points = []
@@ -1378,6 +1372,39 @@ def FindDuplicatedContigPartEnds(repeats, contig_parts, max_dist_contig_end, pro
 #
     return repeat_ends
 
+def GetLeftAndRightBridges(mappings, contig_parts, min_mapping_length):
+    # Get bridges
+    for s in ['left','right']:
+        cur_bridge = mappings.loc[mappings[f'{s}_con'] >= 0, ['conpart',f'{s}_con',f'{s}_con_side',f'{s}_con_dist','mapq','con_from','con_to','read_start','read_end','read_from','read_to','strand']].copy()
+        cur_bridge.rename(columns={'conpart':'from',f'{s}_con':'to',f'{s}_con_side':'to_side','mapq':'from_mapq',f'{s}_con_dist':'distance'}, inplace=True)
+        cur_bridge['from_side'] = s[0]
+        cur_bridge['to_mapq'] = np.where(('+' if s == 'left' else '-') == mappings['strand'], mappings['mapq'].shift(1, fill_value = -1), mappings['mapq'].shift(-1, fill_value = -1))[mappings[f'{s}_con'] >= 0]
+        cur_bridge['mapq'] = np.where(cur_bridge['to_mapq'] < cur_bridge['from_mapq'], cur_bridge['to_mapq'].astype(int)*1000+cur_bridge['from_mapq'], cur_bridge['from_mapq'].astype(int)*1000+cur_bridge['to_mapq'])
+        cur_bridge.drop(columns=['from_mapq','to_mapq'], inplace=True)
+        for e in ['from','to']:
+            # Get maplen and gaplen
+            cur_bridge['maplen'] = cur_bridge['con_to'] - cur_bridge['con_from']
+            cur_bridge['con_from'] -= contig_parts.loc[cur_bridge[e].values, 'start'].values
+            cur_bridge['con_to'] = contig_parts.loc[cur_bridge[e].values, 'end'].values - cur_bridge['con_to']
+            cur_bridge['maplen'] += np.where(cur_bridge[f'{e}_side'] == 'l', cur_bridge['con_from'], cur_bridge['con_to']) # when it start to map later, we do not care, important is how far it maps
+            cur_bridge[f'{e}_gaplen'] = np.where(cur_bridge['distance'] >= 0, cur_bridge['distance']+min_mapping_length, np.maximum(-cur_bridge['distance'], min_mapping_length)) - np.where(cur_bridge[f'{e}_side'] == 'l', cur_bridge['con_from'], cur_bridge['con_to'])
+            # Get extlen
+            cur_bridge[f'{e}_extlen'] = np.where((cur_bridge[f'{e}_side'] == 'l') == (cur_bridge['strand'] == '+'), cur_bridge['read_end']-cur_bridge['read_to'], cur_bridge['read_from']-cur_bridge['read_start']) + cur_bridge['maplen']
+            cur_bridge.drop(columns=['maplen'], inplace=True)
+            # Prepare to side
+            if e == 'from':
+                cur_bridge[['con_from','con_to','read_start','read_end','read_from','read_to','strand']] = np.where(('+' if s == 'left' else '-') == mappings[['strand','strand','strand','strand','strand','strand','strand']].values, mappings[['con_from','con_to','read_start','read_end','read_from','read_to','strand']].shift(1, fill_value = -1).values, mappings[['con_from','con_to','read_start','read_end','read_from','read_to','strand']].shift(-1, fill_value = -1).values)[mappings[f'{s}_con'].values >= 0]
+            else:
+                cur_bridge.drop(columns=['con_from','con_to','read_start','read_end','read_from','read_to','strand'], inplace=True)
+        if s == 'left':
+            left_bridge = cur_bridge[['from','from_side','to','to_side','distance','mapq']].copy()
+            bridge_extlen = cur_bridge.drop(columns=['mapq'])
+        else:
+            right_bridge = cur_bridge[['from','from_side','to','to_side','distance','mapq']].copy()
+            bridge_extlen = pd.concat([bridge_extlen, cur_bridge.drop(columns=['mapq'])], ignore_index=True)
+#
+    return left_bridge, right_bridge, bridge_extlen
+
 def CreateBridges(left_bridge, right_bridge, min_distance_tolerance, rel_distance_tolerance):
     bridges = pd.concat([left_bridge,right_bridge], ignore_index=True, sort=False)
 
@@ -1583,7 +1610,8 @@ def CheckBridgeConsistency(bridges):
         print(inconsistencies)
         raise RuntimeError("Bridges are inconsistent.")
 
-def PrintBridgeFilter(bridges, bridge_extlen, borderline_removal, min_factor_alternatives, org_scaffold_trust, cov_probs, min_mapping_length, contig_parts):
+def PrintBridgeFilter(mappings, bridges, bridge_extlen, borderline_removal, min_factor_alternatives, org_scaffold_trust, cov_probs, min_mapping_length, contig_parts, min_distance_tolerance, rel_distance_tolerance):
+    # Test multiple filter combinations
     filtered_bridges = []
     for min_num_reads in [0,1,2,3,4,5,10,20,30,50]:
         for prematurity_threshold in [0.0,1e-5,1e-4,1e-3,5e-3,0.01,0.02,0.05,0.1,0.2,0.5]:
@@ -1591,39 +1619,70 @@ def PrintBridgeFilter(bridges, bridge_extlen, borderline_removal, min_factor_alt
                 print(min_num_reads, prematurity_threshold, prob_factor)
                 cur_bridges = bridges.copy()
                 cur_bridges = FilterBridges(cur_bridges, bridge_extlen, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, cov_probs, prob_factor, min_mapping_length, contig_parts, prematurity_threshold, pdf)
+                cur_bridges = cur_bridges[['from','from_side','to','to_side','mean_dist']].copy()
+                cur_bridges['fabs'] = min_num_reads
+                cur_bridges['fprem'] = prematurity_threshold
+                cur_bridges['frel'] = prob_factor
                 filtered_bridges.append(cur_bridges)
+                
+    i = 0
+    for min_num_reads in [0,1,2,3,4,5,10,20,30,50]:
+        for prematurity_threshold in [0.0,1e-5,1e-4,1e-3,5e-3,0.01,0.02,0.05,0.1,0.2,0.5]:
+            for prob_factor in [2,3,5,10,20,30,50,1e50]:
+                filtered_bridges[i] = filtered_bridges[i][['from','from_side','to','to_side','mean_dist']].copy()
+                filtered_bridges[i]['fabs'] = min_num_reads
+                filtered_bridges[i]['fprem'] = prematurity_threshold
+                filtered_bridges[i]['frel'] = prob_factor
+                i += 1
+                
+    filtered_bridges = pd.concat(filtered_bridges, ignore_index=True)
+    filtered_bridges.to_csv("filtered_bridges.csv", index=False)
+    contig_parts[['name','start','end']].reset_index().rename(columns={'index':'conpart'}).to_csv("contig_parts.csv", index=False)
+    
+    # Test alternative length filter
+    filtered_bridges = []
+    for min_map_len in [500,1000,2000,5000,10000,20000,50000]:
+        print(min_map_len)
+        # Filter on mapping length
+        cur_mappings = mappings[['read_id', 'read_start', 'read_end', 'read_from', 'read_to', 'strand','conpart', 'con_from', 'con_to','mapq']].copy()
+        cur_mappings['map_len'] = cur_mappings['con_to'] - cur_mappings['con_from']
+        cur_mappings = cur_mappings[cur_mappings['map_len'] > min_map_len].drop(columns='map_len')
+        # Filter reads with single mappings
+        cur_mappings['next_con'] = np.where((cur_mappings['read_id'].shift(-1, fill_value='') != cur_mappings['read_id']) | (cur_mappings['read_start'].shift(-1, fill_value=-1) != cur_mappings['read_start']), -1, cur_mappings['conpart'].shift(-1, fill_value=-1))
+        cur_mappings['next_strand'] = np.where(-1 == cur_mappings['next_con'], '', cur_mappings['strand'].shift(-1, fill_value=''))
+        cur_mappings['prev_con'] = np.where((cur_mappings['read_id'].shift(1, fill_value='') != cur_mappings['read_id']) | (cur_mappings['read_start'].shift(1, fill_value=-1) != cur_mappings['read_start']), -1, cur_mappings['conpart'].shift(1, fill_value=-1))
+        cur_mappings['prev_strand'] = np.where(-1 == cur_mappings['prev_con'], '', cur_mappings['strand'].shift(1, fill_value=''))
+        cur_mappings = cur_mappings[(cur_mappings['next_con'] >= 0) | (cur_mappings['prev_con'] >= 0)].copy()
+        # Update connections
+        cur_mappings['left_con'] = np.where('+' == cur_mappings['strand'], cur_mappings['prev_con'], cur_mappings['next_con'])
+        cur_mappings['right_con'] = np.where('-' == cur_mappings['strand'], cur_mappings['prev_con'], cur_mappings['next_con'])
+        cur_mappings['next_side'] = np.where('+' == cur_mappings['next_strand'], 'l', 'r')
+        cur_mappings['prev_side'] = np.where('-' == cur_mappings['prev_strand'], 'l', 'r')
+        cur_mappings['left_con_side'] = np.where('+' == cur_mappings['strand'], cur_mappings['prev_side'], cur_mappings['next_side'])
+        cur_mappings.loc[-1 == cur_mappings['left_con'], 'left_con_side'] = ''
+        cur_mappings['right_con_side'] = np.where('-' == cur_mappings['strand'], cur_mappings['prev_side'], cur_mappings['next_side'])
+        cur_mappings.loc[-1 == cur_mappings['right_con'], 'right_con_side'] = ''
+        cur_mappings.drop(columns=['next_con','next_strand','prev_con','prev_strand','next_side','prev_side'], inplace=True)
+        # Get distance to connected contigparts
+        cur_mappings['next_dist'] = cur_mappings['read_from'].shift(-1, fill_value=0) - cur_mappings['read_to']
+        cur_mappings['prev_dist'] = cur_mappings['read_from'] - cur_mappings['read_to'].shift(1, fill_value=0)
+        cur_mappings['left_con_dist'] = np.where('+' == cur_mappings['strand'], cur_mappings['prev_dist'], cur_mappings['next_dist'])
+        cur_mappings.loc[-1 == cur_mappings['left_con'], 'left_con_dist'] = 0
+        cur_mappings['right_con_dist'] = np.where('-' == cur_mappings['strand'], cur_mappings['prev_dist'], cur_mappings['next_dist'])
+        cur_mappings.loc[-1 == cur_mappings['right_con'], 'right_con_dist'] = 0
+        cur_mappings.drop(columns=['next_dist','prev_dist'], inplace=True)
+        # Get bridges
+        left_bridge, right_bridge, bridge_extlen = GetLeftAndRightBridges(cur_mappings, contig_parts, min_mapping_length)
+        cur_bridges = CreateBridges(left_bridge, right_bridge, min_distance_tolerance, rel_distance_tolerance)
+        cur_bridges = cur_bridges[['from','from_side','to','to_side','mean_dist']].drop_duplicates()
+        cur_bridges['min_len'] = min_map_len
+        filtered_bridges.append(cur_bridges)
+    filtered_bridges = pd.concat(filtered_bridges, ignore_index=True)
+    filtered_bridges.to_csv("alt_filter_bridges.csv", index=False)
+
 
 def GetBridges(mappings, repeats, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, contig_parts, cov_probs, prob_factor, min_mapping_length, min_distance_tolerance, rel_distance_tolerance, prematurity_threshold, max_dist_contig_end, pdf):
-    # Get bridges
-    for s in ['left','right']:
-        cur_bridge = mappings.loc[mappings[f'{s}_con'] >= 0, ['conpart',f'{s}_con',f'{s}_con_side',f'{s}_con_dist','mapq','con_from','con_to','read_start','read_end','read_from','read_to','strand']].copy()
-        cur_bridge.rename(columns={'conpart':'from',f'{s}_con':'to',f'{s}_con_side':'to_side','mapq':'from_mapq',f'{s}_con_dist':'distance'}, inplace=True)
-        cur_bridge['from_side'] = s[0]
-        cur_bridge['to_mapq'] = np.where(('+' if s == 'left' else '-') == mappings['strand'], mappings['mapq'].shift(1, fill_value = -1), mappings['mapq'].shift(-1, fill_value = -1))[mappings[f'{s}_con'] >= 0]
-        cur_bridge['mapq'] = np.where(cur_bridge['to_mapq'] < cur_bridge['from_mapq'], cur_bridge['to_mapq'].astype(int)*1000+cur_bridge['from_mapq'], cur_bridge['from_mapq'].astype(int)*1000+cur_bridge['to_mapq'])
-        cur_bridge.drop(columns=['from_mapq','to_mapq'], inplace=True)
-        for e in ['from','to']:
-            # Get maplen and gaplen
-            cur_bridge['maplen'] = cur_bridge['con_to'] - cur_bridge['con_from']
-            cur_bridge['con_from'] -= contig_parts.loc[cur_bridge[e].values, 'start'].values
-            cur_bridge['con_to'] = contig_parts.loc[cur_bridge[e].values, 'end'].values - cur_bridge['con_to']
-            cur_bridge['maplen'] += np.where(cur_bridge[f'{e}_side'] == 'l', cur_bridge['con_from'], cur_bridge['con_to']) # when it start to map later, we do not care, important is how far it maps
-            cur_bridge[f'{e}_gaplen'] = np.where(cur_bridge['distance'] >= 0, cur_bridge['distance']+min_mapping_length, np.maximum(-cur_bridge['distance'], min_mapping_length)) - np.where(cur_bridge[f'{e}_side'] == 'l', cur_bridge['con_from'], cur_bridge['con_to'])
-            # Get extlen
-            cur_bridge[f'{e}_extlen'] = np.where((cur_bridge[f'{e}_side'] == 'l') == (cur_bridge['strand'] == '+'), cur_bridge['read_end']-cur_bridge['read_to'], cur_bridge['read_from']-cur_bridge['read_start']) + cur_bridge['maplen']
-            cur_bridge.drop(columns=['maplen'], inplace=True)
-            # Prepare to side
-            if e == 'from':
-                cur_bridge[['con_from','con_to','read_start','read_end','read_from','read_to','strand']] = np.where(('+' if s == 'left' else '-') == mappings[['strand','strand','strand','strand','strand','strand','strand']].values, mappings[['con_from','con_to','read_start','read_end','read_from','read_to','strand']].shift(1, fill_value = -1).values, mappings[['con_from','con_to','read_start','read_end','read_from','read_to','strand']].shift(-1, fill_value = -1).values)[mappings[f'{s}_con'].values >= 0]
-            else:
-                cur_bridge.drop(columns=['con_from','con_to','read_start','read_end','read_from','read_to','strand'], inplace=True)
-        if s == 'left':
-            left_bridge = cur_bridge[['from','from_side','to','to_side','distance','mapq']].copy()
-            bridge_extlen = cur_bridge.drop(columns=['mapq'])
-        else:
-            right_bridge = cur_bridge[['from','from_side','to','to_side','distance','mapq']].copy()
-            bridge_extlen = pd.concat([bridge_extlen, cur_bridge.drop(columns=['mapq'])], ignore_index=True)
-#
+    left_bridge, right_bridge, bridge_extlen = GetLeftAndRightBridges(mappings, contig_parts, min_mapping_length)
     bridges = CreateBridges(left_bridge, right_bridge, min_distance_tolerance, rel_distance_tolerance)
     bridge_extlen = PrepareBridgeExtLen(bridge_extlen, bridges, repeats)
     bridges = FilterBridges(bridges, bridge_extlen, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, cov_probs, prob_factor, min_mapping_length, contig_parts, prematurity_threshold, pdf)
