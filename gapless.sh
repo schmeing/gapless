@@ -182,7 +182,7 @@ do
       env time -v -o pass${i}/timing/minimap2_consensus.txt minimap2 -t $threads -x $mm_map pass${i}/gapless_raw.fa "${org_path}/${reads}" > pass${i}/gapless_consensus.paf 2>pass${i}/logs/minimap2_consensus.log || rm -f pass${i}/gapless_consensus.paf
     fi
     env time -v -o pass${i}/timing/racon.txt racon -t $threads "${org_path}/${reads}" pass${i}/gapless_consensus.paf pass${i}/gapless_raw.fa > pass${i}/gapless.fa 2>pass${i}/logs/racon.log &&\
-    rm -f pass${i}/gapless_raw_polishing.paf pass${i}/gapless_raw.fa pass${i}/gapless_split.fa
+    rm -f pass${i}/gapless_raw_polishing.paf pass${i}/gapless_consensus.paf pass${i}/gapless_raw.fa pass${i}/gapless_split.fa
     if [ -f pass${i}/gapless_raw.fa ]; then
 		rm -f pass${i}/gapless.fa # In case of an error remove final output file to avoid going into the next round
     fi
