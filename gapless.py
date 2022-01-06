@@ -1750,7 +1750,7 @@ def InsertBridgesOnUniqueContigOverlapsWithoutConnections(bridges, repeats, spur
         if len(overlap_mappings):
             overlaps = overlaps[ (overlaps[['q_con','q_side','t_con']].rename(columns={'q_con':'conpart','q_side':'oside','t_con':'conn_part'}).merge(overlap_mappings[['conpart','oside','conn_part']].drop_duplicates(), on=['conpart','oside','conn_part'], how='left', indicator=True)['_merge'].values == "both") | # We have direct support
                                  (overlaps[['q_con','q_side']].rename(columns={'q_con':'conpart','q_side':'oside'}).merge(overlap_mappings[['conpart','oside']].drop_duplicates(), on=['conpart','oside'], how='left', indicator=True)['_merge'].values == "left_only") ].copy() # We have no contradictory evidence 
-            overlaps = overlaps.merge(overlaps[['q_con','q_start','q_end','t_con','t_start','t_end']].rename(columns={'q_con':'t_con','q_start':'t_start','q_end':'t_end','t_con':'q_con','t_start':'q_start','t_end':'q_end'}), on=['q_con','q_start','q_end','t_con','t_start','t_end'], how='inner')
+            overlaps = overlaps.merge(overlaps[['q_con','q_start','q_end','q_side','t_con','t_start','t_end','t_side']].rename(columns={'q_con':'t_con','q_start':'t_start','q_end':'t_end','q_side':'t_side','t_con':'q_con','t_start':'q_start','t_end':'q_end','t_side':'q_side'}), on=['q_con','q_start','q_end','q_side','t_con','t_start','t_end','t_side'], how='inner')
     # Add the valid overlaps to bridges
     overlap_bridges = overlaps.copy()
     if len(overlaps):
@@ -7740,10 +7740,10 @@ def ScaffoldContigs(contig_parts, bridges, mappings, cov_probs, repeats, prob_fa
 #
     # Combine contigs into scaffolds on unique bridges
     unique_bridges = bridges.loc[(bridges['to_alt'] == 1) & (bridges['from_alt'] == 1), ['from','from_side','to','to_side']]
-    scaffolds = scaffolds.merge(unique_bridges[unique_bridges['from_side']=='l'].drop(columns=['from_side']).rename(columns={'from':'scaffold', 'to':'lscaf', 'to_side':'lscaf_side'}), on=['scaffold'], how='left')
-    scaffolds = scaffolds.merge(unique_bridges[unique_bridges['from_side']=='r'].drop(columns=['from_side']).rename(columns={'from':'scaffold', 'to':'rscaf', 'to_side':'rscaf_side'}), on=['scaffold'], how='left')
-    scaffolds[['lscaf','rscaf']] = scaffolds[['lscaf','rscaf']].fillna(-1).astype(int)
-    scaffolds[['lscaf_side','rscaf_side']] = scaffolds[['lscaf_side','rscaf_side']].fillna('')
+    scaffolds['lscaf'] = scaffolds[['scaffold']].merge(unique_bridges.loc[unique_bridges['from_side']=='l', ['from','to']].rename(columns={'from':'scaffold'}), on='scaffold', how='left')['to'].fillna(-1).astype(int).values
+    scaffolds['lscaf_side'] = scaffolds[['scaffold']].merge(unique_bridges.loc[unique_bridges['from_side']=='l', ['from','to_side']].rename(columns={'from':'scaffold'}), on='scaffold', how='left')['to_side'].fillna('').values
+    scaffolds['rscaf'] = scaffolds[['scaffold']].merge(unique_bridges.loc[unique_bridges['from_side']=='r', ['from','to']].rename(columns={'from':'scaffold'}), on='scaffold', how='left')['to'].fillna(-1).astype(int).values
+    scaffolds['rscaf_side'] = scaffolds[['scaffold']].merge(unique_bridges.loc[unique_bridges['from_side']=='r', ['from','to_side']].rename(columns={'from':'scaffold'}), on='scaffold', how='left')['to_side'].fillna('').values
     scaffolds, scaffold_parts = ScaffoldAlongGivenConnections(scaffolds, scaffold_parts)
     scaffolds.drop(columns=['lscaf','lscaf_side','rscaf','rscaf_side'], inplace = True)
     scaffold_parts = AddDistaneInformation(scaffold_parts, bridges[(bridges['to_alt'] == 1) & (bridges['from_alt'] == 1)]) # Do not use unique_bridges, because we require 'mean_dist' column
