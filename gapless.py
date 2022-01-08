@@ -16,7 +16,7 @@ import pandas as pd
 from PIL import Image, ImageDraw, ImageFont
 import re
 from scipy.optimize import minimize
-from scipy.stats import poisson
+from scipy.stats import nbinom
 import seaborn as sns
 import sys
 from time import process_time
@@ -358,8 +358,8 @@ def GetBinnedCoverage(mappings, length_thresholds):
 
     return pd.concat(cov_counts, ignore_index=True)
 
-def CovChi2(par, df): #, expo
-    return np.sum((poisson.cdf(df['x'], par[0]) - df['y'])**2)
+def CovChi2(par, df):
+    return np.sum((nbinom.cdf(df['x'], par[0], par[1]) - df['y'])**2)
     
 def GetCoverageProbabilities(cov_counts, pdf):
     probs = cov_counts.groupby(['bin_size','count']).size().reset_index(name='nbins')
@@ -367,21 +367,27 @@ def GetCoverageProbabilities(cov_counts, pdf):
     cov_bins = probs.groupby(['bin_size'])['nbins'].agg(['sum','size']).reset_index()
     probs['nbin_sum'] = np.repeat( cov_bins['sum'].values, cov_bins['size'].values)
 
-    # Fit CDF with CDF of Poisson distribution
+    # Fit Negative Binomial CDF to coverage CDF
     probs['lower_half'] = (np.repeat( (cov_bins['sum']*0.5).values.astype(int), cov_bins['size'].values) > probs['nbin_cumsum']).shift(1, fill_value=True) # Shift so that we also get the bin that is only partially in the lower half (Ensures that we always have at least one bin)
     probs.loc[probs['bin_size'] != probs['bin_size'].shift(1), 'lower_half'] = True # The first bin must be True, but likely has been turned to False by the shift 
     prob_len = np.unique(probs['bin_size'])
-    prob_mu = []
+    prob_n = []
+    prob_p = []
     for bsize in prob_len:
-        selection = (bsize == probs['bin_size']) & probs['lower_half']
-        opt_par = minimize(CovChi2, [probs.loc[selection, 'count'].values[-1]], args=(pd.DataFrame({'x':probs.loc[selection, 'count'], 'y':probs.loc[selection, 'nbin_cumsum']/probs.loc[selection, 'nbin_sum']})), method='Nelder-Mead').x
-        prob_mu.append(opt_par[0])
+        sel_all = bsize == probs['bin_size']
+        selection = sel_all & probs['lower_half']
+        mean = np.sum(probs.loc[sel_all, 'count'] * probs.loc[sel_all, 'nbins'] / probs.loc[sel_all, 'nbin_sum'])
+        opt_par = minimize(CovChi2, [mean, 1/2], args=(pd.DataFrame({'x':probs.loc[selection, 'count'], 'y':probs.loc[selection, 'nbin_cumsum']/probs.loc[selection, 'nbin_sum']})), method='Nelder-Mead').x
+        prob_n.append(opt_par[0])
+        prob_p.append(opt_par[1])
         if pdf:
             x_values = np.arange(probs.loc[selection, 'count'].values[0], probs.loc[selection, 'count'].values[-1]+1)
-            PlotXY(pdf, "Max. Coverage", "% Bins (Size: {})".format(bsize), probs.loc[selection, 'count'], probs.loc[selection, 'nbin_cumsum']/probs.loc[selection, 'nbin_sum']*100, linex=x_values, liney=poisson.cdf(x_values,opt_par[0])*100)
+            selection2 = selection | (sel_all & (probs['nbin_cumsum'] < 0.95*probs['nbin_sum']))
+            PlotXY(pdf, "Coverage", "% Bins (Size: {})".format(bsize), probs.loc[selection2, 'count'], probs.loc[selection2, 'nbins']/probs.loc[selection2, 'nbin_sum']*100, linex=x_values, liney=nbinom.pmf(x_values,opt_par[0],opt_par[1])*100)
+            PlotXY(pdf, "Max. Coverage", "% Bins (Size: {})".format(bsize), probs.loc[selection2, 'count'], probs.loc[selection2, 'nbin_cumsum']/probs.loc[selection2, 'nbin_sum']*100, linex=x_values, liney=nbinom.cdf(x_values,opt_par[0],opt_par[1])*100)
 
     # Store results in DataFrame
-    cov_probs = pd.DataFrame({'length':prob_len, 'mu':prob_mu})
+    cov_probs = pd.DataFrame({'length':prob_len, 'n':prob_n, 'p':prob_p})
 
     return cov_probs
 
@@ -735,15 +741,16 @@ def GetPrematureStopProb(ntest, ncontrol, longer):
         p[sel] -= prob[sel]
     return np.where(longer == 0, 1.0, p)
 
-def PoisCDFCapped(x, mu):
-    return np.minimum(0.5, poisson.cdf(x, mu)) # Cap it at the mean so that repeats do not get a bonus
+def NbinomCDFCapped(x, n, p):
+    return np.minimum(0.5, nbinom.cdf(x, n, p)) # Cap it at the mean so that repeats do not get a bonus
 
 def GetConProb(cov_probs, req_length, counts):
-    probs = pd.DataFrame({'length':req_length, 'counts':counts, 'mu':0.0})
-    for plen, mu in zip(reversed(cov_probs['length']), reversed(cov_probs['mu'])):
-        probs.loc[plen >= probs['length'], 'mu'] = mu
+    probs = pd.DataFrame({'length':req_length, 'counts':counts, 'n':0.0, 'p':0.0})
+    for plen, n, p in zip(reversed(cov_probs['length']), reversed(cov_probs['n']), reversed(cov_probs['p'])):
+        probs.loc[plen >= probs['length'], 'n'] = n
+        probs.loc[plen >= probs['length'], 'p'] = p
 
-    return PoisCDFCapped(probs['counts'],probs['mu'])
+    return NbinomCDFCapped(probs['counts'],probs['n'],probs['p'])
 
 def CountAndApplyBreakVetos(break_points, mappings, pot_breaks, bp_ext_len, cov_probs, covered_regions, repeats, max_dist_contig_end, max_break_point_distance, min_mapping_length, min_num_reads, min_length_contig_break, prob_factor, merge_block_length, prematurity_threshold):
     unconnected_break_points = []
