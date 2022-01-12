@@ -1248,6 +1248,16 @@ def UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length, max_
 
     return mappings
 
+def AssignBinsForMerging(df, start_col, end_col, bin_size):
+    df['start_bin'] = df[start_col]//bin_size
+    df.reset_index(drop=True, inplace=True)
+    df = df.loc[np.repeat(df.index, df[end_col]//bin_size - df['start_bin'] + 1)].reset_index()
+    df['start_bin'] += df.groupby(df['index'], sort=False).cumcount()
+    df.drop(columns=['index'], inplace=True)
+    df.rename(columns={'start_bin':'bin'}, inplace=True)
+#
+    return df
+
 def AssignContigBins(contig_parts, used_parts, min_mapping_length):
     # Break contig_parts into coverage chunks of min_mapping_length
     polishing_bins = used_parts.copy()
@@ -1297,7 +1307,7 @@ def RemoveReadsByRankUntilPolishingCoverageIsReached(reads, pol_cov, rank, fid, 
 #
     return reads, pol_cov
 
-def SelectSingleContigReadsForPolishing(single_contig_reads, contig_parts, repeats, min_mapping_length, polishing_coverage):
+def SelectSingleContigReadsForPolishing(single_contig_reads, contig_parts, repeats, min_mapping_length, polishing_coverage, merge_block_length):
     if len(single_contig_reads):
         # Update single_contig_reads to contig_parts
         single_contig_reads = GetContigPartFromTargetID(single_contig_reads, contig_parts, min_mapping_length)
@@ -1312,25 +1322,29 @@ def SelectSingleContigReadsForPolishing(single_contig_reads, contig_parts, repea
         if len(repeats) == 0:
             rank['uniqueness'] = 1.0
         else:
+            # Prepare reps
             reps = repeats[['t_id','t_start','t_end']].copy()
             reps = GetContigPartFromTargetID(reps, contig_parts, 1)
             reps['con_from'] = np.maximum(reps['t_start'], reps['part_start'])
             reps['con_to'] = np.minimum(reps['t_end'], reps['part_end'])
             reps = reps[['conpart','con_from','con_to']].rename(columns={'con_from':'rep_from','con_to':'rep_to'})
-            reps.sort_values(['conpart','rep_from','rep_to'], inplace=True)
+            reps = reps.groupby(['conpart','rep_from']).max().reset_index() # Remove reps that are fully included in another repeat
             while True:
                 old_len = len(reps)
                 reps = reps[(reps['conpart'] != reps['conpart'].shift(1)) | (reps['rep_to'] > reps['rep_to'].shift(1))].copy() # Remove reps that are fully included in another repeat
                 if len(reps) == old_len:
                     break
-            uniqueness = uniqueness.merge(reps, on='conpart', how='inner')
-            uniqueness = uniqueness[ (uniqueness['con_start']  < uniqueness['rep_to']) & (uniqueness['con_end'] > uniqueness['rep_from']) ].copy()
+            reps = AssignBinsForMerging(reps, 'rep_from', 'rep_to', merge_block_length)
+            uniqueness = AssignBinsForMerging(uniqueness, 'con_start', 'con_end', merge_block_length)
+            # Calculate uniqueness
+            uniqueness = uniqueness.merge(reps, on=['conpart','bin'], how='inner').drop(columns='bin')
+            uniqueness = uniqueness[ (uniqueness['con_start']  < uniqueness['rep_to']) & (uniqueness['con_end'] > uniqueness['rep_from']) ].drop_duplicates()
             if len(uniqueness) == 0:
                 rank['uniqueness'] = 1.0
             else:
                 uniqueness['rep_from'] = np.maximum(uniqueness['rep_from'], uniqueness['con_start'])
                 uniqueness['rep_to'] = np.minimum(uniqueness['rep_to'], uniqueness['con_end'])
-                uniqueness['uniqueness'] = 1 - (uniqueness['rep_to'] - uniqueness['rep_from'])/(uniqueness['con_end'] - uniqueness['con_start'])
+                uniqueness['uniqueness'] = (uniqueness['con_end'] - uniqueness['con_start']) - (uniqueness['rep_to'] - uniqueness['rep_from'])
                 uniqueness = uniqueness.groupby('q_id')['uniqueness'].min().reset_index()
                 rank['uniqueness'] = rank[['q_id']].merge(uniqueness, on='q_id', how='left')['uniqueness'].fillna(1.0).values
         rank.sort_values(['mapq','uniqueness','len','matches'], ascending=[False,False,False,False], inplace=True)
@@ -9009,7 +9023,7 @@ def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     contig_parts, contigs = GetContigParts(contigs, break_groups, repeat_removal, covered_regions, remove_short_contigs, remove_zero_hit_contigs, min_mapping_length, alignment_precision, pdf)
     result_info = GetBreakAndRemovalInfo(result_info, contigs, contig_parts)
     mappings = UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length, max_dist_contig_end, min_extension)
-    single_contig_reads = SelectSingleContigReadsForPolishing(single_contig_reads, contig_parts, repeats, min_mapping_length, polishing_coverage)
+    single_contig_reads = SelectSingleContigReadsForPolishing(single_contig_reads, contig_parts, repeats, min_mapping_length, polishing_coverage, merge_block_length)
     repeats = FindDuplicatedContigPartEnds(repeats, contig_parts, max_dist_contig_end, proportion_duplicated)
     del break_groups, repeat_removal, contigs, contig_ids
 #
