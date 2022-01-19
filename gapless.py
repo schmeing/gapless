@@ -8949,7 +8949,7 @@ def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     max_dist_contig_end = 500
     max_break_point_distance = 200
     merge_block_length = 10000
-    prematurity_threshold = 0.05
+    prematurity_threshold = 0.001
 #
     min_num_reads = 2
     borderline_removal = False
