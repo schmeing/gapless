@@ -1634,7 +1634,7 @@ def CheckBridgeConsistency(bridges):
 def PrintBridgeFilter(mappings, bridges, bridge_extlen, borderline_removal, min_factor_alternatives, org_scaffold_trust, cov_probs, min_mapping_length, contig_parts, min_distance_tolerance, rel_distance_tolerance):
     # Test multiple filter combinations
     filtered_bridges = []
-    for min_num_reads in [0,1,2,3,4,5,10,20,30,50]:
+    for min_num_reads in [1,2,3,4,5,10,20,30,50]:
         for prematurity_threshold in [0.0,1e-5,1e-4,1e-3,5e-3,0.01,0.02,0.05,0.1,0.2,0.5]:
             for prob_factor in [2,3,5,10,20,30,50,1e50]:
                 print(min_num_reads, prematurity_threshold, prob_factor)
@@ -1645,16 +1645,6 @@ def PrintBridgeFilter(mappings, bridges, bridge_extlen, borderline_removal, min_
                 cur_bridges['fprem'] = prematurity_threshold
                 cur_bridges['frel'] = prob_factor
                 filtered_bridges.append(cur_bridges)
-                
-    i = 0
-    for min_num_reads in [0,1,2,3,4,5,10,20,30,50]:
-        for prematurity_threshold in [0.0,1e-5,1e-4,1e-3,5e-3,0.01,0.02,0.05,0.1,0.2,0.5]:
-            for prob_factor in [2,3,5,10,20,30,50,1e50]:
-                filtered_bridges[i] = filtered_bridges[i][['from','from_side','to','to_side','mean_dist']].copy()
-                filtered_bridges[i]['fabs'] = min_num_reads
-                filtered_bridges[i]['fprem'] = prematurity_threshold
-                filtered_bridges[i]['frel'] = prob_factor
-                i += 1
                 
     filtered_bridges = pd.concat(filtered_bridges, ignore_index=True)
     filtered_bridges.to_csv("filtered_bridges.csv", index=False)
