@@ -7384,11 +7384,21 @@ def AssignNewPhases(scaffold_paths, phase_change_in, ploidy):
 #
     return scaffold_paths
 
-def AssignDeletionsToFollowingPhase(scaffold_paths, ploidy):
+def AssignDeletionsToNeighbouringPhase(scaffold_paths, ploidy):
+    # Select which neighbour to chose based on the haplotype without deletions
+    scaffold_paths['phase_dir'] = np.where(scaffold_paths['pid'] == scaffold_paths['pid'].shift(-1), np.where(scaffold_paths['pos'] == 0, 1, 0), -1)
+    for h in range(ploidy):
+        scaffold_paths['deletion'] = np.where(scaffold_paths[f'phase{h}'] > 0, scaffold_paths[f'scaf{h}'], scaffold_paths['scaf0']) < 0
+        scaffold_paths.loc[(scaffold_paths['phase_dir'] == 0) & (scaffold_paths['deletion'] == False) & (scaffold_paths['deletion'].shift(-1) == False) &
+                           (np.abs(scaffold_paths[f'phase{h}']) == np.abs(scaffold_paths[f'phase{h}'].shift(-1)) ), 'phase_dir'] = 1
+        scaffold_paths.loc[(scaffold_paths['phase_dir'] == 0) & (scaffold_paths['deletion'] == False) & (scaffold_paths['deletion'].shift(1) == False) &
+                           (np.abs(scaffold_paths[f'phase{h}']) == np.abs(scaffold_paths[f'phase{h}'].shift(1)) ), 'phase_dir'] = -1
+    scaffold_paths.loc[scaffold_paths['phase_dir'] == 0, 'phase_dir'] = 1
+    # Assign new phases
     for h in range(ploidy):
         scaffold_paths['deletion'] = np.where(scaffold_paths[f'phase{h}'] > 0, scaffold_paths[f'scaf{h}'], scaffold_paths['scaf0']) < 0
         while True:
-            scaffold_paths['new_phase'] = np.where(scaffold_paths['deletion'], np.where(scaffold_paths['pid'] == scaffold_paths['pid'].shift(-1), np.sign(scaffold_paths[f'phase{h}'])*np.abs(scaffold_paths[f'phase{h}'].shift(-1, fill_value=0)), 0), scaffold_paths[f'phase{h}'])
+            scaffold_paths['new_phase'] = np.where(scaffold_paths['deletion'], np.where(scaffold_paths['phase_dir'] == 1, np.sign(scaffold_paths[f'phase{h}'])*np.abs(scaffold_paths[f'phase{h}'].shift(-1, fill_value=0)), 0), scaffold_paths[f'phase{h}'])
             if np.sum(scaffold_paths['new_phase'] != scaffold_paths[f'phase{h}']) == 0:
                 break
             else:
@@ -7405,7 +7415,7 @@ def AssignDeletionsToFollowingPhase(scaffold_paths, ploidy):
         # We introduced zero phases, where the deletions were at the path end, now we have to assign the previous phase to them
         while np.sum(scaffold_paths[f'phase{h}'] == 0):
             scaffold_paths[f'phase{h}'] = np.where(scaffold_paths[f'phase{h}'] == 0, np.where((h > 0) & (scaffold_paths['scaf0'] < 0), -1, 1)*np.abs(scaffold_paths[f'phase{h}'].shift(1, fill_value=0)), scaffold_paths[f'phase{h}'])
-    scaffold_paths.drop(columns=['deletion','new_phase'], inplace=True)
+    scaffold_paths.drop(columns=['deletion','new_phase','phase_dir'], inplace=True)
 #
     return scaffold_paths
 
@@ -7446,7 +7456,7 @@ def PhaseScaffoldsWithScafBridges(scaffold_paths, scaf_bridges, ploidy):
     test_bridges = test_bridges.loc[(test_bridges['from_alts'] == 1) & (test_bridges['to_alts'] == 1) & (test_bridges['from_hap'] == test_bridges['to_hap']), ['from_phase','to_phase']].copy()
     scaffold_paths = AssignNewPhases(scaffold_paths, test_bridges, ploidy)
     # Handle deletions by assigning them to the following phase (or the previous if they are at the end of the paths)
-    scaffold_paths = AssignDeletionsToFollowingPhase(scaffold_paths, ploidy)
+    scaffold_paths = AssignDeletionsToNeighbouringPhase(scaffold_paths, ploidy)
 #
     return scaffold_paths
 
@@ -7622,8 +7632,7 @@ def PhaseScaffolds(scaffold_paths, graph_ext, scaf_bridges, ploidy):
 
 def ExpandScaffoldsWithContigs(scaffold_paths, scaffolds, scaffold_parts, ploidy):
     for h in range(0,ploidy):
-        scaffold_paths = scaffold_paths.merge(scaffolds[['scaffold','size']].rename(columns={'scaffold':f'scaf{h}','size':f'size{h}'}), on=[f'scaf{h}'], how='left')
-        scaffold_paths[f'size{h}'] = scaffold_paths[f'size{h}'].fillna(0).astype(int)
+        scaffold_paths[f'size{h}'] = scaffold_paths[[f'scaf{h}']].merge(scaffolds[['scaffold','size']].rename(columns={'scaffold':f'scaf{h}','size':f'size{h}'}), on=[f'scaf{h}'], how='left')[f'size{h}'].fillna(0).astype(int)
         
     scaffold_paths = scaffold_paths.loc[np.repeat(scaffold_paths.index.values, scaffold_paths[[f'size{h}' for h in range(ploidy)]].max(axis=1).values)]
     scaffold_paths['spos'] = scaffold_paths.groupby(['pid','pos'], sort=False).cumcount()
@@ -7733,7 +7742,7 @@ def OrderByUnbrokenOriginalScaffolds(scaffold_paths, contig_parts, ploidy):
     col_rename = {**{'scaf':'pid'}, **{f'con{h}':f'scaf{h}' for h in range(ploidy)}}
     scaffold_paths = ReverseScaffolds(scaffold_paths.rename(columns=col_rename), scaffold_paths['reverse'], ploidy)
     scaffold_paths.drop(columns=['reverse','new_scaf'], inplace=True)
-    scaffold_paths = AssignDeletionsToFollowingPhase(scaffold_paths, ploidy).rename(columns={v: k for k, v in col_rename.items()})
+    scaffold_paths = AssignDeletionsToNeighbouringPhase(scaffold_paths, ploidy).rename(columns={v: k for k, v in col_rename.items()})
 
     # Set org_dist_left/right based on scaffold (not the contig anymore)
     org_cons = GetOriginalConnections(scaffold_paths, contig_parts, ploidy)
