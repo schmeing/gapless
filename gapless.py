@@ -1055,7 +1055,7 @@ def FindBreakPoints(mappings, contigs, covered_regions, repeats, max_dist_contig
 
     return break_groups, repeat_removal, spurious_break_indexes, non_informative_mappings, unconnected_break_points
 
-def GetContigParts(contigs, break_groups, repeat_removal, covered_regions, remove_short_contigs, remove_zero_hit_contigs, min_mapping_length, alignment_precision, pdf):
+def GetContigParts(contigs, break_groups, repeat_removal, covered_regions, remove_short_contigs, trim_contigs, min_mapping_length, alignment_precision, pdf):
     # Create a dataframe with the contigs being split into parts and contigs scheduled for removal not included
     if 0 == len(break_groups):
         # We do not have break points, so we don't need to split
@@ -1082,7 +1082,7 @@ def GetContigParts(contigs, break_groups, repeat_removal, covered_regions, remov
         contig_parts = contig_parts[contig_parts.merge(repeat_removal.rename(columns={'contig_id':'contig'}), on=['contig','start','end'], how='left', indicator=True)['_merge'] != "both"].copy()
 
     # Trim unmapped part on ends of contig_parts
-    if remove_zero_hit_contigs:
+    if trim_contigs:
         cov_reg = contig_parts[['contig','part','start']].merge(covered_regions.rename(columns={'con_id':'contig'}), on='contig', how='left')
         cov_reg = cov_reg[cov_reg['to'] > cov_reg['start'] + (min_mapping_length if remove_short_contigs else 0)].copy()
         cov_reg = cov_reg.groupby(['contig','part'])['from'].min().reset_index()
@@ -1780,7 +1780,29 @@ def InsertBridgesOnUniqueContigOverlapsWithoutConnections(bridges, repeats, spur
     
     return bridges, overlap_bridges
 
+def VerifyScaffoldParts(scaffold_parts, org_check):
+    obs_conns = scaffold_parts.rename(columns={'conpart':'from'})
+    obs_conns['from_side'] = np.where(obs_conns['reverse'], 'l', 'r')
+    obs_conns['to'] = obs_conns['from'].shift(-1, fill_value=-1)
+    obs_conns['to_side'] = np.where(obs_conns['reverse'].shift(-1, fill_value=False), 'r', 'l')
+    obs_conns = obs_conns[obs_conns['scaffold'] == obs_conns['scaffold'].shift(-1)].drop(columns=['scaffold','pos','reverse'])
+    
+    obs_conns = obs_conns.merge(org_check[['from','from_side','to','to_side']], on=['from','from_side','to','to_side'], how='left', indicator=True)
+    obs_conns = obs_conns[obs_conns['_merge'] != "both"].drop(columns='_merge')
+    if len(obs_conns):
+        print(obs_conns)
+        raise RuntimeError("Scaffold parts contain invalid bridges.")
+
 def ScaffoldAlongGivenConnections(scaffolds, scaffold_parts):
+    # First we store the original connections that should be used to be able to later verify that we did not do errors
+    org_check = pd.concat([scaffolds[['left','lside','lscaf','lscaf_side']].rename(columns={'left':'from','lside':'from_side','lscaf':'to','lscaf_side':'to_side'}),
+                           scaffolds[['right','rside','rscaf','rscaf_side']].rename(columns={'right':'from','rside':'from_side','rscaf':'to','rscaf_side':'to_side'})], ignore_index=True)
+    org_check = org_check[org_check['to'] >= 0].copy()
+    # Now we check if the object is even consistent
+    org_check['mean_dist'] = 0
+    CheckBridgeConsistency(org_check)
+    org_check.drop(columns=['mean_dist'], inplace=True)
+    
     # Handle right-right scaffold connections (keep scaffold with lower id and reverse+add the other one): We can only create new r-r or r-l connections
     keep = scaffolds.loc[(scaffolds['rscaf_side'] == 'r') & (scaffolds['scaffold'] < scaffolds['rscaf']), 'scaffold'].values
     while len(keep):
@@ -1812,6 +1834,9 @@ def ScaffoldAlongGivenConnections(scaffolds, scaffold_parts):
         scaffolds.index = scaffolds['scaffold'].values # Make sure we can access scaffolds with .loc[scaffold]
         # Prepare next round
         keep = scaffolds.loc[(scaffolds['rscaf_side'] == 'r') & (scaffolds['scaffold'] < scaffolds['rscaf']), 'scaffold'].values
+    
+    scaffold_parts.sort_values(['scaffold','pos'], inplace=True)
+    VerifyScaffoldParts(scaffold_parts, org_check)
 
     # Handle left-left scaffold connections (keep scaffold with lower id and reverse+add the other one): We can only create new l-l or l-r connections
     keep = scaffolds.loc[(scaffolds['lscaf_side'] == 'l') & (scaffolds['scaffold'] < scaffolds['lscaf']), 'scaffold'].values
@@ -1823,6 +1848,7 @@ def ScaffoldAlongGivenConnections(scaffolds, scaffold_parts):
         scaffold_parts.loc[absorbed, 'pos'] = scaffold_parts.loc[absorbed, 'pos']*-1 - 1
         scaffold_parts.sort_values(['scaffold','pos'], inplace=True)
         scaffold_parts['pos'] = scaffold_parts.groupby(['scaffold'], sort=False).cumcount() # Shift positions so that we don't have negative numbers anymore
+        scaffold_parts = scaffold_parts.copy() # This prevents pandas from messing up the commands before in version 1.4.2
         # Update scaffolds
         absorbed = scaffolds.loc[keep, 'lscaf'].values
         scaffolds.loc[keep, 'left'] = scaffolds.loc[absorbed, 'right'].values
@@ -1845,6 +1871,8 @@ def ScaffoldAlongGivenConnections(scaffolds, scaffold_parts):
         scaffolds.index = scaffolds['scaffold'].values # Make sure we can access scaffolds with .loc[scaffold]
         # Prepare next round
         keep = scaffolds.loc[(scaffolds['lscaf_side'] == 'l') & (scaffolds['scaffold'] < scaffolds['lscaf']), 'scaffold'].values
+    
+    VerifyScaffoldParts(scaffold_parts, org_check)
 
     # Remove simple ciruclarities
     circular_scaffolds = scaffolds['scaffold'] == scaffolds['lscaf']
@@ -1915,6 +1943,9 @@ def ScaffoldAlongGivenConnections(scaffolds, scaffold_parts):
         scaffolds.drop(columns=['new_scaf'], inplace=True)
         scaffolds.index = scaffolds['scaffold'].values # Make sure we can access scaffolds with .loc[scaffold]
 
+    scaffold_parts.sort_values(['scaffold','pos'], inplace=True)
+    VerifyScaffoldParts(scaffold_parts, org_check)
+
     return scaffolds, scaffold_parts
 
 def AddDistaneInformation(scaffold_parts, unique_bridges):
@@ -1983,6 +2014,19 @@ def GetConnectionFromTo(long_range_connections):
     long_range_connections['to_side'] = np.where(long_range_connections['strand'] == '+', 'l', 'r')
 
     return long_range_connections
+
+def CheckLongRangeConnectionsForValidBridges(long_range_connections, bridges, contig_col):
+    if len(long_range_connections):
+        expected_bridges = long_range_connections[['conn_id',contig_col,'strand','next_dist']].rename(columns={contig_col:'from','strand':'from_side','next_dist':'mean_dist'})
+        expected_bridges['from_side'] = np.where(expected_bridges['from_side'] == '+', 'r', 'l')
+        expected_bridges['to'] = expected_bridges['from'].shift(-1, fill_value=-1)
+        expected_bridges['to_side'] = np.where(expected_bridges['from_side'].shift(-1, fill_value=-1) == 'l', 'r', 'l')
+        expected_bridges = expected_bridges[expected_bridges['conn_id'] == expected_bridges['conn_id'].shift(-1)].copy()
+        expected_bridges = expected_bridges.merge(bridges[['from','from_side','to','to_side','mean_dist']], on=['from','from_side','to','to_side','mean_dist'], how='left', indicator=True)
+        expected_bridges = expected_bridges[expected_bridges['_merge'] != "both"].drop(columns='_merge')
+        if len(expected_bridges):
+            print(expected_bridges)
+            raise RuntimeError("Long range connections contain invalid bridges.")
 
 def GetLongRangeConnections(bridges, mappings, contig_parts, max_dist_contig_end):
     # Get long_range_mappings that include a bridge that has alternatives
@@ -2096,9 +2140,11 @@ def GetLongRangeConnections(bridges, mappings, contig_parts, max_dist_contig_end
         rem = long_range_connections.loc[long_range_connections['reverse'] & (long_range_connections['pos'] == 0) & (long_range_connections['conn_code'] == long_range_connections['conn_code'].shift(1)), 'conn_id'].values
         long_range_connections = long_range_connections[np.isin(long_range_connections['conn_id'], rem) == False].drop(columns=['reverse'])
 #
+        CheckLongRangeConnectionsForValidBridges(long_range_connections, bridges, 'conpart')
+#
     return long_range_connections
 
-def TransformContigConnectionsToScaffoldConnections(long_range_connections, scaffold_parts):
+def TransformContigConnectionsToScaffoldConnections(long_range_connections, scaffold_parts, scaf_bridges):
     if len(long_range_connections):
         long_range_connections[['scaffold','scaf_pos','reverse']] = scaffold_parts.loc[long_range_connections['conpart'].values,['scaffold','pos','reverse']].values
         # Reverse strand of contigs that are reversed in the scaffold to get the scaffold strand
@@ -2113,6 +2159,8 @@ def TransformContigConnectionsToScaffoldConnections(long_range_connections, scaf
         long_range_connections['size'] = np.repeat(con_size['size'].values, con_size['size'].values)
         long_range_connections = long_range_connections[long_range_connections['size'] > 2].copy()
         long_range_connections['pos'] = long_range_connections.groupby(['conn_id'], sort=False).cumcount()
+        
+        CheckLongRangeConnectionsForValidBridges(long_range_connections, scaf_bridges, 'scaffold')
 
     return long_range_connections
 
@@ -2329,6 +2377,17 @@ def CheckScaffoldGraphConsistency(scaffold_graph):
             print(inconsistencies)
             raise RuntimeError("Scaffold graph is inconsistent: Not all intermediate starting points are present.")
 
+def CheckScaffoldGraphBridgeValidity(scaffold_graph, scaf_bridges):
+    if len(scaffold_graph):
+        expected_bridges = scaffold_graph[['from','from_side','scaf1','strand1','dist1']].drop_duplicates()
+        expected_bridges.rename(columns={'scaf1':'to','strand1':'to_side','dist1':'mean_dist'}, inplace=True)
+        expected_bridges['to_side'] = np.where(expected_bridges['to_side'] == '+', 'l', 'r')
+        expected_bridges = expected_bridges.merge(scaf_bridges[['from','from_side','to','to_side','mean_dist']], on=['from','from_side','to','to_side','mean_dist'], how='left', indicator=True)
+        expected_bridges = expected_bridges[expected_bridges['_merge'] != "both"].drop(columns='_merge')
+        if len(expected_bridges):
+            print(expected_bridges)
+            raise RuntimeError("Scaffold graph contains invalid bridges.")
+
 def BuildScaffoldGraph(long_range_connections, scaf_bridges):
     # First start from every contig and extend in both directions on valid reads
     if len(long_range_connections):
@@ -2361,6 +2420,7 @@ def BuildScaffoldGraph(long_range_connections, scaf_bridges):
         # Remove redundant entries
         scaffold_graph = RemoveRedundantEntriesInScaffoldGraph(scaffold_graph)
         CheckScaffoldGraphConsistency(scaffold_graph)
+        CheckScaffoldGraphBridgeValidity(scaffold_graph, scaf_bridges)
 
     return scaffold_graph
 
@@ -7773,7 +7833,7 @@ def ScaffoldContigs(contig_parts, bridges, mappings, cov_probs, repeats, prob_fa
 #
     # Build scaffold graph to find unique bridges over scaffolds with alternative connections
     long_range_connections = GetLongRangeConnections(bridges, mappings, contig_parts, max_dist_contig_end)
-    long_range_connections = TransformContigConnectionsToScaffoldConnections(long_range_connections, scaffold_parts)
+    long_range_connections = TransformContigConnectionsToScaffoldConnections(long_range_connections, scaffold_parts, scaf_bridges)
     long_range_connections, long_range_extlen = SummarizeLongRangeConnections(long_range_connections)
     long_range_connections, long_range_extlen = FilterLongRangeConnections(long_range_connections, long_range_extlen, scaffold_parts, contig_parts, repeats, cov_probs, prob_factor, min_mapping_length, prematurity_threshold)
     scaffold_graph = BuildScaffoldGraph(long_range_connections, scaf_bridges)
@@ -8955,6 +9015,7 @@ def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
 #
     remove_zero_hit_contigs = True
     remove_short_contigs = True
+    trim_contigs = True
     min_extension = 500
     max_dist_contig_end = 500
     max_break_point_distance = 200
@@ -9020,7 +9081,7 @@ def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     mappings.drop(np.concatenate([np.unique(spurious_break_indexes['map_index'].values), non_informative_mappings]), inplace=True) # Remove not-accepted breaks from mappings and mappings that do not contain any information (mappings inside of contigs that do not overlap with breaks)
     del spurious_break_indexes, non_informative_mappings
 #
-    contig_parts, contigs = GetContigParts(contigs, break_groups, repeat_removal, covered_regions, remove_short_contigs, remove_zero_hit_contigs, min_mapping_length, alignment_precision, pdf)
+    contig_parts, contigs = GetContigParts(contigs, break_groups, repeat_removal, covered_regions, remove_short_contigs, trim_contigs, min_mapping_length, alignment_precision, pdf)
     result_info = GetBreakAndRemovalInfo(result_info, contigs, contig_parts)
     mappings = UpdateMappingsToContigParts(mappings, contig_parts, min_mapping_length, max_dist_contig_end, min_extension)
     single_contig_reads = SelectSingleContigReadsForPolishing(single_contig_reads, contig_parts, repeats, min_mapping_length, polishing_coverage, merge_block_length)
