@@ -9332,6 +9332,7 @@ def ExtendScaffolds(scaffold_paths, polishing_reads, extensions, hap_merger, new
     extension_info['count'] = 0
     extension_info['new'] = 0
 
+    gap_scaffolds = []
     if len(extensions) and len(mappings):
         # Create table on how long mappings agree in the gap with at least min_num_reads-1 (-1 because they always agree with themselves)
         len_agree = extensions[['scaf','side','hap','q_index','q_agree']].sort_values(['scaf','side','hap','q_index','q_agree'], ascending=[True,True,True,True,False])
