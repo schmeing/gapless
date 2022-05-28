@@ -14,7 +14,15 @@ Combined scaffolding, gap-closing and assembly correction with long reads
 - [Publication](#publication)
 
 ## <a name="abstract"></a>Abstract
-Coming soon ...
+Continuity, correctness and completeness of genome assemblies are important for
+many biological projects. Long reads represent a major driver towards delivering
+high-quality genomes, but not everybody can achieve the necessary coverage for good
+long-read-only assemblies. Therefore, improving existing assemblies with low-coverage
+long reads is a promising alternative. The improvements include correction, scaffold-
+ing and gap filling. However, most tools perform only one of these tasks and the
+useful information of reads that supported the scaffolding is lost when running sepa-
+rate programs successively. Therefore, we propose a new tool for combined execution
+of all three tasks using PacBio or Oxford Nanopore reads.
 
 ## <a name="requirements"></a>Requirements
 
