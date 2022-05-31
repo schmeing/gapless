@@ -169,7 +169,9 @@ do
     fi
     # Finish
     if [ ! -f pass${i}/gapless_raw.fa ] || [ $reset = true ]; then
-      env time -v -o pass${i}/timing/gapless_finish.txt gapless.py finish -o pass${i}/gapless_raw.fa -H 0 -s pass${i}/gapless_extended_scaffold_paths.csv -p pass${i}/gapless_extended_polishing.csv pass${i}/gapless_split.fa <(seqtk subseq "${org_path}/${reads}" pass${i}/gapless_used_reads.lst) >pass${i}/logs/gapless_finish.log 2>&1 || rm -f pass${i}/gapless_raw.fa
+      format="${reads%%.gz}"
+      format="${format##*.}"
+      env time -v -o pass${i}/timing/gapless_finish.txt gapless.py finish -o pass${i}/gapless_raw.fa -H 0 --format "$format" -s pass${i}/gapless_extended_scaffold_paths.csv -p pass${i}/gapless_extended_polishing.csv pass${i}/gapless_split.fa <(seqtk subseq "${org_path}/${reads}" pass${i}/gapless_used_reads.lst) >pass${i}/logs/gapless_finish.log 2>&1 || rm -f pass${i}/gapless_raw.fa
       if [ ! -f pass${i}/gapless_raw.fa ]; then
         echo "pipeline crashed: finish"
         exit 1
