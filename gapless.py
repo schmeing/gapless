@@ -9790,6 +9790,7 @@ def GaplessFinish(assembly_file, read_file, read_format, scaffold_file, polishin
             pol_reads = polishing_reads[(polishing_reads['hap'] == -1) | (polishing_reads['hap'] == hap)].drop(columns='hap')
         # Remove scaffolds that are shorter than min_length
         outpaths = outpaths.loc[outpaths['name'] != '', ['meta','scaf','pos','type','name','start','end','strand','sdist_right']].copy()
+        outpaths[['start','end']] = outpaths[['start','end']].astype(int)
         outpaths['length'] = outpaths['end'] - outpaths['start']
         scaf_len = outpaths.groupby(['scaf'])['length'].agg(['sum','size'])
         outpaths = outpaths[np.repeat(scaf_len['sum'].values >= min_length, scaf_len['size'].values)].copy()
