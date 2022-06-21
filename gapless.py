@@ -7692,8 +7692,8 @@ def PhaseScaffolds(scaffold_paths, graph_ext, scaf_bridges, ploidy):
 
 def ExpandScaffoldsWithContigs(scaffold_paths, scaffolds, scaffold_parts, ploidy):
     for h in range(0,ploidy):
-        scaffold_paths[f'size{h}'] = scaffold_paths[[f'scaf{h}']].merge(scaffolds[['scaffold','size']].rename(columns={'scaffold':f'scaf{h}','size':f'size{h}'}), on=[f'scaf{h}'], how='left')[f'size{h}'].fillna(0).astype(int)
-        
+        scaffold_paths[f'size{h}'] = scaffold_paths[[f'scaf{h}']].merge(scaffolds[['scaffold','size']].rename(columns={'scaffold':f'scaf{h}','size':f'size{h}'}), on=[f'scaf{h}'], how='left')[f'size{h}'].fillna(0).astype(int).values
+
     scaffold_paths = scaffold_paths.loc[np.repeat(scaffold_paths.index.values, scaffold_paths[[f'size{h}' for h in range(ploidy)]].max(axis=1).values)]
     scaffold_paths['spos'] = scaffold_paths.groupby(['pid','pos'], sort=False).cumcount()
     for h in range(ploidy-1,-1,-1): # We need to go in the opposite direction, because we need the main to handle the alternatives
