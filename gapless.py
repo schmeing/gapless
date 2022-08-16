@@ -2915,8 +2915,9 @@ def FindValidExtensionsInScaffoldGraph(scaffold_graph):
             nbranches = nbranches[nbranches['nbranches'] > 1].copy()
             # Prepare next round
             s += 1
-        branch_points = pd.concat(branch_points, ignore_index=True)
-        branch_points.sort_values(['oindex','pos'], ascending=[True,False], inplace=True)
+        if len(branch_points):
+            branch_points = pd.concat(branch_points, ignore_index=True)
+            branch_points.sort_values(['oindex','pos'], ascending=[True,False], inplace=True)
         # Get all the valid extensions for a given origin possible origin-extension-pairs and count how long they match
         pairs = origins[['scaf0','strand0']].reset_index().rename(columns={'index':'oindex'}).merge(extensions[['scaf0','strand0']].reset_index().rename(columns={'index':'eindex'}), on=['scaf0','strand0'], how='inner').drop(columns=['scaf0','strand0'])
         pairs[['scaf1','strand1','dist1']] = extensions.loc[pairs['eindex'].values, ['scaf1','strand1','dist1']].values
