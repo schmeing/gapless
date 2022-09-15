@@ -12998,8 +12998,8 @@ def GaplessTest():
 
 def Version():
     print("Program: gapless")
-    print("Version: 0.3")
-    print("Contact: Stephan Schmeing <stephan.schmeing@uzh.ch>")
+    print("Version: 0.4")
+    print("Contact: https://github.com/schmeing/gapless")
 
 def Usage(module=""):
     if "" == module:
