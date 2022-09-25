@@ -105,6 +105,12 @@ case "$type" in
     exit 1
     ;;
   esac
+  
+if [ ! -z ${2+x} ]; then
+  echo "Options after the read file specification are ignored. Please, add them before."
+  echo "First ignored option: \"$2\""
+  exit 1
+fi
 
 # Turn into absolute paths
 asm=$(python -c "import os,sys; print(os.path.abspath(sys.argv[1]))" "$asm")
