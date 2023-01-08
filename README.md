@@ -65,8 +65,18 @@ ln -s /where/you/downloaded/gapless/gapless.sh /where/you/want/to/have/gapless/g
 ```
 
 ## <a name="conda"></a>Bioconda
-In the future gapless can also be downloaded with all requirements in an automatic fashion via anaconda/miniconda(https://docs.conda.io/projects/continuumio-conda/en/latest/user-guide/install/index.html).
+Gapless can also be downloaded with all python requirements in an automatic fashion via anaconda/miniconda(https://docs.conda.io/projects/continuumio-conda/en/latest/user-guide/install/index.html).
 However, updates will not be as frequent and the option to switch to the devel branch to get the most recent bugfixes is missing.
+
+```
+conda install -c bioconda gapless
+```
+
+To add the additional software used in gapless.sh from conda use:
+
+```
+conda install -c bioconda minimap2 racon seqtk
+```
 
 ## <a name="quickstart"></a>Quick start examples
 The pipeline can be run with one of the following three commands depending on the type of long reads:
