@@ -69,13 +69,13 @@ Gapless can also be downloaded with all python requirements in an automatic fash
 However, updates will not be as frequent and the option to switch to the devel branch to get the most recent bugfixes is missing.
 
 ```
-conda install -c bioconda
+conda install -c bioconda gapless
 ```
 
 To add the additional software used in gapless.sh from conda use:
 
 ```
-conda install -c minimap2 racon seqtk
+conda install -c bioconda minimap2 racon seqtk
 ```
 
 ## <a name="quickstart"></a>Quick start examples
