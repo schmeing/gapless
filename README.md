@@ -136,6 +136,7 @@ racon -t {threads} {input_reads} gapless_consensus.paf gapless_raw.fa > gapless.
 | `--minLenBreak`    | 600                     | Minimum length for a read to diverge from a contig to consider a contig break |
 | `--minMapLength`   | 400                     | Minimum length of individual mappings of reads |
 | `--minMapQ`        | 20                      | Minimum mapping quality of reads |
+| `--largeGenome`    |                         | Increases int size to handle scaffolds longer than ~ 2147 million bases |
 
 `gapless.py extend -p {prefix} {all_vs_all}.paf`
 
