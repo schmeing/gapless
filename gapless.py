@@ -213,8 +213,17 @@ def GetInputInfo(result_info, contigs):
 
     return result_info
 
-def ReadPaf(file_name):
-    return pd.read_csv(file_name, sep='\t', header=None, usecols=range(12), names=['q_name','q_len','q_start','q_end','strand','t_name','t_len','t_start','t_end','matches','alignment_length','mapq'], dtype={'q_name':object, 'q_len':np.int32, 'q_start':np.int32, 'q_end':np.int32, 'strand':str, 't_name':object, 't_len':np.int32, 't_start':np.int32, 't_end':np.int32, 'matches':np.int32, 'alignment_length':np.int32, 'mapq':np.int16})
+def ReadPaf(file_name, large_reads, large_contigs):
+    read_int = np.int32
+    if large_reads:
+        read_int = int
+    contig_int = np.int32
+    if large_contigs:
+        contig_int = int
+    match_int = np.int32
+    if large_reads and large_contigs:
+        match_int = int
+    return pd.read_csv(file_name, sep='\t', header=None, usecols=range(12), names=['q_name','q_len','q_start','q_end','strand','t_name','t_len','t_start','t_end','matches','alignment_length','mapq'], dtype={'q_name':object, 'q_len':read_int, 'q_start':read_int, 'q_end':read_int, 'strand':str, 't_name':object, 't_len':contig_int, 't_start':contig_int, 't_end':contig_int, 'matches':match_int, 'alignment_length':match_int, 'mapq':np.int16})
 
 def stackhist(x, y, **kws):
     grouped = pd.groupby(x, y)
@@ -308,8 +317,8 @@ def PlotXY(pdf, xtitle, ytitle, x, y, category=[], count=[], logx=False, linex=[
 
     return
 
-def LoadRepeats(repeat_file, contig_ids):
-    repeats = ReadPaf(repeat_file)
+def LoadRepeats(repeat_file, contig_ids, large_contigs):
+    repeats = ReadPaf(repeat_file, large_contigs, large_contigs)
     repeats.drop(columns=['matches','alignment_length','mapq'], inplace=True)
     repeats['q_name'] = itemgetter(*repeats['q_name'])(contig_ids)
     repeats['t_name'] = itemgetter(*repeats['t_name'])(contig_ids)
@@ -411,8 +420,8 @@ def GetBestSubreads(mappings, read_names, alignment_precision):
     
     return mappings
 
-def ReadMappings(mapping_file, contig_ids, min_mapq, min_mapping_length, keep_all_subreads, alignment_precision, num_read_len_groups, pdf):
-    mappings = ReadPaf(mapping_file)
+def ReadMappings(mapping_file, contig_ids, min_mapq, min_mapping_length, keep_all_subreads, alignment_precision, num_read_len_groups, large_reads, large_contigs, pdf):
+    mappings = ReadPaf(mapping_file, large_reads, large_contigs)
     if len(mappings) == 0:
         raise RuntimeError("Read mapping file empty.")
 
@@ -8999,7 +9008,7 @@ def PrintStats(result_info):
     print("Output assembly:    {:8,.0f} contigs   (Total sequence: {:,.0f} Min: {:,.0f} Max: {:,.0f} N50: {:,.0f})".format(result_info['output']['contigs']['num'], result_info['output']['contigs']['total'], result_info['output']['contigs']['min'], result_info['output']['contigs']['max'], result_info['output']['contigs']['N50']))
     print("                    {:8,.0f} scaffolds (Total sequence: {:,.0f} Min: {:,.0f} Max: {:,.0f} N50: {:,.0f})".format(result_info['output']['scaffolds']['num'], result_info['output']['scaffolds']['total'], result_info['output']['scaffolds']['min'], result_info['output']['scaffolds']['max'], result_info['output']['scaffolds']['N50']))
 
-def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapping_length, min_length_contig_break, prefix=False, stats=None):
+def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapping_length, min_length_contig_break, large_reads, large_contigs, prefix=False, stats=None):
     # Put in default parameters if nothing was specified
     if False == prefix:
         if ".gz" == assembly_file[-3:len(assembly_file)]:
@@ -9063,10 +9072,10 @@ def GaplessScaffold(assembly_file, mapping_file, repeat_file, min_mapq, min_mapp
     result_info = GetInputInfo(result_info, contigs)
 #
     print( str(timedelta(seconds=process_time())), "Loading repeats")
-    repeats = LoadRepeats(repeat_file, contig_ids)
+    repeats = LoadRepeats(repeat_file, contig_ids, large_contigs)
 #
     print( str(timedelta(seconds=process_time())), "Filtering mappings")
-    mappings, cov_counts, cov_probs, read_names, read_len = ReadMappings(mapping_file, contig_ids, min_mapq, min_mapping_length, keep_all_subreads, alignment_precision, num_read_len_groups, pdf)
+    mappings, cov_counts, cov_probs, read_names, read_len = ReadMappings(mapping_file, contig_ids, min_mapq, min_mapping_length, keep_all_subreads, alignment_precision, num_read_len_groups, large_reads, large_contigs, pdf)
     contigs, covered_regions = RemoveUnmappedContigs(contigs, mappings, remove_zero_hit_contigs)
     mappings = BreakReadsAtAdapters(mappings, alignment_precision, keep_all_subreads)
 #
@@ -9161,11 +9170,14 @@ def RemoveDuplicatedReadMappings(extensions):
 
     return extensions
 
-def LoadReads(all_vs_all_mapping_file, mappings, read_ids, min_length_contig_break, read_in_chunks):
+def LoadReads(all_vs_all_mapping_file, mappings, read_ids, min_length_contig_break, read_in_chunks, large_reads):
     # Load all vs. all mappings for extending reads
+    read_int = np.int32
+    if large_reads:
+        read_int = int
     ext_list = []
     merger_list = []
-    for reads in pd.read_csv(all_vs_all_mapping_file, sep='\t', header=None, usecols=range(9), names=['q_name','q_len','q_start','q_end','strand','t_name','t_len','t_start','t_end'], dtype={'q_name':object, 'q_len':np.int32, 'q_start':np.int32, 'q_end':np.int32, 'strand':str, 't_name':object, 't_len':np.int32, 't_start':np.int32, 't_end':np.int32}, chunksize=read_in_chunks):
+    for reads in pd.read_csv(all_vs_all_mapping_file, sep='\t', header=None, usecols=range(9), names=['q_name','q_len','q_start','q_end','strand','t_name','t_len','t_start','t_end'], dtype={'q_name':object, 'q_len':read_int, 'q_start':read_int, 'q_end':read_int, 'strand':str, 't_name':object, 't_len':read_int, 't_start':read_int, 't_end':read_int}, chunksize=read_in_chunks):
         reads['q_name'] = reads[['q_name']].merge(read_ids.rename(columns={'read_name':'q_name'}), on='q_name', how='left')['read_id'].fillna(-1).astype(int).values
         reads['t_name'] = reads[['t_name']].merge(read_ids.rename(columns={'read_name':'t_name'}), on='t_name', how='left')['read_id'].fillna(-1).astype(int).values
         reads.rename(columns={'q_name':'q_id','t_name':'t_id'}, inplace=True)
@@ -9556,11 +9568,14 @@ def ExtendScaffolds(scaffold_paths, polishing_reads, extensions, hap_merger, new
         
     return scaffold_paths, polishing_reads, extension_info, gap_scaffolds
 
-def FindPolishingForGapScaffolds(polishing_reads, gap_scaffolds, all_vs_all_mapping_file, polishing_coverage, read_in_chunks):
+def FindPolishingForGapScaffolds(polishing_reads, gap_scaffolds, all_vs_all_mapping_file, polishing_coverage, read_in_chunks, large_reads):
     if len(gap_scaffolds):
         # Get mappings of other reads to the new contig
+        read_int = np.int32
+        if large_reads:
+            read_int = int
         gap_pol = []
-        for reads in pd.read_csv(all_vs_all_mapping_file, sep='\t', header=None, usecols=range(9), names=['q_name','q_len','q_start','q_end','strand','t_name','t_len','t_start','t_end'], dtype={'q_name':object, 'q_len':np.int32, 'q_start':np.int32, 'q_end':np.int32, 'strand':str, 't_name':object, 't_len':np.int32, 't_start':np.int32, 't_end':np.int32}, chunksize=read_in_chunks):
+        for reads in pd.read_csv(all_vs_all_mapping_file, sep='\t', header=None, usecols=range(9), names=['q_name','q_len','q_start','q_end','strand','t_name','t_len','t_start','t_end'], dtype={'q_name':object, 'q_len':read_int, 'q_start':read_int, 'q_end':read_int, 'strand':str, 't_name':object, 't_len':read_int, 't_start':read_int, 't_end':read_int}, chunksize=read_in_chunks):
             gap_pol.append( reads.merge(gap_scaffolds, on='t_name', how='inner') )
         gap_pol = pd.concat(gap_pol, ignore_index=True)
         gap_pol = gap_pol[(gap_pol['t_start'] < gap_pol['end0']) & (gap_pol['t_end'] > gap_pol['start0'])].drop(columns=['t_name','t_len'])
@@ -9584,7 +9599,7 @@ def FindPolishingForGapScaffolds(polishing_reads, gap_scaffolds, all_vs_all_mapp
         
     return polishing_reads
 
-def GaplessExtend(all_vs_all_mapping_file, prefix, min_length_contig_break):
+def GaplessExtend(all_vs_all_mapping_file, prefix, min_length_contig_break, large_reads):
     # Define parameters
     min_extension = 500
     min_num_reads = 3
@@ -9602,13 +9617,13 @@ def GaplessExtend(all_vs_all_mapping_file, prefix, min_length_contig_break):
     scaffold_paths = pd.read_csv(prefix+"_scaffold_paths.csv").fillna('')
     ploidy = GetPloidyFromPaths(scaffold_paths)
     mappings, read_ids = LoadExtensions(prefix, min_extension)
-    extensions, hap_merger = LoadReads(all_vs_all_mapping_file, mappings, read_ids, min_length_contig_break, read_in_chunks)
+    extensions, hap_merger = LoadReads(all_vs_all_mapping_file, mappings, read_ids, min_length_contig_break, read_in_chunks, large_reads)
     polishing_reads = pd.read_csv(prefix+"_polishing.csv")
     
     print( str(timedelta(seconds=process_time())), "Searching for extensions")
     extensions, new_scaffolds = ClusterExtension(extensions, mappings, min_num_reads, min_scaf_len)
     scaffold_paths, polishing_reads, extension_info, gap_scaffolds = ExtendScaffolds(scaffold_paths, polishing_reads, extensions, hap_merger, new_scaffolds, mappings, min_num_reads, max_mapping_uncertainty, min_scaf_len, ploidy, polishing_coverage)
-    polishing_reads = FindPolishingForGapScaffolds(polishing_reads, gap_scaffolds, all_vs_all_mapping_file, polishing_coverage, read_in_chunks)
+    polishing_reads = FindPolishingForGapScaffolds(polishing_reads, gap_scaffolds, all_vs_all_mapping_file, polishing_coverage, read_in_chunks, large_reads)
 
     print( str(timedelta(seconds=process_time())), "Writing output")
     scaffold_paths.to_csv(f"{prefix}_extended_scaffold_paths.csv", index=False)
@@ -9867,7 +9882,7 @@ def GaplessFinish(assembly_file, read_file, read_format, scaffold_file, polishin
     print( str(timedelta(seconds=process_time())), "Finished" )
 
 def GetMappingsInRegion(mapping_file, regions, min_mapq, min_mapping_length, keep_all_subreads, alignment_precision, min_length_contig_break, max_dist_contig_end):
-    mappings = ReadPaf(mapping_file)
+    mappings = ReadPaf(mapping_file, False, True)
     
     # Filter mappings
     mappings = mappings[(min_mapq <= mappings['mapq']) & (min_mapping_length <= mappings['t_end'] - mappings['t_start'])].copy()
@@ -13028,6 +13043,7 @@ def Usage(module=""):
         print("      --minLenBreak INT     Minimum length for a read to diverge from a contig to consider a contig break (600)")
         print("      --minMapLength INT    Minimum length of individual mappings of reads (400)")
         print("      --minMapQ INT         Minimum mapping quality of reads (20)")
+        print("      --largeGenome         Increases int size to handle scaffolds longer than ~ 2147 million bases")
     elif "extend" == module:
         print("Usage: gapless.py extend -p {prefix} {all_vs_all}.paf")
         print("Extend scaffold ends with reads reaching over the ends.")
@@ -13102,7 +13118,7 @@ def main(argv):
         GaplessSplit(args[0],o_file,min_n)
     elif "scaffold" == module:
         try:
-            optlist, args = getopt.getopt(argv, 'hp:s:', ['help','prefix=','stats=','--minLenBreak=','minMapLength=','minMapQ=','version'])
+            optlist, args = getopt.getopt(argv, 'hp:s:', ['help','prefix=','stats=','--minLenBreak=','minMapLength=','minMapQ=','largeGenome','largeReads','version'])
         except getopt.GetoptError:
             print("Unknown option\n")
             Usage(module)
@@ -13113,6 +13129,8 @@ def main(argv):
         min_length_contig_break = 700
         min_mapping_length = 500
         min_mapq = 20
+        large_reads = False
+        large_contigs = False
         for opt, par in optlist:
             if opt in ("-h", "--help"):
                 Usage(module)
@@ -13143,6 +13161,10 @@ def main(argv):
                 except ValueError:
                     print("--minMapQ option only accepts integers")
                     sys.exit(1)
+            elif opt == "--largeGenome":
+                large_contigs = True
+            elif opt == "--largeReads":
+                large_reads = True
             elif opt == "--version":
                 Version()
                 sys.exit()
@@ -13153,10 +13175,10 @@ def main(argv):
             Usage(module)
             sys.exit(2)
 
-        GaplessScaffold(args[0], args[1], args[2], min_mapq, min_mapping_length, min_length_contig_break, prefix, stats)
+        GaplessScaffold(args[0], args[1], args[2], min_mapq, min_mapping_length, min_length_contig_break, large_reads, large_contigs, prefix, stats)
     elif "extend" == module:
         try:
-            optlist, args = getopt.getopt(argv, 'hp:', ['help','prefix=','--minLenBreak','version'])
+            optlist, args = getopt.getopt(argv, 'hp:', ['help','prefix=','--minLenBreak','--largeReads','version'])
         except getopt.GetoptError:
             print("Unknown option\n")
             Usage(module)
@@ -13176,6 +13198,8 @@ def main(argv):
                 except ValueError:
                     print("--minLenBreak option only accepts integers")
                     sys.exit(1)
+            elif opt == "--largeReads":
+                large_reads = True
             elif opt == "--version":
                 Version()
                 sys.exit()
@@ -13190,7 +13214,7 @@ def main(argv):
             Usage(module)
             sys.exit(1)
 
-        GaplessExtend(args[0], prefix, min_length_contig_break)
+        GaplessExtend(args[0], prefix, min_length_contig_break, large_reads)
     elif "finish" == module:
         num_slots = 10
         try:
