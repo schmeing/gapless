@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 
 from Bio import SeqIO
 from datetime import timedelta
