@@ -28,21 +28,21 @@ of all three tasks using PacBio or Oxford Nanopore reads.
 
 The first list are the python requirements for `gapless.py` and the second list are the external programs called in `gapless.sh`.
 
-| Requirement               | Tested version | Installation instructions                                         |
-|---------------------------|----------------|-------------------------------------------------------------------|
-| Python 3                  | 3.9.6          |                                                                   |
-| biopython                 | 1.77           | https://biopython.org/wiki/Download                               |
-| matplotlib                | 3.4.2          | https://matplotlib.org/stable/users/installing.html               |
-| numpy                     | 1.21.1         | https://numpy.org/install/                                        |
-| pandas                    | 1.3.1          | https://pandas.pydata.org/docs/getting_started/install.html       |
-| pillow                    | 8.3.1          | https://pillow.readthedocs.io/en/stable/installation.html         |
-| scipy                     | 1.6.3          | https://www.scipy.org/install.html                                |
-| seaborn                   | 0.11.1         | https://seaborn.pydata.org/installing.html                        |
-|---------------------------|----------------|-------------------------------------------------------------------|
-| Linux system              |                |                                                                   |
-| minimap2                  | 2.18-r1015     | https://github.com/lh3/minimap2                                   |
-| racon                     | v1.4.13        | https://github.com/lbcb-sci/racon                                 |
-| seqtk                     | 1.3-r106       | https://github.com/lh3/seqtk                                      |
+| Requirement               | Min. version | Tested version | Installation instructions                                         |
+|---------------------------|--------------|------------------------------------------------------------------------------------|
+| Python 3                  | > 3.6.0      | 3.9.6          |                                                                   |
+| biopython                 |              | 1.77           | https://biopython.org/wiki/Download                               |
+| matplotlib                |              | 3.4.2          | https://matplotlib.org/stable/users/installing.html               |
+| numpy                     |              | 1.21.1         | https://numpy.org/install/                                        |
+| pandas                    | > 1.1.0      | 1.3.1          | https://pandas.pydata.org/docs/getting_started/install.html       |
+| pillow                    |              | 8.3.1          | https://pillow.readthedocs.io/en/stable/installation.html         |
+| scipy                     | > 1.7.0      | 1.10.0         | https://www.scipy.org/install.html                                |
+| seaborn                   |              | 0.11.1         | https://seaborn.pydata.org/installing.html                        |
+|---------------------------|--------------|------------------------------------------------------------------------------------|
+| Linux system              |              |                                                                                    |
+| minimap2                  |              | 2.18-r1015     | https://github.com/lh3/minimap2                                   |
+| racon                     |              | v1.4.13        | https://github.com/lbcb-sci/racon                                 |
+| seqtk                     |              | 1.3-r106       | https://github.com/lh3/seqtk                                      |
 
 ## <a name="installation"></a>Installation
 No installation except for the requirements is necessary. The program can be directly called from its folder after downloading:

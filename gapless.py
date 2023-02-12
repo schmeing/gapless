@@ -377,7 +377,7 @@ def GetCoverageProbabilities(cov_counts, pdf):
         sel_all = bsize == probs['bin_size']
         selection = sel_all & probs['lower_half']
         mean = np.sum(probs.loc[sel_all, 'count'] * probs.loc[sel_all, 'nbins'] / probs.loc[sel_all, 'nbin_sum'])
-        opt_par = minimize(CovChi2, [mean, 1/2], args=(pd.DataFrame({'x':probs.loc[selection, 'count'], 'y':probs.loc[selection, 'nbin_cumsum']/probs.loc[selection, 'nbin_sum']})), method='Nelder-Mead').x
+        opt_par = minimize(CovChi2, [mean, 1/2], args=(pd.DataFrame({'x':probs.loc[selection, 'count'], 'y':probs.loc[selection, 'nbin_cumsum']/probs.loc[selection, 'nbin_sum']})), method='Nelder-Mead', bounds=[(1e-20,None),(1e-20,1)]).x
         prob_n.append(opt_par[0])
         prob_p.append(opt_par[1])
         if pdf:
