@@ -1640,7 +1640,7 @@ def PrintBridgeFilter(mappings, bridges, bridge_extlen, borderline_removal, min_
             for prob_factor in [2,3,5,10,20,30,50,1e50]:
                 print(min_num_reads, prematurity_threshold, prob_factor)
                 cur_bridges = bridges.copy()
-                cur_bridges = FilterBridges(cur_bridges, bridge_extlen, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, cov_probs, prob_factor, min_mapping_length, contig_parts, prematurity_threshold, pdf)
+                cur_bridges = FilterBridges(cur_bridges, bridge_extlen, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, cov_probs, prob_factor, min_mapping_length, contig_parts, prematurity_threshold, None)
                 cur_bridges = cur_bridges[['from','from_side','to','to_side','mean_dist']].copy()
                 cur_bridges['fabs'] = min_num_reads
                 cur_bridges['fprem'] = prematurity_threshold
@@ -1697,6 +1697,7 @@ def GetBridges(mappings, repeats, borderline_removal, min_factor_alternatives, m
     left_bridge, right_bridge, bridge_extlen = GetLeftAndRightBridges(mappings, contig_parts, min_mapping_length)
     bridges = CreateBridges(left_bridge, right_bridge, min_distance_tolerance, rel_distance_tolerance)
     bridge_extlen = PrepareBridgeExtLen(bridge_extlen, bridges, repeats)
+    # PrintBridgeFilter(mappings, bridges, bridge_extlen, borderline_removal, min_factor_alternatives, org_scaffold_trust, cov_probs, min_mapping_length, contig_parts, min_distance_tolerance, rel_distance_tolerance)
     bridges = FilterBridges(bridges, bridge_extlen, borderline_removal, min_factor_alternatives, min_num_reads, org_scaffold_trust, cov_probs, prob_factor, min_mapping_length, contig_parts, prematurity_threshold, pdf)
     CheckBridgeConsistency(bridges)
 
