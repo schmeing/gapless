@@ -703,16 +703,26 @@ def IdentifyBreakinsRepeats(break_points, mappings, repeats, min_num_reads, max_
     inner_repeats['block'] = np.where(inner_repeats['side'] == 'l', inner_repeats['rep_start']//merge_block_length, inner_repeats['rep_end']//merge_block_length)
     inner_repeats['irep'] = inner_repeats.index.values
     bmap = mappings.loc[np.isin(mappings['t_id'], np.unique(inner_repeats['contig_id'].values)), ['read_start','read_end','q_start','q_end','strand','t_id','t_start','t_end']].rename(columns={'t_id':'contig_id'})
-    bmap['first_block'] = bmap['t_start'] // merge_block_length
-    bmap['last_block'] = bmap['t_end'] // merge_block_length
-    bmap = bmap.loc[np.repeat(bmap.index.values, bmap['last_block'] - bmap['first_block'] + 1)].reset_index()
-    bmap['block'] = bmap.groupby(['index'], sort=False).cumcount() + bmap['first_block']
-    bmap.drop(columns=['index','first_block','last_block'], inplace=True)
-    bmap = inner_repeats.merge(bmap, on=['contig_id','block'], how='inner')
-    bmap = bmap[np.where(bmap['side'] == 'l', (bmap['t_start'] < bmap['rep_start']-min_mapping_length) & (bmap['rep_start']+min_mapping_length < bmap['t_end']),
-                                              (bmap['t_start'] < bmap['rep_end']-min_mapping_length) & (bmap['rep_end']+min_mapping_length < bmap['t_end']) )].drop(columns='block')
-    # Remove repeats that are fully traversed
-    inner_repeats.drop(np.unique(bmap.loc[(bmap['t_start'] < bmap['rep_start']-min_mapping_length) & (bmap['rep_end']+min_mapping_length < bmap['t_end']), 'irep'].values), inplace=True)
+    bmap_chunksize = 2500000
+    bmap_list = []
+    for i in range(len(bmap)//bmap_chunksize+1):
+      bmap_cur = bmap[bmap_chunksize*i:bmap_chunksize*(i+1)].copy()
+      bmap_cur['first_block'] = bmap_cur['t_start'] // merge_block_length
+      bmap_cur['last_block'] = bmap_cur['t_end'] // merge_block_length
+      bmap_cur = bmap_cur.loc[np.repeat(bmap_cur.index.values, bmap_cur['last_block'] - bmap_cur['first_block'] + 1)].reset_index()
+      bmap_cur['block'] = bmap_cur.groupby(['index'], sort=False).cumcount() + bmap_cur['first_block']
+      bmap_cur.drop(columns=['index','first_block','last_block'], inplace=True)
+      bmap_cur = inner_repeats.merge(bmap_cur, on=['contig_id','block'], how='inner')
+      bmap_cur = bmap_cur[np.where(bmap_cur['side'] == 'l', (bmap_cur['t_start'] < bmap_cur['rep_start']-min_mapping_length) & (bmap_cur['rep_start']+min_mapping_length < bmap_cur['t_end']),
+                                                            (bmap_cur['t_start'] < bmap_cur['rep_end']-min_mapping_length) & (bmap_cur['rep_end']+min_mapping_length < bmap_cur['t_end']) )].drop(columns='block')
+      # Remove repeats that are fully traversed (prefilter to save memory, needs to run again for bmap later to remove all)
+      inner_repeats.drop(np.unique(bmap_cur.loc[(bmap_cur['t_start'] < bmap_cur['rep_start']-min_mapping_length) & (bmap_cur['rep_end']+min_mapping_length < bmap_cur['t_end']), 'irep'].values), inplace=True)
+      bmap_cur = bmap_cur[np.isin(bmap_cur['irep'], inner_repeats['irep'])].copy()
+      bmap_list.append(bmap_cur)
+    del bmap, bmap_cur
+    bmap = pd.concat(bmap_list, ignore_index=True)
+    del bmap_list
+    # Remove bmaps of repeats that are fully traversed (required to remove all: prefilter keeps bmaps from repeats removed in a later ioteration of the loop)
     bmap = bmap[np.isin(bmap['irep'], inner_repeats['irep'])].copy()
     # Check which reads break in the repeat
     bmap['breaks'] = np.where( (bmap['side'] == 'l') & (bmap['strand'] == '+'), bmap['read_end']-bmap['q_end'] >= min_length_contig_break, bmap['q_start']-bmap['read_start'] >= min_length_contig_break)
